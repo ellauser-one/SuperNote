@@ -1,0 +1,1355 @@
+/**
+ * [INPUT]: 依赖 tailwindcss v4；MDX 编辑器样式由 MdxMemoEditor 局部引入，禁止污染全局 spacing
+ * [OUTPUT]: SuperNote 唯一设计系统真相源头
+ * [POS]: app/src 全局样式入口
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md 与 shared/ui/CLAUDE.md
+ *
+ * 法则:
+ * 1. 颜色 / 字号 / 间距 / 圆角 / 控件尺寸只在本文件定义
+ * 2. 禁止 UI 硬编码像素与颜色；只消费 token
+ * 3. spacing 数字 = 像素（--spacing-12 = 12px），禁止残留 rem 默认值放大界面
+ * 4. base 重置必须放在 @layer base，避免压过 utilities / 组件字号
+ * 5. 苹果 continuous corner：corner-shape: squircle（≡ superellipse(2)）；Chrome 139+ 渐进增强
+ */
+
+@import "tailwindcss";
+
+/* -------------------------------------------------------------------------- */
+/* Design tokens                                                                */
+/* -------------------------------------------------------------------------- */
+
+:root {
+  /* Color */
+  --color-putty: #c4c3b6;
+  --color-ink: #000000;
+  --color-bone: #e7e5e4;
+  --color-chalk: #ebebeb;
+  --color-vellum: #dfdcd5;
+  --color-graphite: #595855;
+  --color-ash: #808080;
+  --color-paper: #ffffff;
+
+  --surface-canvas: var(--color-putty);
+  --surface-card: var(--color-bone);
+  --surface-muted: var(--color-chalk);
+  --surface-room: var(--color-ink);
+  --surface-paper: var(--color-paper);
+
+  /* Typography — families */
+  --font-davinci: "Davinci", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-helvetica-now: "Helvetica Now", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+
+  /* Typography — size (compact product chrome) */
+  --text-caption: 9px;
+  --text-label: 10px;
+  --text-meta: 11px;
+  --text-ui: 12px;
+  --text-ui-md: 13px;
+  --text-body: 14px;
+  --text-body-sm: 15px;
+  --text-title: 16px;
+  --text-title-md: 18px;
+  --text-title-lg: 20px;
+  --text-subheading: 22px;
+  --text-heading-sm: 26px;
+  --text-heading-md: 28px;
+  --text-heading: 43px;
+  --text-heading-lg: 52px;
+  --text-display-sm: 78px;
+  --text-display-md: 82px;
+  --text-display-lg: 88px;
+  --text-display-xl: 94px;
+  --text-display: 374px;
+
+  /* Typography — line-height */
+  --leading-tight: 1.15;
+  --leading-snug: 1.2;
+  --leading-compact: 1.25;
+  --leading-body: 1.5;
+  --leading-relaxed: 1.6;
+  --leading-prose: 1.65;
+  --leading-subheading: 1.33;
+  --leading-heading-sm: 1.33;
+  --leading-heading: 1.1;
+  --leading-heading-lg: 1;
+  --leading-display: 0.84;
+  --leading-display-tight: 0.98;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+
+  /*
+   * Spacing: 数字即像素。完整覆盖 Tailwind / 第三方可能注入的 rem 档位，
+   * 避免 --spacing-12: 3rem 这类历史遗留把 UI 放大 4 倍。
+   */
+  --spacing-0: 0px;
+  --spacing-px: 1px;
+  --spacing-0_5: 2px;
+  --spacing-1: 1px;
+  --spacing-1_5: 2px;
+  --spacing-2: 2px;
+  --spacing-2_5: 2px;
+  --spacing-3: 3px;
+  --spacing-3_5: 4px;
+  --spacing-4: 4px;
+  --spacing-5: 5px;
+  --spacing-6: 6px;
+  --spacing-7: 7px;
+  --spacing-8: 8px;
+  --spacing-9: 9px;
+  --spacing-10: 10px;
+  --spacing-11: 11px;
+  --spacing-12: 12px;
+  --spacing-14: 14px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-36: 36px;
+  --spacing-40: 40px;
+  --spacing-44: 44px;
+  --spacing-48: 48px;
+  --spacing-52: 52px;
+  --spacing-56: 56px;
+  --spacing-60: 60px;
+  --spacing-64: 64px;
+  --spacing-72: 72px;
+  --spacing-80: 80px;
+  --spacing-96: 96px;
+  --spacing-160: 160px;
+  --spacing-168: 168px;
+  --spacing-unit: 4px;
+  --section-gap: var(--spacing-80);
+  --card-padding: var(--spacing-16);
+  --element-gap: var(--spacing-6);
+
+  /* Controls — 微拟物需要略厚的触控面 */
+  --control-height-sm: 26px;
+  --control-height-md: 32px;
+  --control-height-lg: 36px;
+  --control-height-xl: 40px;
+  --row-height: 20px;
+  --header-height: 36px;
+  --header-height-lg: 48px;
+  --icon-xs: 12px;
+  --icon-sm: 14px;
+  --icon-md: 16px;
+  --icon-lg: 20px;
+  --icon-xl: 24px;
+  --logo-mark: 24px;
+  /* Avatar — 真圆形裁切；仅头像用途 */
+  --avatar-sm: 28px;
+  --avatar-md: 40px;
+  --avatar-lg: 64px;
+  --avatar-xl: 80px;
+
+  /* Radius — 圆角矩形（非胶囊）；几何形状见 --corner-shape-continuous */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+  --radius-2xl: 16px;
+  /* 仅真·圆形用途（头像点、全圆裁切）；禁止用于按钮/卡片 */
+  --radius-full: 9999px;
+  --radius-cards: var(--radius-lg);
+  --radius-links: var(--radius-sm);
+  --radius-buttons: var(--radius-xl);
+  --radius-control: var(--radius-md);
+  /*
+   * 苹果丝滑 continuous corner（squircle）
+   * - squircle ≡ superellipse(2)（MDN）
+   * - 需配合非 0 的 border-radius 才生效
+   * - Chrome / Chromium 139+；其它浏览器忽略，回退普通 border-radius
+   */
+  --corner-shape-continuous: squircle;
+  --corner-shape-round: round;
+
+  /* Layout */
+  --layout-sidebar: 15%;
+  --layout-agent: 15%;
+  --layout-tree: 28%;
+  --layout-tree-min: 160px;
+  --layout-trash-date: 88px;
+  --layout-trash-action: 56px;
+  --max-prose-xs: 420px;
+  --max-prose-sm: 480px;
+  --max-prose-md: 520px;
+  --max-prose-lg: 540px;
+  --max-prose-xl: 620px;
+  --max-content: 760px;
+  --max-content-sm: 680px;
+  --max-measure: 900px;
+  --max-shell: 1080px;
+  --max-shell-lg: 1120px;
+  --max-metric-label: 116px;
+  --min-app-width: 320px;
+  --min-textarea: 160px;
+  --min-preview-panel: 240px;
+
+  --shadow-preview: 0 16px 48px color-mix(in srgb, var(--color-ink) 14%, transparent);
+
+  /*
+   * 微拟物阴影语言（内外影配合）
+   * - outer: 环境光投射 + 接触阴影，制造浮起厚度
+   * - inner: 顶缘高光 + 底缘压暗，制造切削倒角
+   */
+  --shadow-button-primary:
+    0 1px 1px color-mix(in srgb, var(--color-ink) 12%, transparent),
+    0 4px 8px color-mix(in srgb, var(--color-ink) 18%, transparent),
+    0 10px 22px color-mix(in srgb, var(--color-ink) 12%, transparent),
+    0 1px 0 color-mix(in srgb, var(--color-ink) 35%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 28%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, var(--color-ink) 55%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-paper) 8%, transparent);
+
+  --shadow-button-primary-hover:
+    0 2px 2px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    0 6px 12px color-mix(in srgb, var(--color-ink) 20%, transparent),
+    0 14px 28px color-mix(in srgb, var(--color-ink) 14%, transparent),
+    0 1px 0 color-mix(in srgb, var(--color-ink) 30%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 34%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, var(--color-ink) 48%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-paper) 10%, transparent);
+
+  --shadow-button-primary-active:
+    0 1px 2px color-mix(in srgb, var(--color-ink) 18%, transparent),
+    0 2px 4px color-mix(in srgb, var(--color-ink) 12%, transparent),
+    inset 0 2px 4px color-mix(in srgb, var(--color-ink) 45%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-ink) 30%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-paper) 8%, transparent);
+
+  --shadow-button-surface:
+    0 1px 1px color-mix(in srgb, var(--color-ink) 6%, transparent),
+    0 3px 8px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    0 8px 16px color-mix(in srgb, var(--color-ink) 6%, transparent),
+    0 1px 0 color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 90%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-paper) 40%, transparent);
+
+  --shadow-button-surface-hover:
+    0 2px 2px color-mix(in srgb, var(--color-ink) 7%, transparent),
+    0 5px 12px color-mix(in srgb, var(--color-ink) 12%, transparent),
+    0 12px 22px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    0 1px 0 color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 1px 0 var(--color-paper),
+    inset 0 -1px 1px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-paper) 55%, transparent);
+
+  --shadow-button-surface-active:
+    0 1px 2px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    inset 0 2px 5px color-mix(in srgb, var(--color-ink) 14%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-paper) 70%, transparent);
+
+  --shadow-field:
+    0 1px 1px color-mix(in srgb, var(--color-ink) 4%, transparent),
+    inset 0 1px 2px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-paper) 70%, transparent);
+
+  --shadow-field-focus:
+    0 0 0 1px color-mix(in srgb, var(--color-ink) 35%, transparent),
+    0 1px 2px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 1px 2px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-paper) 80%, transparent);
+
+  --shadow-card:
+    0 1px 1px color-mix(in srgb, var(--color-ink) 5%, transparent),
+    0 4px 12px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 75%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-ink) 6%, transparent);
+
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --ease-tactile: cubic-bezier(0.22, 1, 0.36, 1);
+  --duration-fast: 140ms;
+  --duration-press: 90ms;
+  --duration-spin: 700ms;
+  --duration-shimmer: 1400ms;
+
+  /* Ghost resting / hover surfaces */
+  --shadow-button-ghost:
+    0 1px 1px color-mix(in srgb, var(--color-ink) 4%, transparent),
+    0 2px 6px color-mix(in srgb, var(--color-ink) 6%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 55%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, var(--color-ink) 6%, transparent);
+
+  --shadow-button-ghost-hover:
+    0 2px 2px color-mix(in srgb, var(--color-ink) 5%, transparent),
+    0 4px 10px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-paper) 70%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, var(--color-ink) 8%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--color-ink) 6%, transparent);
+
+  --shadow-button-ghost-active:
+    inset 0 2px 4px color-mix(in srgb, var(--color-ink) 10%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--color-ink) 6%, transparent);
+}
+
+@theme {
+  --color-putty: #c4c3b6;
+  --color-ink: #000000;
+  --color-bone: #e7e5e4;
+  --color-chalk: #ebebeb;
+  --color-vellum: #dfdcd5;
+  --color-graphite: #595855;
+  --color-ash: #808080;
+  --color-paper: #ffffff;
+
+  --font-davinci: "Davinci", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-helvetica-now: "Helvetica Now", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+
+  --text-caption: 9px;
+  --text-caption--line-height: 1.25;
+  --text-label: 10px;
+  --text-label--line-height: 1.25;
+  --text-meta: 11px;
+  --text-meta--line-height: 1.25;
+  --text-ui: 12px;
+  --text-ui--line-height: 1.25;
+  --text-ui-md: 13px;
+  --text-ui-md--line-height: 1.3;
+  --text-body: 14px;
+  --text-body--line-height: 1.6;
+  --text-body-sm: 15px;
+  --text-body-sm--line-height: 1.5;
+  --text-title: 16px;
+  --text-title--line-height: 1.2;
+  --text-title-md: 18px;
+  --text-title-md--line-height: 1.25;
+  --text-title-lg: 20px;
+  --text-title-lg--line-height: 1.45;
+  --text-subheading: 22px;
+  --text-subheading--line-height: 1.33;
+  --text-heading-sm: 26px;
+  --text-heading-sm--line-height: 1.33;
+  --text-heading-md: 28px;
+  --text-heading-md--line-height: 1.15;
+  --text-heading: 43px;
+  --text-heading--line-height: 1.1;
+  --text-heading-lg: 52px;
+  --text-heading-lg--line-height: 1;
+  --text-display-sm: 78px;
+  --text-display-sm--line-height: 0.98;
+  --text-display-md: 82px;
+  --text-display-md--line-height: 0.98;
+  --text-display-lg: 88px;
+  --text-display-lg--line-height: 0.84;
+  --text-display-xl: 94px;
+  --text-display-xl--line-height: 0.84;
+  --text-display: 374px;
+  --text-display--line-height: 0.84;
+
+  /* Full px spacing scale — kill rem defaults */
+  --spacing-0: 0px;
+  --spacing-px: 1px;
+  --spacing-0_5: 2px;
+  --spacing-1: 1px;
+  --spacing-1_5: 2px;
+  --spacing-2: 2px;
+  --spacing-2_5: 2px;
+  --spacing-3: 3px;
+  --spacing-3_5: 4px;
+  --spacing-4: 4px;
+  --spacing-5: 5px;
+  --spacing-6: 6px;
+  --spacing-7: 7px;
+  --spacing-8: 8px;
+  --spacing-9: 9px;
+  --spacing-10: 10px;
+  --spacing-11: 11px;
+  --spacing-12: 12px;
+  --spacing-14: 14px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-36: 36px;
+  --spacing-40: 40px;
+  --spacing-44: 44px;
+  --spacing-48: 48px;
+  --spacing-52: 52px;
+  --spacing-56: 56px;
+  --spacing-60: 60px;
+  --spacing-64: 64px;
+  --spacing-72: 72px;
+  --spacing-80: 80px;
+  --spacing-96: 96px;
+  --spacing-160: 160px;
+  --spacing-168: 168px;
+
+  --spacing-control-sm: 26px;
+  --spacing-control-md: 32px;
+  --spacing-control-lg: 36px;
+  --spacing-control-xl: 40px;
+  --spacing-row: 20px;
+  --spacing-header: 36px;
+  --spacing-header-lg: 48px;
+  --spacing-icon-xs: 12px;
+  --spacing-icon-sm: 14px;
+  --spacing-icon-md: 16px;
+  --spacing-icon-lg: 20px;
+  --spacing-icon-xl: 24px;
+  --spacing-logo: 24px;
+  --spacing-avatar-sm: 28px;
+  --spacing-avatar-md: 40px;
+  --spacing-avatar-lg: 64px;
+  --spacing-avatar-xl: 80px;
+  --spacing-tree-min: 160px;
+  --spacing-trash-date: 88px;
+  --spacing-trash-action: 56px;
+  --spacing-textarea: 160px;
+  --spacing-preview-panel: 240px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+  --radius-2xl: 16px;
+  --radius-full: 9999px;
+
+  --max-width-prose-xs: 420px;
+  --max-width-prose-sm: 480px;
+  --max-width-prose-md: 520px;
+  --max-width-prose-lg: 540px;
+  --max-width-prose-xl: 620px;
+  --max-width-content: 760px;
+  --max-width-content-sm: 680px;
+  --max-width-measure: 900px;
+  --max-width-shell: 1080px;
+  --max-width-shell-lg: 1120px;
+  --max-width-metric-label: 116px;
+
+  --shadow-preview: 0 16px 48px color-mix(in srgb, var(--color-ink) 14%, transparent);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Base — must stay in @layer base so utilities / .ds-* win on font-size       */
+/* -------------------------------------------------------------------------- */
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html {
+    background: var(--color-putty);
+    color: var(--color-ink);
+    font-family: var(--font-helvetica-now);
+    font-size: var(--text-body);
+    line-height: var(--leading-body);
+  }
+
+  body {
+    margin: 0;
+    min-width: var(--min-app-width);
+    min-height: 100vh;
+    background: var(--color-putty);
+  }
+
+  /* 禁止 font shorthand：会压掉 utilities 的 font-size，导致按钮/导航回落到 16px 放大 */
+  button,
+  input,
+  textarea {
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Design-system primitives — 微拟物（圆角矩形 · 内外影 · 厚度）                  */
+/* -------------------------------------------------------------------------- */
+
+.ds-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-6);
+  border-style: solid;
+  border-width: 1px;
+  border-radius: var(--radius-buttons);
+  font-family: var(--font-helvetica-now);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0.01em;
+  line-height: var(--leading-compact);
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transform: translateY(0);
+  transition:
+    background var(--duration-fast) var(--ease-tactile),
+    background-color var(--duration-fast) var(--ease-tactile),
+    box-shadow var(--duration-fast) var(--ease-tactile),
+    border-color var(--duration-fast) var(--ease-tactile),
+    color var(--duration-fast) var(--ease-tactile),
+    transform var(--duration-press) var(--ease-tactile),
+    filter var(--duration-fast) var(--ease-tactile);
+}
+
+.ds-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-ink) 40%, transparent);
+  outline-offset: 2px;
+}
+
+/* 真 disabled（非 loading）才褪色压扁 */
+.ds-button:disabled:not(.ds-button--loading) {
+  opacity: 0.45;
+  cursor: not-allowed;
+  filter: grayscale(0.15);
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* —— Primary：最吸睛的实体按键，深色釉面 + 内外影厚度 —— */
+.ds-button--primary {
+  color: var(--color-paper);
+  border-color: color-mix(in srgb, var(--color-ink) 92%, var(--color-paper));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-ink) 78%, var(--color-paper)) 0%,
+      var(--color-ink) 46%,
+      color-mix(in srgb, var(--color-ink) 88%, var(--color-graphite)) 100%
+    );
+  box-shadow: var(--shadow-button-primary);
+  text-shadow: 0 1px 0 color-mix(in srgb, var(--color-ink) 55%, transparent);
+}
+
+.ds-button--primary:hover:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, var(--color-ink) 86%, var(--color-paper));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-ink) 70%, var(--color-paper)) 0%,
+      color-mix(in srgb, var(--color-ink) 94%, var(--color-paper)) 48%,
+      color-mix(in srgb, var(--color-ink) 90%, var(--color-graphite)) 100%
+    );
+  box-shadow: var(--shadow-button-primary-hover);
+  transform: translateY(-1px);
+}
+
+.ds-button--primary:active:not(:disabled):not(.ds-button--loading) {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-ink) 96%, var(--color-graphite)) 0%,
+      var(--color-ink) 55%,
+      color-mix(in srgb, var(--color-ink) 82%, var(--color-paper)) 100%
+    );
+  box-shadow: var(--shadow-button-primary-active);
+  transform: translateY(1px);
+  text-shadow: none;
+}
+
+/* —— Outline：浅色浮起面，贴合 putty/bone 画布 —— */
+.ds-button--outline {
+  color: var(--color-ink);
+  border-color: color-mix(in srgb, var(--color-vellum) 55%, var(--color-ink));
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-paper) 0%,
+      color-mix(in srgb, var(--color-bone) 70%, var(--color-paper)) 55%,
+      var(--color-bone) 100%
+    );
+  box-shadow: var(--shadow-button-surface);
+}
+
+.ds-button--outline:hover:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, var(--color-ink) 35%, var(--color-vellum));
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-paper) 0%,
+      color-mix(in srgb, var(--color-chalk) 40%, var(--color-paper)) 100%
+    );
+  box-shadow: var(--shadow-button-surface-hover);
+  transform: translateY(-1px);
+}
+
+.ds-button--outline:active:not(:disabled):not(.ds-button--loading) {
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-bone) 0%,
+      color-mix(in srgb, var(--color-chalk) 60%, var(--color-paper)) 100%
+    );
+  box-shadow: var(--shadow-button-surface-active);
+  transform: translateY(1px);
+}
+
+/*
+ * —— Ghost：幽灵变体（半透明磨砂面 + 轻内外影）
+ * 默认即可见轮廓，不像透明空按钮；仍轻于 outline
+ */
+.ds-button--ghost {
+  color: var(--color-ink);
+  border-color: color-mix(in srgb, var(--color-ink) 14%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-paper) 52%, transparent) 0%,
+      color-mix(in srgb, var(--color-bone) 28%, transparent) 100%
+    );
+  box-shadow: var(--shadow-button-ghost);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  text-shadow: none;
+}
+
+.ds-button--ghost:hover:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, var(--color-ink) 22%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-paper) 72%, transparent) 0%,
+      color-mix(in srgb, var(--color-chalk) 36%, transparent) 100%
+    );
+  box-shadow: var(--shadow-button-ghost-hover);
+  transform: translateY(-1px);
+}
+
+.ds-button--ghost:active:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, var(--color-ink) 18%, transparent);
+  background: color-mix(in srgb, var(--color-ink) 7%, transparent);
+  box-shadow: var(--shadow-button-ghost-active);
+  transform: translateY(1px);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* —— Inverse：暗底上的浅色实体键 —— */
+.ds-button--inverse {
+  color: var(--color-ink);
+  border-color: color-mix(in srgb, var(--color-paper) 70%, var(--color-ink));
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-paper) 0%,
+      color-mix(in srgb, var(--color-chalk) 35%, var(--color-paper)) 52%,
+      color-mix(in srgb, var(--color-bone) 50%, var(--color-paper)) 100%
+    );
+  box-shadow: var(--shadow-button-surface);
+}
+
+.ds-button--inverse:hover:not(:disabled):not(.ds-button--loading) {
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-paper) 0%,
+      color-mix(in srgb, var(--color-paper) 88%, var(--color-chalk)) 100%
+    );
+  box-shadow: var(--shadow-button-surface-hover);
+  transform: translateY(-1px);
+}
+
+.ds-button--inverse:active:not(:disabled):not(.ds-button--loading) {
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-bone) 0%,
+      var(--color-paper) 100%
+    );
+  box-shadow: var(--shadow-button-surface-active);
+  transform: translateY(1px);
+}
+
+/* —— Loading：转圈 + 扫光 shimmer（可与任意 variant 叠加） —— */
+.ds-button--loading {
+  cursor: wait;
+  pointer-events: none;
+  overflow: hidden;
+  transform: none;
+}
+
+.ds-button--loading .ds-button__label {
+  opacity: 0.78;
+}
+
+/* 扫光层：沿对角线掠过表面 */
+.ds-button--loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    transparent 38%,
+    color-mix(in srgb, var(--color-paper) 34%, transparent) 50%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+  animation: ds-button-shimmer var(--duration-shimmer) var(--ease-standard) infinite;
+}
+
+.ds-button--primary.ds-button--loading::after,
+.ds-button--inverse.ds-button--loading::after {
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    transparent 38%,
+    color-mix(in srgb, var(--color-paper) 28%, transparent) 50%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+}
+
+.ds-button--ghost.ds-button--loading::after,
+.ds-button--outline.ds-button--loading::after {
+  background: linear-gradient(
+    105deg,
+    transparent 0%,
+    transparent 38%,
+    color-mix(in srgb, var(--color-paper) 55%, transparent) 50%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-size: 220% 100%;
+}
+
+/* 转圈：细环 spinner，颜色跟随 currentColor */
+.ds-button__spinner {
+  display: inline-block;
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  flex-shrink: 0;
+  border-radius: var(--radius-full);
+  border: 1.5px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-top-color: currentColor;
+  border-right-color: color-mix(in srgb, currentColor 55%, transparent);
+  animation: ds-button-spin var(--duration-spin) linear infinite;
+}
+
+.ds-button--sm .ds-button__spinner {
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+  border-width: 1.25px;
+}
+
+@keyframes ds-button-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes ds-button-shimmer {
+  0% {
+    background-position: 120% 0;
+  }
+  100% {
+    background-position: -120% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ds-button__spinner,
+  .ds-button--loading::after {
+    animation: none;
+  }
+
+  .ds-button--loading::after {
+    opacity: 0.2;
+    background-position: 50% 0;
+  }
+}
+
+.ds-button--sm {
+  height: var(--control-height-sm);
+  padding-inline: var(--spacing-10);
+  font-size: var(--text-meta);
+}
+
+.ds-button--md {
+  height: var(--control-height-md);
+  padding-inline: var(--spacing-14);
+  font-size: var(--text-ui);
+}
+
+.ds-button__icon {
+  display: inline-flex;
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  flex-shrink: 0;
+  opacity: 0.92;
+}
+
+.ds-button__icon > svg {
+  width: 100%;
+  height: 100%;
+}
+
+.ds-button__label {
+  display: inline-block;
+}
+
+/* —— Fields：内凹微拟物输入面 —— */
+.ds-input,
+.ds-textarea {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--color-vellum) 70%, var(--color-ink));
+  border-radius: var(--radius-control);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-chalk) 35%, var(--color-paper)) 0%,
+      var(--color-paper) 40%,
+      var(--color-paper) 100%
+    );
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  outline: none;
+  box-shadow: var(--shadow-field);
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    box-shadow var(--duration-fast) var(--ease-standard);
+}
+
+.ds-input::placeholder,
+.ds-textarea::placeholder {
+  color: var(--color-graphite);
+}
+
+.ds-input:focus,
+.ds-textarea:focus {
+  border-color: color-mix(in srgb, var(--color-ink) 45%, var(--color-vellum));
+  box-shadow: var(--shadow-field-focus);
+}
+
+.ds-input {
+  height: var(--control-height-md);
+  padding-inline: var(--spacing-10);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
+}
+
+.ds-input--lg {
+  height: var(--control-height-lg);
+  padding-inline: var(--spacing-12);
+  font-size: var(--text-ui-md);
+}
+
+/* Privacy input：右侧眼睛切换可见性 */
+.ds-input-privacy {
+  position: relative;
+  width: 100%;
+}
+
+.ds-input--with-privacy {
+  padding-inline-end: var(--spacing-36);
+}
+
+.ds-input-privacy--lg .ds-input--with-privacy {
+  padding-inline-end: var(--spacing-40);
+}
+
+.ds-input-privacy__toggle {
+  position: absolute;
+  top: 50%;
+  right: var(--spacing-4);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height-sm);
+  height: var(--control-height-sm);
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-graphite);
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+.ds-input-privacy__toggle:hover:not(:disabled) {
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-chalk) 70%, transparent);
+}
+
+.ds-input-privacy__toggle:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-ink) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.ds-input-privacy__toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.ds-input-privacy__toggle > svg {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+.ds-input-privacy--lg .ds-input-privacy__toggle {
+  right: var(--spacing-6);
+  width: var(--control-height-md);
+  height: var(--control-height-md);
+}
+
+.ds-input-privacy--lg .ds-input-privacy__toggle > svg {
+  width: var(--icon-md);
+  height: var(--icon-md);
+}
+
+.ds-textarea {
+  min-height: var(--min-textarea);
+  resize: none;
+  padding: var(--spacing-12);
+  border-radius: var(--radius-lg);
+  font-size: var(--text-ui-md);
+  line-height: var(--leading-body);
+}
+
+/* —— Cards：轻浮起表面 —— */
+.ds-card {
+  border: 1px solid color-mix(in srgb, var(--color-vellum) 80%, var(--color-ink));
+  border-radius: var(--radius-cards);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-paper) 55%, var(--color-bone)) 0%,
+      var(--color-bone) 100%
+    );
+  color: var(--color-ink);
+  box-shadow: var(--shadow-card);
+}
+
+.ds-card--ink {
+  border-color: color-mix(in srgb, var(--color-ink) 88%, var(--color-paper));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-ink) 82%, var(--color-paper)) 0%,
+      var(--color-ink) 100%
+    );
+  color: var(--color-paper);
+  box-shadow: var(--shadow-button-primary);
+}
+
+.ds-card--chalk {
+  background:
+    linear-gradient(
+      180deg,
+      var(--color-paper) 0%,
+      var(--color-chalk) 100%
+    );
+}
+
+.ds-card--paper {
+  background: var(--color-paper);
+}
+
+.ds-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--color-ink) 40%, transparent);
+  padding: var(--spacing-16);
+}
+
+.ds-dialog-panel {
+  width: min(100%, var(--max-prose-xs));
+  border: 1px solid var(--color-vellum);
+  border-radius: var(--radius-lg);
+  background: var(--color-bone);
+  color: var(--color-ink);
+  padding: var(--spacing-16);
+  box-shadow: var(--shadow-preview);
+}
+
+/* —— Avatar：真圆形头像；fallback 字标 / 图片 —— */
+.ds-avatar {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 12%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-paper) 70%, var(--color-bone)) 0%,
+      var(--color-bone) 100%
+    );
+  box-shadow: var(--shadow-button-ghost);
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  user-select: none;
+}
+
+.ds-avatar--sm {
+  width: var(--avatar-sm);
+  height: var(--avatar-sm);
+  font-size: var(--text-label);
+}
+
+.ds-avatar--md {
+  width: var(--avatar-md);
+  height: var(--avatar-md);
+  font-size: var(--text-ui);
+}
+
+.ds-avatar--lg {
+  width: var(--avatar-lg);
+  height: var(--avatar-lg);
+  font-size: var(--text-title);
+}
+
+.ds-avatar--xl {
+  width: var(--avatar-xl);
+  height: var(--avatar-xl);
+  font-size: var(--text-title-md);
+}
+
+.ds-avatar__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ds-avatar__fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: var(--color-graphite);
+}
+
+/* 深色表面（如侧栏 ink）上的头像 */
+.ds-avatar--on-ink {
+  border-color: color-mix(in srgb, var(--color-paper) 28%, transparent);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-paper) 18%, transparent) 0%,
+      color-mix(in srgb, var(--color-paper) 8%, transparent) 100%
+    );
+  box-shadow: none;
+}
+
+.ds-avatar--on-ink .ds-avatar__fallback {
+  color: color-mix(in srgb, var(--color-paper) 90%, transparent);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Continuous corner（苹果 squircle）— 渐进增强                                 */
+/* border-radius 定“半径”；corner-shape 定“角的几何”。不支持则仅用 border-radius */
+/* -------------------------------------------------------------------------- */
+
+@supports (corner-shape: squircle) {
+  /*
+   * 设计系统原子 + 常用 rounded 工具类 → continuous squircle
+   * 按钮/卡片/输入/对话框：圆角矩形 + squircle，不是胶囊
+   */
+  :where(
+    .ds-button,
+    .ds-input,
+    .ds-textarea,
+    .ds-card,
+    .ds-dialog-panel,
+    .rounded-sm,
+    .rounded-md,
+    .rounded-lg,
+    .rounded-xl,
+    .rounded-2xl
+  ) {
+    corner-shape: var(--corner-shape-continuous);
+  }
+
+  /* 真圆形保持椭圆 round，避免 squircle 扭曲全圆 */
+  :where(.rounded-full, .size-full.rounded-full) {
+    corner-shape: var(--corner-shape-round);
+  }
+}
+
+.ds-dialog-title {
+  margin: 0;
+  font-family: var(--font-davinci);
+  font-size: var(--text-title);
+  font-weight: var(--font-weight-medium);
+  line-height: var(--leading-compact);
+}
+
+.ds-dialog-description {
+  margin: var(--spacing-10) 0 0;
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-body);
+  color: var(--color-graphite);
+}
+
+/* -------------------------------------------------------------------------- */
+/* MDX editor bridge（样式包在组件内 import，此处只约束编辑区）                  */
+/* -------------------------------------------------------------------------- */
+
+.supernote-mdx-editor {
+  min-height: 100%;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+}
+
+.supernote-mdx-editor [contenteditable="true"] {
+  min-height: 100%;
+  caret-color: var(--color-ink);
+  padding: var(--spacing-16);
+  font-size: var(--text-body);
+  line-height: var(--leading-prose);
+}
+
+.supernote-mdx-editor h1,
+.supernote-mdx-editor h2,
+.supernote-mdx-editor h3 {
+  font-family: var(--font-davinci);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0;
+}
+
+.supernote-mdx-editor pre,
+.supernote-mdx-editor code {
+  background: var(--color-bone);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Memo Tree — sidebar 文件树                                                  */
+/* -------------------------------------------------------------------------- */
+
+.ds-tree-node {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-4);
+  width: 100%;
+  min-width: 0;
+  height: var(--control-height-md);
+  padding-inline: var(--spacing-8);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.ds-tree-node:hover {
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+}
+
+.ds-tree-node--active {
+  background: var(--color-ink);
+  color: var(--color-paper);
+}
+
+.ds-tree-node--active:hover {
+  background: color-mix(in srgb, var(--color-ink) 88%, var(--color-paper));
+}
+
+.ds-tree-node--drop-inside {
+  background: color-mix(in srgb, var(--color-ink) 10%, transparent);
+  outline: 1.5px solid color-mix(in srgb, var(--color-ink) 30%, transparent);
+  outline-offset: -1.5px;
+}
+
+.ds-tree-node__icon {
+  display: inline-flex;
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  flex-shrink: 0;
+  color: var(--color-graphite);
+}
+
+.ds-tree-node--active .ds-tree-node__icon {
+  color: color-mix(in srgb, var(--color-paper) 75%, transparent);
+}
+
+.ds-tree-node__chevron {
+  display: inline-flex;
+  width: var(--icon-xs);
+  height: var(--icon-xs);
+  flex-shrink: 0;
+  color: var(--color-ash);
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+.ds-tree-node__chevron--open {
+  transform: rotate(90deg);
+}
+
+.ds-tree-node__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ds-tree-node__rename {
+  flex: 1;
+  min-width: 0;
+  height: var(--control-height-sm);
+  padding-inline: var(--spacing-6);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 35%, var(--color-vellum));
+  border-radius: var(--radius-sm);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
+  outline: none;
+  box-shadow: var(--shadow-field-focus);
+}
+
+/* Drop indicator — 横线 */
+.ds-tree-drop-indicator {
+  position: absolute;
+  left: var(--spacing-8);
+  right: var(--spacing-8);
+  height: 2px;
+  background: var(--color-ink);
+  border-radius: var(--radius-full);
+  pointer-events: none;
+  z-index: 10;
+}
+
+.ds-tree-drop-indicator::before {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--color-ink);
+}
+
+/* 树缩进层级 */
+.ds-tree-children {
+  padding-left: var(--spacing-12);
+}
+
+/* 根区域 drop 占位 */
+.ds-tree-root-drop {
+  flex: 1;
+  min-height: var(--spacing-48);
+}
+
+/* 右键菜单 */
+.ds-tree-context-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: var(--spacing-160);
+  padding: var(--spacing-4);
+  border: 1px solid var(--color-vellum);
+  border-radius: var(--radius-md);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  box-shadow: var(--shadow-preview);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+}
+
+.ds-tree-context-menu__item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  width: 100%;
+  padding: var(--spacing-6) var(--spacing-10);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-ink);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: var(--leading-compact);
+  cursor: pointer;
+  text-align: left;
+}
+
+.ds-tree-context-menu__item:hover {
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+}
+
+/*
+ * Token lock — 放在文件末尾，压过第三方（如 MDXEditor）注入到 :root 的 rem spacing。
+ * 这是「禁止 rem 放大」的最终防线。
+ */
+:root {
+  --spacing-0: 0px;
+  --spacing-1: 1px;
+  --spacing-2: 2px;
+  --spacing-3: 3px;
+  --spacing-4: 4px;
+  --spacing-5: 5px;
+  --spacing-6: 6px;
+  --spacing-7: 7px;
+  --spacing-8: 8px;
+  --spacing-9: 9px;
+  --spacing-10: 10px;
+  --spacing-11: 11px;
+  --spacing-12: 12px;
+  --spacing-14: 14px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-36: 36px;
+  --spacing-40: 40px;
+  --spacing-44: 44px;
+  --spacing-48: 48px;
+  --spacing-52: 52px;
+  --spacing-56: 56px;
+  --spacing-60: 60px;
+  --spacing-64: 64px;
+  --spacing-72: 72px;
+  --spacing-80: 80px;
+  --spacing-96: 96px;
+  --control-height-sm: 26px;
+  --control-height-md: 32px;
+  --control-height-lg: 36px;
+  --control-height-xl: 40px;
+  --row-height: 20px;
+  --header-height: 36px;
+  --header-height-lg: 48px;
+  --icon-xs: 12px;
+  --icon-sm: 14px;
+  --avatar-sm: 28px;
+  --avatar-md: 40px;
+  --avatar-lg: 64px;
+  --avatar-xl: 80px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+  --radius-2xl: 16px;
+  --radius-buttons: 14px;
+  --radius-cards: 12px;
+  --radius-control: 8px;
+  --radius-full: 9999px;
+  --corner-shape-continuous: squircle;
+  --corner-shape-round: round;
+}

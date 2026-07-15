@@ -3,7 +3,10 @@
 
 模块定位: AI 能力服务 · Bun + Hono + TypeScript + Mastra + zod
 
+鉴权边界: 不直收浏览器 JWT；只接受 api 转发的可信 user context（`X-Service-Token` + `X-User-Id`）。
+
 <directory>
+src/index.ts - 进程入口
 src/routes/ - Hono 路由层，负责 AI 服务 HTTP 入口编排
 src/dto/ - DTO 层，负责请求与响应契约描述
 src/models/ - 模型层，负责 AI 服务内部领域对象与类型边界

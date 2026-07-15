@@ -1,0 +1,63 @@
+/**
+ * [INPUT]: 无运行时依赖；在第三方 CSS（如 MDXEditor）之后导入
+ * [OUTPUT]: 将 spacing / 控件 / 圆角 / continuous corner token 重新锁定
+ * [POS]: shared/ui 设计系统护栏样式，由 MdxMemoEditor 在 editor style 之后引入
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
+
+:root {
+  --spacing-0: 0px;
+  --spacing-1: 1px;
+  --spacing-2: 2px;
+  --spacing-3: 3px;
+  --spacing-4: 4px;
+  --spacing-5: 5px;
+  --spacing-6: 6px;
+  --spacing-7: 7px;
+  --spacing-8: 8px;
+  --spacing-9: 9px;
+  --spacing-10: 10px;
+  --spacing-11: 11px;
+  --spacing-12: 12px;
+  --spacing-14: 14px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-36: 36px;
+  --spacing-40: 40px;
+  --spacing-44: 44px;
+  --spacing-48: 48px;
+  --spacing-52: 52px;
+  --spacing-56: 56px;
+  --spacing-60: 60px;
+  --spacing-64: 64px;
+  --spacing-72: 72px;
+  --spacing-80: 80px;
+  --spacing-96: 96px;
+  --control-height-sm: 26px;
+  --control-height-md: 32px;
+  --control-height-lg: 36px;
+  --control-height-xl: 40px;
+  --row-height: 20px;
+  --header-height: 36px;
+  --header-height-lg: 48px;
+  --icon-xs: 12px;
+  --icon-sm: 14px;
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 14px;
+  --radius-2xl: 16px;
+  --radius-buttons: 14px;
+  --radius-cards: 12px;
+  --radius-control: 8px;
+  --radius-full: 9999px;
+  --corner-shape-continuous: squircle;
+  --corner-shape-round: round;
+  --text-ui: 12px;
+  --text-ui-md: 13px;
+  --text-meta: 11px;
+  --text-body: 14px;
+}

@@ -1,0 +1,6 @@
+# Local secrets / machine-specific config — never commit
+.mcp.json
+.DS_Store
+.env
+.env.local
+.env.*.local
