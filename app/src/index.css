@@ -168,9 +168,12 @@
 
   /* Layout */
   --layout-sidebar: 15%;
+  /* 备忘录工作区：窄图标轨，把宽度留给文件树 */
+  --layout-rail: 56px;
   --layout-agent: 15%;
-  --layout-tree: 28%;
-  --layout-tree-min: 160px;
+  /* 文件树作为主侧栏：约 1/3 主区宽度 */
+  --layout-tree: 32%;
+  --layout-tree-min: 220px;
   --layout-trash-date: 88px;
   --layout-trash-action: 56px;
   --max-prose-xs: 420px;
@@ -1110,12 +1113,16 @@
   font-family: var(--font-helvetica-now);
 }
 
-.supernote-mdx-editor [contenteditable="true"] {
+.supernote-mdx-editor [contenteditable="true"],
+.supernote-mdx-editor__content {
   min-height: 100%;
   caret-color: var(--color-ink);
-  padding: var(--spacing-16);
+  padding: var(--spacing-16) var(--spacing-20);
   font-size: var(--text-body);
   line-height: var(--leading-prose);
+  /* 保留连续空格、行首/行尾空格与换行；禁止浏览器折叠空白 */
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .supernote-mdx-editor h1,
@@ -1124,16 +1131,240 @@
   font-family: var(--font-davinci);
   font-weight: var(--font-weight-medium);
   letter-spacing: 0;
+  white-space: pre-wrap;
+}
+
+.supernote-mdx-editor p,
+.supernote-mdx-editor li {
+  white-space: pre-wrap;
 }
 
 .supernote-mdx-editor pre,
 .supernote-mdx-editor code {
   background: var(--color-bone);
+  white-space: pre-wrap;
+}
+
+/* 自动保存失败轻量 toast（不打扰成功路径） */
+.ds-memo-save-toast {
+  position: absolute;
+  bottom: var(--spacing-16);
+  left: 50%;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+  max-width: min(100% - var(--spacing-32), 28rem);
+  transform: translateX(-50%);
+  padding: var(--spacing-10) var(--spacing-14);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 12%, var(--color-vellum));
+  border-radius: var(--radius-sm);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  box-shadow: var(--shadow-elevated, 0 4px 16px color-mix(in srgb, var(--color-ink) 12%, transparent));
+}
+
+.ds-memo-save-toast__retry {
+  flex-shrink: 0;
+  margin: 0;
+  padding: var(--spacing-4) var(--spacing-8);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 18%, var(--color-vellum));
+  border-radius: var(--radius-sm);
+  background: var(--color-chalk);
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.ds-memo-save-toast__retry:hover {
+  background: color-mix(in srgb, var(--color-ink) 6%, var(--color-chalk));
+}
+
+/* -------------------------------------------------------------------------- */
+/* App icon rail（备忘录工作区窄导航）                                           */
+/* -------------------------------------------------------------------------- */
+
+.ds-app-rail {
+  width: 100%;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Markdown in Agent panel（助手消息）                                           */
+/* -------------------------------------------------------------------------- */
+
+.ds-md {
+  color: inherit;
+}
+
+.ds-md__p {
+  margin: 0 0 var(--spacing-8);
+}
+
+.ds-md__p:last-child {
+  margin-bottom: 0;
+}
+
+.ds-md__list {
+  margin: 0 0 var(--spacing-8);
+  padding-left: var(--spacing-16);
+  list-style: disc;
+}
+
+.ds-md__list--ordered {
+  list-style: decimal;
+}
+
+.ds-md__li {
+  margin: var(--spacing-4) 0;
+}
+
+.ds-md__strong {
+  font-weight: 600;
+}
+
+.ds-md__em {
+  font-style: italic;
+}
+
+.ds-md__heading {
+  margin: 0 0 var(--spacing-8);
+  font-family: var(--font-davinci);
+  font-size: var(--text-subheading);
+  font-weight: 500;
+  line-height: var(--leading-tight, 1.25);
+}
+
+.ds-md__link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: var(--spacing-2);
+}
+
+.ds-md__quote {
+  margin: 0 0 var(--spacing-8);
+  padding-left: var(--spacing-12);
+  border-left: 2px solid color-mix(in srgb, currentColor 25%, transparent);
+  opacity: 0.9;
+}
+
+.ds-md__pre {
+  margin: 0 0 var(--spacing-8);
+  padding: var(--spacing-8);
+  overflow-x: auto;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--text-meta);
+}
+
+.ds-md__code-inline {
+  padding: 0 var(--spacing-4);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--text-meta);
+}
+
+.ds-md__code-block {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Memo editor title（可编辑标题）                                               */
+/* -------------------------------------------------------------------------- */
+
+.ds-memo-title-input {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: var(--spacing-4) 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-ink);
+  font-family: var(--font-davinci);
+  font-size: var(--text-title-lg);
+  font-weight: 500;
+  line-height: var(--leading-tight, 1.25);
+  outline: none;
+  box-shadow: none;
+}
+
+.ds-memo-title-input::placeholder {
+  color: var(--color-ash);
+}
+
+.ds-memo-title-input:hover {
+  background: color-mix(in srgb, var(--color-ink) 3%, transparent);
+}
+
+.ds-memo-title-input:focus {
+  background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+  box-shadow: inset 0 -1.5px 0 0 color-mix(in srgb, var(--color-ink) 35%, transparent);
+}
+
+.ds-memo-title-input:disabled {
+  opacity: 0.6;
+  cursor: wait;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Memo Tree — sidebar 文件树                                                  */
 /* -------------------------------------------------------------------------- */
+
+.ds-tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-4);
+  flex-shrink: 0;
+}
+
+.ds-tree-toolbar__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-4);
+  height: var(--control-height-sm);
+  min-width: var(--control-height-sm);
+  padding-inline: var(--spacing-6);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 12%, var(--color-vellum));
+  border-radius: var(--radius-sm);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-meta);
+  line-height: var(--leading-compact);
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.ds-tree-toolbar__btn:hover {
+  background: color-mix(in srgb, var(--color-ink) 6%, var(--color-paper));
+}
+
+.ds-tree-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--spacing-10);
+  margin: var(--spacing-12);
+  padding: var(--spacing-12);
+  border: 1px dashed color-mix(in srgb, var(--color-ink) 18%, var(--color-vellum));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-paper) 70%, transparent);
+  color: var(--color-graphite);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
+}
+
+.ds-tree-empty__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-6);
+}
 
 .ds-tree-node {
   display: flex;
@@ -1172,6 +1403,14 @@
   background: color-mix(in srgb, var(--color-ink) 10%, transparent);
   outline: 1.5px solid color-mix(in srgb, var(--color-ink) 30%, transparent);
   outline-offset: -1.5px;
+}
+
+.ds-tree-node--drop-before {
+  box-shadow: inset 0 2px 0 0 var(--color-ink);
+}
+
+.ds-tree-node--dragging {
+  opacity: 0.45;
 }
 
 .ds-tree-node__icon {
@@ -1223,38 +1462,92 @@
   box-shadow: var(--shadow-field-focus);
 }
 
-/* Drop indicator — 横线 */
-.ds-tree-drop-indicator {
+/* 真实 drop 落点线（可接收 dragOver/drop，不是纯视觉） */
+.ds-tree-drop-line {
+  position: relative;
+  height: var(--spacing-8);
+  margin-right: var(--spacing-8);
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.ds-tree-drop-line--active {
+  height: var(--spacing-10);
+}
+
+.ds-tree-drop-line--active::after {
+  content: "";
   position: absolute;
   left: var(--spacing-8);
-  right: var(--spacing-8);
+  right: 0;
+  top: 50%;
   height: 2px;
+  transform: translateY(-50%);
   background: var(--color-ink);
   border-radius: var(--radius-full);
   pointer-events: none;
-  z-index: 10;
 }
 
-.ds-tree-drop-indicator::before {
+.ds-tree-drop-line--active::before {
   content: "";
   position: absolute;
-  left: -3px;
-  top: -2px;
-  width: 6px;
-  height: 6px;
+  left: var(--spacing-4);
+  top: 50%;
+  width: var(--spacing-6);
+  height: var(--spacing-6);
+  transform: translateY(-50%);
   border-radius: var(--radius-full);
   background: var(--color-ink);
+  pointer-events: none;
+}
+
+.ds-tree-drop-line--disabled {
+  pointer-events: none;
+}
+
+.ds-tree-level {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ds-tree-subtree {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 /* 树缩进层级 */
 .ds-tree-children {
-  padding-left: var(--spacing-12);
+  min-width: 0;
 }
 
-/* 根区域 drop 占位 */
+/* 根区域空白占位（右键空白 + 拖回根目录末尾） */
 .ds-tree-root-drop {
   flex: 1;
   min-height: var(--spacing-48);
+}
+
+.ds-tree-root-drop--active {
+  box-shadow: inset 0 2px 0 0 var(--color-ink);
+  background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+}
+
+/* 错误 toast */
+.ds-tree-toast {
+  position: sticky;
+  bottom: var(--spacing-8);
+  z-index: 20;
+  margin: var(--spacing-8);
+  padding: var(--spacing-8) var(--spacing-12);
+  border: 1px solid var(--color-vellum);
+  border-radius: var(--radius-md);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  box-shadow: var(--shadow-preview);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
 }
 
 /* 右键菜单 */

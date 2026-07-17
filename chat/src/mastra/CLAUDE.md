@@ -2,10 +2,10 @@
 > L2 | 父级: ../../CLAUDE.md
 
 成员清单
-.gitkeep: 保留 Mastra 集成层目录，等待 AI 能力组织入口落位
-agents/: Agent 目录，负责 Mastra Agent 定义归属
-workflows/: Workflow 目录，负责 Mastra 工作流定义归属
-tools/: Tool 目录，负责 Mastra 工具定义归属
-prompts/: Prompt 目录，负责提示词资产归属
+index.ts: new Mastra({ agents, server }) — agents['memo-agent']、cors、apiRoutes
+agents/: memo-agent 定义
+prompts/: 系统提示词资产（memoAgentPrompt）
+tools/: 预留（本轮不用）
+workflows/: 预留（本轮不用）
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

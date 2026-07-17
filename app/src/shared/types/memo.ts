@@ -60,12 +60,12 @@ export type CreateMemoInput = {
   parent_id: string | null;
   title: string;
   content_mdx?: string;
-  sort_order?: string;
+  sort_order?: string | number;
 };
 
 export type MoveMemoNodeInput = {
   parent_id: string | null;
-  sort_order: string;
+  sort_order: string | number;
 };
 
 export type UpdateMemoNodeInput = {
@@ -78,11 +78,31 @@ export type UpdateMemoContentInput = {
 };
 
 /* -------------------------------------------------------------------------- */
-/* API 信封（与后端 ApiResponse<T> 同构）                                       */
+/* 拖拽落点                                                                     */
+/* -------------------------------------------------------------------------- */
+
+/** before / inside / after 语义见 MemoTree 与 memo-tree-helpers.resolveDropPlacement */
+export type DropPosition = "before" | "inside" | "after";
+
+/**
+ * - nodeId != null + before：排在该节点前（同父）
+ * - nodeId != null + after：排在该节点后（同父；folder 指整个子树之后）
+ * - nodeId != null + inside：放入该 folder
+ * - nodeId = null + parentId + before：该层最前
+ * - nodeId = null + parentId + after：该层最后
+ */
+export type DropTarget = {
+  nodeId: string | null;
+  parentId: string | null;
+  position: DropPosition;
+};
+
+/* -------------------------------------------------------------------------- */
+/* API 信封（与后端 ApiResponse<T> 同构：code = "ok" | ERROR）                  */
 /* -------------------------------------------------------------------------- */
 
 export type ApiEnvelope<T> = {
-  code: number;
+  code: "ok" | string;
   message: string;
   data: T;
 };

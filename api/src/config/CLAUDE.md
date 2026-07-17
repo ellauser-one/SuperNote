@@ -1,8 +1,8 @@
 # api/src/config/
-> L2 | 父级: ../../CLAUDE.md
+> L3 | 父级: ../../CLAUDE.md
 
 成员清单
-env.ts: 运行时环境变量只读视图（SUPABASE_URL / SERVICE_ROLE / CHAT / CORS）
+env.ts: zod 校验环境变量只读视图（PORT / NODE_ENV / SYSTEM_NAME / CORS_ORIGINS / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY）
 
 ## 边界
 - 环境变量只在此归口读取；业务代码不直接散落 process.env

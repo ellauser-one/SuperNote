@@ -1,11 +1,12 @@
 /**
  * [INPUT]: 依赖 React useState/lazy/Suspense，依赖 widgets 与业务页面；DEV 下懒加载 design-system
  * [OUTPUT]: 对外提供 AppDashboard 路由页面
- * [POS]: pages /app 工作台；固定视口；含个人主页视图；DEV 视图挂载 Design System 画廊
+ * [POS]: pages 历史工作台（主路径已由 AppShell 替代）；含 Agent 侧栏开合
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 import { lazy, Suspense, useState, type ComponentType } from "react";
 
+import { useAgentPanelStore } from "../shared/stores/agent-panel.store";
 import { AgentPanel } from "../widgets/AgentPanel";
 import { AppSidebar, type AppView } from "../widgets/AppSidebar";
 import { MemoLibraryPage } from "./MemoLibraryPage";
@@ -23,14 +24,16 @@ const DesignSystemPage: ComponentType | null = import.meta.env.DEV
 
 export function AppDashboard() {
   const [activeView, setActiveView] = useState<AppView>("new");
+  const agentOpen = useAgentPanelStore((s) => s.open);
 
   return (
     <div className="h-dvh overflow-hidden bg-putty text-ink">
       <div
         className="grid h-full min-h-0"
         style={{
-          gridTemplateColumns:
-            "var(--layout-sidebar) minmax(0, 1fr) var(--layout-agent)",
+          gridTemplateColumns: agentOpen
+            ? "var(--layout-sidebar) minmax(0, 1fr) var(--layout-agent)"
+            : "var(--layout-sidebar) minmax(0, 1fr)",
         }}
       >
         <AppSidebar activeView={activeView} onViewChange={setActiveView} />
@@ -51,7 +54,7 @@ export function AppDashboard() {
             </Suspense>
           ) : null}
         </div>
-        <AgentPanel />
+        {agentOpen ? <AgentPanel /> : null}
       </div>
     </div>
   );

@@ -2,11 +2,11 @@
 > L2 | 父级: ../../CLAUDE.md
 
 成员清单
-user-context.ts: requireTrustedUser；校验 X-Service-Token + X-User-Id（可选 X-User-Email）
+auth.ts: authMiddleware — Authorization Bearer JWT → Supabase userId → requestContext
 
 ## 边界
-- 不直接校验浏览器用户 JWT
-- 只接受 api 转发的可信 user context
-- 与 api 共享 INTERNAL_SERVICE_TOKEN
+- 身份只信 JWT，绝不从 body 读 userId
+- 无 token / 无效 token → 401
+- 日志只记 status，不打印 token
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

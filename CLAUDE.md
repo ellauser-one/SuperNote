@@ -26,10 +26,19 @@ app 使用自研 Design System，不依赖第三方 UI 组件库：
 详见 [app/src/shared/ui/CLAUDE.md](app/src/shared/ui/CLAUDE.md)
 
 <directory>
-app/ - 用户端，承载浏览器交互界面与前端路由
-chat/ - AI 能力服务，承载 Mastra Agent、Workflow、Tool 与对话接口
-api/ - 业务接口服务，承载业务 HTTP API、数据访问与 Supabase 集成
+app/ - 用户端，承载浏览器交互界面与前端路由（本机 Bun/Vite :20000，不进 Docker）
+chat/ - AI 能力服务，承载 Mastra Agent、Workflow、Tool 与对话接口（本机 Mastra :20002）
+api/ - 业务接口服务，承载业务 HTTP API、数据访问与 Supabase 集成（Docker :20001）
+deploy/ - 部署与镜像定义（docker/api.Dockerfile）
+scripts/ - 本地 Docker 启停与日志脚本
 </directory>
+
+## 本地开发端口
+| 服务 | 端口 | 运行方式 |
+| --- | --- | --- |
+| app | 20000 | 本机 `cd app && bun run dev` |
+| api | 20001 | Docker `./scripts/docker-start.sh` |
+| chat | 20002 | 本机 `cd chat && bun run dev`（mastra dev） |
 
 ## 模块地图
 | L1 | 职责 | 地图 |
@@ -37,10 +46,16 @@ api/ - 业务接口服务，承载业务 HTTP API、数据访问与 Supabase 集
 | app | 用户端，负责备忘录记录、浏览、文件树交互与前端路由界面 | [app/CLAUDE.md](app/CLAUDE.md) |
 | chat | AI 能力服务，负责保存时分类、目录推荐、自动建夹与 AI 编排 | [chat/CLAUDE.md](chat/CLAUDE.md) |
 | api | 业务接口服务，负责备忘录、文件夹、订阅与数据访问边界 | [api/CLAUDE.md](api/CLAUDE.md) |
+| deploy | 容器镜像与部署资产 | [deploy/CLAUDE.md](deploy/CLAUDE.md) |
+| scripts | 本地 Docker 启停 / 日志 | [scripts/CLAUDE.md](scripts/CLAUDE.md) |
 
 <config>
 SYSTEM.md - 全项目开发 Agent 系统提示词（人格、四象限、SOLID/熵减、GEB 分形文档协议）
 .git/ - Git 版本库元数据
+.env.example - 根级环境变量模板（复制为 .env.local）
+docker-compose.dev.yml - 本地 Docker 编排（仅 api）
+deploy/docker/api.Dockerfile - api Bun 开发镜像
+scripts/docker-start.sh · docker-stop.sh · docker-logs.sh - 本地 Docker 运维脚本
 app/package.json - 用户端依赖清单与 Bun 包元数据，声明 React 路由、MDXEditor、Tailwind 与自研设计系统
 app/bun.lock - 用户端 Bun 依赖锁定文件
 app/tsconfig.json - 用户端 TypeScript 编辑器配置

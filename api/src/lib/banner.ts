@@ -1,99 +1,18 @@
 /**
- * [INPUT]: 依赖 lib/ansi；可选读 package.json / CLAUDE.md / env 推断系统名
- * [OUTPUT]: 对外提供 resolveSystemName / printBanner / printRuntimeInfo / printReady
+ * [INPUT]: 依赖 lib/ansi、config/env
+ * [OUTPUT]: 对外提供 printBanner / printRuntimeInfo / printReady
  * [POS]: lib 启动横幅；纯 stdout ASCII，不经业务 logger
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 三段横幅：
+ * 1. printBanner      - ASCII logo + 系统名
+ * 2. printRuntimeInfo - env / runtime / port / supabase host / cors
+ * 3. printReady       - endpoint / health / 主路由
+ *
+ * 纯 7-bit ASCII，无 box-drawing 字符。支持 NO_COLOR=1。
  */
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-
+import { env } from "../config/env";
 import { ansi, padVisible } from "./ansi";
-
-const GENERIC_PKG_NAMES = new Set([
-  "api",
-  "app",
-  "server",
-  "backend",
-  "frontend",
-  "web",
-  "chat",
-  "package",
-]);
-
-/**
- * 系统名称解析顺序：
- * 1. APP_NAME / SYSTEM_NAME
- * 2. package.json name（排除 api/app 等通用名）
- * 3. 近邻 CLAUDE.md 标题（# Name - ...）
- */
-export function resolveSystemName(): string {
-  const fromEnv =
-    process.env.APP_NAME?.trim() || process.env.SYSTEM_NAME?.trim();
-  if (fromEnv) {
-    return fromEnv;
-  }
-
-  const apiRoot = resolveApiRoot();
-  const pkgName = readPackageName(join(apiRoot, "package.json"));
-  if (pkgName && !GENERIC_PKG_NAMES.has(pkgName.toLowerCase())) {
-    return pkgName;
-  }
-
-  for (const md of [
-    join(apiRoot, "CLAUDE.md"),
-    join(apiRoot, "..", "CLAUDE.md"),
-  ]) {
-    const title = readClaudeTitle(md);
-    if (title) {
-      return title;
-    }
-  }
-
-  // 项目根 CLAUDE 已确认存在「SuperNote」；兜底避免阻塞启动
-  return "SuperNote";
-}
-
-function resolveApiRoot(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  // src/lib -> api/
-  return join(here, "..", "..");
-}
-
-function readPackageName(path: string): string | null {
-  try {
-    if (!existsSync(path)) {
-      return null;
-    }
-    const raw = JSON.parse(readFileSync(path, "utf8")) as { name?: string };
-    const name = raw.name?.trim();
-    return name || null;
-  } catch {
-    return null;
-  }
-}
-
-function readClaudeTitle(path: string): string | null {
-  try {
-    if (!existsSync(path)) {
-      return null;
-    }
-    const first = readFileSync(path, "utf8").split("\n")[0] ?? "";
-    // # SuperNote - ...  或  # SuperNote
-    const m = /^#\s+(.+?)(?:\s+-\s+.+)?\s*$/.exec(first.trim());
-    if (!m?.[1]) {
-      return null;
-    }
-    const title = m[1].trim();
-    // 跳过纯路径标题如 "api/"
-    if (!title || title.endsWith("/") || title.length < 2) {
-      return null;
-    }
-    return title;
-  } catch {
-    return null;
-  }
-}
 
 /** 7-bit ASCII 字标（无 unicode box-drawing） */
 function asciiLogo(name: string): string[] {
@@ -146,8 +65,14 @@ function safeHost(url: string): string {
   }
 }
 
+function detectRuntime(): string {
+  const bunVer =
+    typeof Bun !== "undefined" && Bun.version ? `Bun ${Bun.version}` : "Bun";
+  return bunVer;
+}
+
 /** 1) 系统名 ASCII logo */
-export function printBanner(systemName = resolveSystemName()): void {
+export function printBanner(systemName: string): void {
   const logo = asciiLogo(systemName);
   const out = process.stdout;
   out.write("\n");
@@ -177,7 +102,7 @@ export function printRuntimeInfo(info: RuntimeInfo): void {
   out.write("\n");
 }
 
-/** 4) 就绪：endpoint / health / 主路由前缀 */
+/** 3) 就绪：endpoint / health / 主路由前缀 */
 export function printReady(info: ReadyInfo): void {
   const out = process.stdout;
   out.write(ansi.bold(ansi.green("  Ready")) + "\n");
@@ -189,16 +114,14 @@ export function printReady(info: ReadyInfo): void {
   out.write("\n");
 }
 
-export function supabaseHostFromUrl(url: string): string {
-  return safeHost(url);
-}
-
-export function detectEnvName(): string {
-  return process.env.NODE_ENV?.trim() || "development";
-}
-
-export function detectRuntime(): string {
-  const bunVer =
-    typeof Bun !== "undefined" && Bun.version ? `Bun ${Bun.version}` : "Bun";
-  return bunVer;
+/** 从 env 构造 RuntimeInfo（index.ts 调用） */
+export function runtimeInfoFromEnv(): RuntimeInfo {
+  return {
+    systemName: env.systemName,
+    envName: env.nodeEnv,
+    runtime: detectRuntime(),
+    port: env.port,
+    supabaseHost: safeHost(env.supabaseUrl),
+    corsOrigins: env.corsOrigins,
+  };
 }

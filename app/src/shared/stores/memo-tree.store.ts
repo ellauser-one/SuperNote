@@ -3,6 +3,11 @@
  * [OUTPUT]: 对外提供 useMemoTreeStore hook 与 MemoTreeState 类型
  * [POS]: shared/stores 备忘录树全局状态；widgets/MemoTree 唯一数据源
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 规则：
+ * - fetchTree 仅在进入 dashboard、登录用户变化、显式刷新时调用
+ * - create / rename / move 均乐观更新；失败回滚 previousNodes
+ * - move 成功后禁止重新 GET /memo-tree，避免 UI 闪动
  */
 import { create } from "zustand";
 
@@ -20,7 +25,6 @@ import {
   findSiblings,
   insertNode,
   moveNodeInTree,
-  removeNode,
   replaceNode,
   sortNodes,
   updateNode,
@@ -33,7 +37,7 @@ import type {
 } from "../types/memo";
 
 /* -------------------------------------------------------------------------- */
-/* 乐观 ID                                                                     */
+/* 乐观 ID（create 本地占位；成功后用服务端 id 替换）                               */
 /* -------------------------------------------------------------------------- */
 
 let optimisticCounter = 0;
@@ -48,23 +52,21 @@ function nextOptimisticId(): string {
 export type MemoTreeState = {
   loading: boolean;
   nodes: MemoTreeNode[];
+  /** 最近一次树操作错误（供 UI toast） */
+  lastError: string | null;
 
   fetchTree(signal?: AbortSignal): Promise<MemoTreeNode[]>;
   createFolder(input: CreateMemoFolderInput): Promise<MemoTreeNode>;
   createMemo(input: CreateMemoInput): Promise<MemoTreeNode>;
-  moveNode(
-    nodeId: string,
-    input: MoveMemoNodeInput,
-    /** 可选：前端已算好的 sort_order，跳过本地再算 */
-    precomputedSortOrder?: string,
-  ): Promise<void>;
+  /**
+   * 拖拽移动：本地先 remove + insert，再 PATCH move。
+   * 成功不 refetch；失败回滚 previousNodes。
+   */
+  moveNode(nodeId: string, input: MoveMemoNodeInput): Promise<void>;
   renameNode(nodeId: string, title: string): Promise<MemoTreeNode>;
-  /** 编辑器调用：本地即时更新正文，不触发 API */
   updateMemoContentLocal(nodeId: string, content: string): void;
-  saveMemoContent(
-    nodeId: string,
-    content: string,
-  ): Promise<MemoTreeNode>;
+  saveMemoContent(nodeId: string, content: string): Promise<MemoTreeNode>;
+  clearError(): void;
   reset(): void;
 };
 
@@ -75,11 +77,12 @@ export type MemoTreeState = {
 export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
   loading: false,
   nodes: [],
+  lastError: null,
 
   /* ── fetchTree ─────────────────────────────────────────────── */
 
   async fetchTree(signal) {
-    set({ loading: true });
+    set({ loading: true, lastError: null });
     try {
       const tree = await getMemoTree(signal);
       set({ nodes: sortNodes(tree), loading: false });
@@ -118,6 +121,7 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
 
     set({
       nodes: insertNode(previousNodes, optimisticNode, input.parent_id),
+      lastError: null,
     });
 
     try {
@@ -127,7 +131,10 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       }));
       return real;
     } catch (err) {
-      set({ nodes: previousNodes });
+      set({
+        nodes: previousNodes,
+        lastError: err instanceof Error ? err.message : "创建文件夹失败",
+      });
       throw err;
     }
   },
@@ -138,6 +145,10 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
     const previousNodes = get().nodes;
     const optimisticId = nextOptimisticId();
     const siblings = findSiblings(previousNodes, input.parent_id);
+    const sortOrder =
+      input.sort_order != null
+        ? String(input.sort_order)
+        : computeSortOrder(siblings, "append");
 
     const optimisticNode: MemoTreeNode = {
       id: optimisticId,
@@ -145,9 +156,7 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       parent_id: input.parent_id,
       node_type: "memo",
       title: input.title,
-      sort_order:
-        input.sort_order ??
-        computeSortOrder(siblings, "append"),
+      sort_order: sortOrder,
       icon: null,
       color: null,
       metadata: {},
@@ -172,8 +181,9 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
         previousNodes,
         optimisticNode,
         input.parent_id,
-        input.sort_order,
+        sortOrder,
       ),
+      lastError: null,
     });
 
     try {
@@ -183,17 +193,21 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       }));
       return real;
     } catch (err) {
-      set({ nodes: previousNodes });
+      set({
+        nodes: previousNodes,
+        lastError: err instanceof Error ? err.message : "创建备忘录失败",
+      });
       throw err;
     }
   },
 
-  /* ── moveNode ──────────────────────────────────────────────── */
+  /* ── moveNode（乐观更新；成功不 refetch） ───────────────────── */
 
-  async moveNode(nodeId, input, precomputedSortOrder) {
+  async moveNode(nodeId, input) {
     const previousNodes = get().nodes;
-    const sortOrder =
-      precomputedSortOrder ?? input.sort_order;
+    if (!findNode(previousNodes, nodeId)) return;
+
+    const sortOrder = String(input.sort_order);
 
     set({
       nodes: moveNodeInTree(
@@ -202,13 +216,20 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
         input.parent_id,
         sortOrder,
       ),
+      lastError: null,
     });
 
     try {
-      await apiMoveMemoNode(nodeId, input);
-      // 成功后不重新 fetch，本地已经是最新
+      await apiMoveMemoNode(nodeId, {
+        parent_id: input.parent_id,
+        sort_order: input.sort_order,
+      });
+      // 成功：保留乐观树，禁止整树 refetch
     } catch (err) {
-      set({ nodes: previousNodes });
+      set({
+        nodes: previousNodes,
+        lastError: err instanceof Error ? err.message : "移动节点失败",
+      });
       throw err;
     }
   },
@@ -223,6 +244,7 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
         ...n,
         title,
       })),
+      lastError: null,
     });
 
     try {
@@ -232,7 +254,10 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       }));
       return real;
     } catch (err) {
-      set({ nodes: previousNodes });
+      set({
+        nodes: previousNodes,
+        lastError: err instanceof Error ? err.message : "重命名失败",
+      });
       throw err;
     }
   },
@@ -244,13 +269,22 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       nodes: updateNode(s.nodes, nodeId, (n) => ({
         ...n,
         memo: n.memo
-          ? { ...n.memo, content_mdx: content, updated_at: new Date().toISOString() }
+          ? {
+              ...n.memo,
+              content_mdx: content,
+              updated_at: new Date().toISOString(),
+            }
           : n.memo,
       })),
     }));
   },
 
   /* ── saveMemoContent ───────────────────────────────────────── */
+  /**
+   * 将 content 原样 POST 到 PATCH /memos/:id（不 trim、不压缩空格）。
+   * 竞态：若请求期间用户继续输入，本地 content_mdx 已更新为更新内容；
+   * 此时旧响应返回时 currentContent !== content，禁止用旧服务端节点覆盖本地。
+   */
 
   async saveMemoContent(nodeId, content) {
     try {
@@ -259,7 +293,7 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
         const current = findNode(s.nodes, nodeId);
         const currentContent = current?.memo?.content_mdx;
 
-        // 用户仍在编辑且内容已变化 → 不覆盖
+        // 本地已前进到更新草稿：丢弃过期响应，保留用户输入
         if (currentContent != null && currentContent !== content) {
           return { nodes: s.nodes };
         }
@@ -268,14 +302,19 @@ export const useMemoTreeStore = create<MemoTreeState>((set, get) => ({
       });
       return real;
     } catch (err) {
-      // 保存失败不回滚内容（用户可能继续编辑）
+      // 失败不回滚本地 content_mdx，避免丢字
+      set({
+        lastError: err instanceof Error ? err.message : "保存备忘录失败",
+      });
       throw err;
     }
   },
 
-  /* ── reset ─────────────────────────────────────────────────── */
+  clearError() {
+    set({ lastError: null });
+  },
 
   reset() {
-    set({ loading: false, nodes: [] });
+    set({ loading: false, nodes: [], lastError: null });
   },
 }));

@@ -1,21 +1,17 @@
 /**
- * [INPUT]: 依赖 Hono 与 api/* 路由模块
- * [OUTPUT]: 对外提供根路由聚合（health + 业务挂载点）
- * [POS]: router 层；index.ts 只挂载本模块
+ * [INPUT]: 依赖 Hono、router/health.router、profile.router、memo.router
+ * [OUTPUT]: 对外提供 router（根路由聚合）
+ * [POS]: router 层；index.ts 只挂载子路由，禁止业务判断
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 import { Hono } from "hono";
 
-import { aiApi } from "../api/ai.api";
-import { meApi } from "../api/me.api";
-import { profilesApi } from "../api/profiles.api";
-import type { AuthVariables } from "../common/auth-context";
-import { ok } from "../common/response";
+import { healthRouter } from "./health.router";
+import { memoRouter } from "./memo.router";
+import { profileRouter } from "./profile.router";
 
-export const router = new Hono<{ Variables: AuthVariables }>();
+export const router = new Hono();
 
-router.get("/health", (c) => ok(c, { service: "api" }));
-
-router.route("/v1/me", meApi);
-router.route("/v1/profiles", profilesApi);
-router.route("/v1/ai", aiApi);
+router.route("/", healthRouter);
+router.route("/", profileRouter);
+router.route("/", memoRouter);

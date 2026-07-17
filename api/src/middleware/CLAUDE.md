@@ -1,13 +1,12 @@
 # api/src/middleware/
-> L2 | 父级: ../../CLAUDE.md
+> L3 | 父级: ../../CLAUDE.md
 
 成员清单
-auth.ts: requireAuth + verifyAccessToken；`Authorization: Bearer <jwt>` → AuthContext.userId
+request-logger.ts: requestLogger — [request] ISO method path status duration origin
+error-handler.ts: errorHandler — HttpError → fail 信封；未知错误 → 500
 
 ## 边界
-- 用 Supabase Auth REST `GET /auth/v1/user` 验签，禁止只 decode 不校验
-- 注入 `c.get('auth')`：`{ userId, email, accessToken }`
-- 用户身份只来自 JWT，禁止信任 body.user_id
-- chat 不走本中间件；api → chat 用 INTERNAL_SERVICE_TOKEN
+- 请求日志禁止打印 token / service_role / 完整 Authorization header
+- 错误处理不向响应体泄漏 stack trace
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

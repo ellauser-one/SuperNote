@@ -1,13 +1,14 @@
 # api/src/service/
-> L2 | 父级: ../../CLAUDE.md
+> L3 | 父级: ../../CLAUDE.md
 
 成员清单
-me.service.ts: GET /v1/me 聚合
-profile.service.ts: 本人 profile 读改/upsert、username 可用性与归属校验
-ai.service.ts: AI generate 编排（userId 来自 JWT）
+profile.service.ts: getOrCreateProfile / updateProfile — 归属校验、默认 nickname/username
+memo.service.ts: getMemoTree / createFolder / createMemo / getMemo / updateMemo / renameNode / moveNode — 树组装、父文件夹校验、防环移动
 
 ## 边界
-- 不依赖 Hono Context；入参为 Actor / 纯数据
-- 用户身份只来自 JWT userId，禁止信任 body.user_id
+- 不依赖 Hono Context；入参为纯数据
+- 业务编排与权限判断在此层
+- service_role 绕过 RLS → 必须 assert user_id === authUser.id
+- 写树前 ensure profile（FK → profiles）
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

@@ -1,76 +1,48 @@
 /**
- * [INPUT]: 依赖 process.env（Bun 运行时注入）
- * [OUTPUT]: 对外提供 api 服务运行时环境变量只读视图
+ * [INPUT]: 依赖 zod、process.env（Bun 运行时注入）
+ * [OUTPUT]: 对外提供 env 只读视图与 Env 类型
  * [POS]: config 层真相源头；lib/repository/middleware 从此读取连接与密钥
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 环境变量：
+ * - PORT          HTTP 端口（默认 20001）
+ * - NODE_ENV      运行环境（默认 development）
+ * - SYSTEM_NAME   系统展示名（默认 SuperNote）
+ * - CORS_ORIGINS  逗号分隔的 CORS 来源
+ * - SUPABASE_URL  Supabase 项目 URL（必填）
+ * - SUPABASE_SERVICE_ROLE_KEY  service_role 密钥（必填，仅服务端）
  */
+import { z } from "zod";
 
-export type ApiEnv = {
+const envSchema = z.object({
+  PORT: z.coerce.number().int().positive().default(20001),
+  NODE_ENV: z.string().default("development"),
+  SYSTEM_NAME: z.string().default("SuperNote"),
+  CORS_ORIGINS: z
+    .string()
+    .default("http://localhost:20000,http://127.0.0.1:20000"),
+  SUPABASE_URL: z.string().url(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
+});
+
+const parsed = envSchema.parse(process.env);
+
+export type Env = {
   port: number;
-  /**
-   * 系统展示名（启动横幅）。
-   * 优先 APP_NAME / SYSTEM_NAME；未设时由 banner 从 CLAUDE.md 等推断。
-   */
-  appName: string;
-  /** Supabase project URL，例如 https://xxx.supabase.co */
-  supabaseUrl: string;
-  /**
-   * 服务端密钥（service_role）。仅 api 进程使用，禁止下发浏览器。
-   * 未配置时 REST client / JWT 校验会拒绝初始化。
-   */
-  supabaseServiceRoleKey: string;
-  /** chat 服务基址，api → chat 转发 AI 请求 */
-  chatUrl: string;
-  /**
-   * api ↔ chat 共享服务令牌。
-   * chat 只认此令牌 + X-User-Id，不直接验用户 JWT。
-   */
-  internalServiceToken: string;
-  /** 浏览器 CORS 来源（逗号分隔） */
+  nodeEnv: string;
+  systemName: string;
   corsOrigins: string[];
+  supabaseUrl: string;
+  supabaseServiceRoleKey: string;
 };
 
-function read(name: string): string {
-  const value = process.env[name];
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function readPort(name: string, fallback: number): number {
-  const raw = read(name);
-  if (!raw) {
-    return fallback;
-  }
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
-}
-
-const corsRaw = read("CORS_ORIGINS") || read("CORS_ORIGIN") || "http://localhost:10001";
-
-export const env: ApiEnv = {
-  port: readPort("PORT", 10002),
-  appName: read("APP_NAME") || read("SYSTEM_NAME"),
-  supabaseUrl: read("SUPABASE_URL"),
-  supabaseServiceRoleKey: read("SUPABASE_SERVICE_ROLE_KEY"),
-  chatUrl: (read("CHAT_URL") || "http://localhost:10003").replace(/\/$/, ""),
-  internalServiceToken: read("INTERNAL_SERVICE_TOKEN"),
-  corsOrigins: corsRaw
-    .split(",")
+export const env: Env = {
+  port: parsed.PORT,
+  nodeEnv: parsed.NODE_ENV,
+  systemName: parsed.SYSTEM_NAME,
+  corsOrigins: parsed.CORS_ORIGINS.split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  supabaseUrl: parsed.SUPABASE_URL,
+  supabaseServiceRoleKey: parsed.SUPABASE_SERVICE_ROLE_KEY,
 };
-
-export function assertSupabaseAdminEnv(): void {
-  if (!env.supabaseUrl || !env.supabaseServiceRoleKey) {
-    throw new Error(
-      "缺少 SUPABASE_URL 或 SUPABASE_SERVICE_ROLE_KEY。请在 api/.env 中配置后重启服务。",
-    );
-  }
-}
-
-export function assertInternalServiceToken(): void {
-  if (!env.internalServiceToken) {
-    throw new Error(
-      "缺少 INTERNAL_SERVICE_TOKEN。api → chat 需要共享服务令牌，请在 api/.env 与 chat/.env 配置相同值。",
-    );
-  }
-}

@@ -12,8 +12,12 @@ interface ImportMetaEnv {
   readonly VITE_SUPABASE_ANON_KEY?: string;
   /** Optional legacy alias when ANON_KEY is unset. */
   readonly VITE_SUPABASE_PUBLISHABLE_KEY?: string;
-  /** Business API base URL (Bearer access_token). */
+  /** Business API base URL (Bearer access_token). Preferred. */
+  readonly VITE_API_BASE_URL?: string;
+  /** @deprecated Prefer VITE_API_BASE_URL */
   readonly VITE_API_URL?: string;
+  /** Chat (Mastra) service base URL — SSE /v1/chat */
+  readonly VITE_CHAT_BASE_URL?: string;
 }
 
 interface ImportMeta {

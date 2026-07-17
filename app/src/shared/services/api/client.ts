@@ -1,12 +1,16 @@
 /**
- * [INPUT]: 依赖 auth.getAccessToken 与 VITE_API_URL
+ * [INPUT]: 依赖 auth.getAccessToken 与 VITE_API_BASE_URL（兼容 VITE_API_URL）
  * [OUTPUT]: 对外提供 apiFetch / apiJson（自动附带 Authorization Bearer）
  * [POS]: shared/services/api 浏览器 → api 客户端；禁止直连 chat
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
 import { getAccessToken } from "../auth/auth.service";
 
-const apiBase = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+const apiBase = (
+  (import.meta.env.VITE_API_BASE_URL as string | undefined) ||
+  (import.meta.env.VITE_API_URL as string | undefined) ||
+  ""
+).replace(/\/$/, "");
 
 export function getApiBaseUrl(): string {
   return apiBase;
@@ -41,7 +45,7 @@ export type ApiFetchOptions = Omit<RequestInit, "headers"> & {
 export async function apiFetch(path: string, options: ApiFetchOptions = {}): Promise<Response> {
   if (!apiBase) {
     throw new ApiClientError(
-      "未配置 VITE_API_URL。请在 app/.env.local 设置 api 基址（如 http://localhost:10002）。",
+      "未配置 VITE_API_BASE_URL。请在 app/.env.local 设置 api 基址（如 http://localhost:20001）。",
       0,
     );
   }
@@ -75,10 +79,14 @@ export async function apiJson<T>(path: string, options: ApiFetchOptions = {}): P
   const body = await res.json().catch(() => null);
 
   if (!res.ok) {
+    const rec =
+      body && typeof body === "object"
+        ? (body as Record<string, unknown>)
+        : null;
     const message =
-      body && typeof body === "object" && "error" in body && typeof (body as { error: unknown }).error === "string"
-        ? (body as { error: string }).error
-        : `API ${res.status}`;
+      (rec && typeof rec.message === "string" && rec.message.trim()) ||
+      (rec && typeof rec.error === "string" && rec.error.trim()) ||
+      `API ${res.status}`;
     throw new ApiClientError(message, res.status, body);
   }
 

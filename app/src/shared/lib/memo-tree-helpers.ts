@@ -1,11 +1,16 @@
 /**
- * [INPUT]: 仅依赖 shared/types/memo 的 MemoTreeNode
+ * [INPUT]: 仅依赖 shared/types/memo 的 MemoTreeNode / DropTarget
  * [OUTPUT]: 对外提供 findNode / findSiblings / insertNode / removeNode / replaceNode /
- *           updateNode / moveNodeInTree / isDescendant / sortNodes / computeSortOrder
- * [POS]: shared/lib 树操作纯函数集；store 的乐观更新逻辑全部基于此模块
+ *           updateNode / moveNodeInTree / isDescendant / sortNodes / computeSortOrder /
+ *           canDropTarget / resolveDropPlacement
+ * [POS]: shared/lib 树操作纯函数集；store 与 MemoTree 拖拽均消费
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
-import type { MemoTreeNode } from "../types/memo";
+import type {
+  DropTarget,
+  MemoTreeNode,
+  MoveMemoNodeInput,
+} from "../types/memo";
 
 /* -------------------------------------------------------------------------- */
 /* 排序                                                                         */
@@ -206,4 +211,115 @@ export function computeSortOrder(
   const prev = Number(sorted[idx]!.sort_order);
   const next = Number(sorted[idx + 1]!.sort_order);
   return String((prev + next) / 2);
+}
+
+/* -------------------------------------------------------------------------- */
+/* 拖拽落点 → move payload                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 是否允许将 dragId 放到 target。
+ * 禁止：拖进自己、拖进自己的任意后代、inside 非 folder。
+ */
+export function canDropTarget(
+  nodes: MemoTreeNode[],
+  dragId: string,
+  target: DropTarget,
+): boolean {
+  if (!dragId) return false;
+
+  if (target.position === "inside") {
+    if (!target.nodeId) return false;
+    const folder = findNode(nodes, target.nodeId);
+    if (!folder || folder.node_type !== "folder") return false;
+    // 自己或后代
+    return !isDescendant(nodes, dragId, target.nodeId);
+  }
+
+  // 层级边界：parentId 不能是 drag 自身或其后代
+  if (target.nodeId == null) {
+    if (target.parentId == null) return true;
+    if (target.parentId === dragId) return false;
+    return !isDescendant(nodes, dragId, target.parentId);
+  }
+
+  // before / after 某节点
+  if (target.nodeId === dragId) return false;
+  const targetNode = findNode(nodes, target.nodeId);
+  if (!targetNode) return false;
+
+  // 新 parent 不能是 drag 自身或其后代
+  const newParent = targetNode.parent_id;
+  if (newParent === dragId) return false;
+  if (newParent && isDescendant(nodes, dragId, newParent)) return false;
+
+  return true;
+}
+
+/**
+ * 将 DropTarget 解析为后端 move 所需的 parent_id + sort_order。
+ * 调用方应先 canDropTarget。
+ */
+export function resolveDropPlacement(
+  nodes: MemoTreeNode[],
+  dragId: string,
+  target: DropTarget,
+): MoveMemoNodeInput {
+  // 放入 folder 本体（含未展开）：作为该 folder 第一个子节点
+  if (target.position === "inside" && target.nodeId) {
+    const siblings = findSiblings(nodes, target.nodeId).filter(
+      (n) => n.id !== dragId,
+    );
+    return {
+      parent_id: target.nodeId,
+      sort_order: computeSortOrder(siblings, "prepend"),
+    };
+  }
+
+  // 层级边界（开头 / 末尾）
+  if (target.nodeId == null) {
+    const siblings = findSiblings(nodes, target.parentId).filter(
+      (n) => n.id !== dragId,
+    );
+    if (target.position === "before") {
+      return {
+        parent_id: target.parentId,
+        sort_order: computeSortOrder(siblings, "prepend"),
+      };
+    }
+    return {
+      parent_id: target.parentId,
+      sort_order: computeSortOrder(siblings, "append"),
+    };
+  }
+
+  // before / after 指定节点（folder 的 after = 整个子树之后的同级位置）
+  const targetNode = findNode(nodes, target.nodeId);
+  if (!targetNode) {
+    return { parent_id: null, sort_order: 1000 };
+  }
+
+  const siblings = findSiblings(nodes, targetNode.parent_id).filter(
+    (n) => n.id !== dragId,
+  );
+  const idx = siblings.findIndex((n) => n.id === target.nodeId);
+
+  if (target.position === "before") {
+    return {
+      parent_id: targetNode.parent_id,
+      sort_order: computeSortOrder(
+        siblings,
+        idx <= 0 ? "prepend" : { afterIndex: idx - 1 },
+      ),
+    };
+  }
+
+  // after
+  return {
+    parent_id: targetNode.parent_id,
+    sort_order: computeSortOrder(
+      siblings,
+      idx < 0 ? "append" : { afterIndex: idx },
+    ),
+  };
 }

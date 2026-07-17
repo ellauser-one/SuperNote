@@ -1,86 +1,160 @@
 /**
- * [INPUT]: 依赖 zustand store、lucide-react 图标、react-router useNavigate、
- *         useFlipAnimation、MemoTreeContextMenu、CreateNodeDialog
- * [OUTPUT]: 对外提供 MemoTree 完整侧栏文件树组件
- * [POS]: widgets/MemoTree 主组件；递归渲染节点行，管理拖拽/重命名/右键/创建状态
+ * [INPUT]: 依赖 zustand store、lucide-react、react-router、
+ *         memo-tree-helpers、MemoTreeContextMenu、CreateNodeDialog、useFlipAnimation
+ * [OUTPUT]: 对外提供 MemoTree 完整侧栏文件树（HTML5 DnD + 乐观 move + FLIP）
+ * [POS]: widgets/MemoTree 主组件；folder/memo 同树；drop 后乐观 UI，成功不 refetch
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 拖拽心智：
+ * - 每一层都是线性列表，有开头/末尾落点
+ * - folder 标题：上 24% before / 中 52% inside / 下 24% after
+ * - folder 的 after = 整个子树之后（同级），不在 title 与 children 之间
+ * - 拖入 folder 中间区域 = 作为该 folder 第一个子节点
+ * - 根空白区域 = parent_id null 末尾
+ * - 禁止拖进自己 / 自己的后代
+ * - move 乐观更新 + FLIP；失败 store 回滚 + toast
  */
 import {
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
   type DragEvent,
 } from "react";
-import { useNavigate } from "react-router-dom";
-import { ChevronRight, FileText, Folder, FolderOpen } from "lucide-react";
-
-import { useMemoTreeStore } from "../../shared/stores/memo-tree.store";
+import { useNavigate, useParams } from "react-router-dom";
 import {
-  computeSortOrder,
+  ChevronRight,
+  FilePlus,
+  FileText,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+} from "lucide-react";
+
+import {
+  canDropTarget,
   findNode,
-  findSiblings,
-  isDescendant,
+  resolveDropPlacement,
   sortNodes,
 } from "../../shared/lib/memo-tree-helpers";
-import type { MemoTreeNode as NodeType } from "../../shared/types/memo";
+import { useMemoTreeStore } from "../../shared/stores/memo-tree.store";
+import type {
+  DropPosition,
+  DropTarget,
+  MemoTreeNode as NodeType,
+} from "../../shared/types/memo";
+import { cn } from "../../shared/ui/cn";
 import { CreateNodeDialog } from "./CreateNodeDialog";
 import {
   MemoTreeContextMenu,
   type ContextMenuAction,
 } from "./MemoTreeContextMenu";
 import { useFlipAnimation } from "./useFlipAnimation";
-import { cn } from "../../shared/ui/cn";
+
+/** 树中是否存在任意 folder（含子树） */
+function hasAnyFolder(nodes: NodeType[]): boolean {
+  for (const n of nodes) {
+    if (n.node_type === "folder") return true;
+    if (n.children.length > 0 && hasAnyFolder(n.children)) return true;
+  }
+  return false;
+}
 
 /* -------------------------------------------------------------------------- */
-/* 拖拽常量                                                                     */
+/* 常量                                                                         */
 /* -------------------------------------------------------------------------- */
 
 const DRAG_TYPE = "application/x-supernote-node-id";
-const DROP_ZONE_BEFORE = 0.24;
-const DROP_ZONE_AFTER = 0.76;
+/** folder 标题行分区：上 before / 中 inside / 下 after（各约 24%） */
+const FOLDER_BEFORE = 0.24;
+const FOLDER_AFTER = 0.76;
 
-type DropPosition = "before" | "after" | "inside" | "root-end";
-
-/* -------------------------------------------------------------------------- */
-/* last-opened 持久化                                                           */
-/* -------------------------------------------------------------------------- */
-
-const LAST_OPENED_KEY = "supernote:last-opened-memo";
-
-function getLastOpened(): string | null {
-  try {
-    return localStorage.getItem(LAST_OPENED_KEY);
-  } catch {
-    return null;
-  }
+function sameDropTarget(a: DropTarget | null, b: DropTarget | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return (
+    a.nodeId === b.nodeId &&
+    a.parentId === b.parentId &&
+    a.position === b.position
+  );
 }
 
-function setLastOpened(nodeId: string) {
-  try {
-    localStorage.setItem(LAST_OPENED_KEY, nodeId);
-  } catch {
-    /* noop */
-  }
+/* -------------------------------------------------------------------------- */
+/* DropLine — 真实落点（层级边界 / 节点后）                                      */
+/* -------------------------------------------------------------------------- */
+
+type DropLineProps = {
+  depth: number;
+  active: boolean;
+  disabled?: boolean;
+  onHover: (e: DragEvent) => void;
+  onDropLine: (e: DragEvent) => void;
+};
+
+function DropLine({
+  depth,
+  active,
+  disabled,
+  onHover,
+  onDropLine,
+}: DropLineProps) {
+  return (
+    <div
+      className={cn(
+        "ds-tree-drop-line",
+        active && "ds-tree-drop-line--active",
+        disabled && "ds-tree-drop-line--disabled",
+      )}
+      style={{ marginLeft: `calc(${depth} * var(--spacing-12))` }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (disabled) {
+          e.dataTransfer.dropEffect = "none";
+          return;
+        }
+        e.dataTransfer.dropEffect = "move";
+        onHover(e);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (disabled) return;
+        onDropLine(e);
+      }}
+    />
+  );
 }
+
+/* -------------------------------------------------------------------------- */
+/* Props                                                                        */
+/* -------------------------------------------------------------------------- */
+
+export type MemoTreeProps = {
+  /** 打开 memo 时回调（用于 last-opened 等） */
+  onMemoOpened?: (nodeId: string) => void;
+};
 
 /* -------------------------------------------------------------------------- */
 /* 主组件                                                                       */
 /* -------------------------------------------------------------------------- */
 
-export function MemoTree() {
+export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
   const nodes = useMemoTreeStore((s) => s.nodes);
   const loading = useMemoTreeStore((s) => s.loading);
-  const fetchTree = useMemoTreeStore((s) => s.fetchTree);
+  const lastError = useMemoTreeStore((s) => s.lastError);
   const moveNode = useMemoTreeStore((s) => s.moveNode);
   const renameNode = useMemoTreeStore((s) => s.renameNode);
+  const clearError = useMemoTreeStore((s) => s.clearError);
   const navigate = useNavigate();
+  const { noteId } = useParams<{ noteId: string }>();
   const containerRef = useRef<HTMLDivElement>(null);
   const flip = useFlipAnimation();
 
-  /* ── 展开/折叠 ──────────────────────────────────────────────── */
+  /* ── 展开 / 选中 ───────────────────────────────────────────── */
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const activeId = noteId ?? null;
+
   const toggleExpand = useCallback((id: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -90,244 +164,169 @@ export function MemoTree() {
     });
   }, []);
 
-  /* ── 选中态 ─────────────────────────────────────────────────── */
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const expandFolder = useCallback((id: string) => {
+    setExpanded((prev) => new Set(prev).add(id));
+  }, []);
 
   /* ── 拖拽态 ─────────────────────────────────────────────────── */
   const [dragSourceId, setDragSourceId] = useState<string | null>(null);
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
-  const [dropPosition, setDropPosition] = useState<DropPosition | null>(null);
-  const [dropIndicatorStyle, setDropIndicatorStyle] = useState<
-    { top: number; left: number; right: number } | null
-  >(null);
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
+  const [draggingBusy, setDraggingBusy] = useState(false);
 
-  /* ── 重命名态 ───────────────────────────────────────────────── */
+  /* ── 重命名 / 菜单 / 创建 ──────────────────────────────────── */
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-
-  /* ── 右键菜单态 ─────────────────────────────────────────────── */
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
+    /** 新建节点的 parent（folder 上右键 = 该 folder；memo 上 = 其 parent） */
     targetParentId: string | null;
+    /** 被右键的节点 id；有值时可重命名 */
+    targetNodeId: string | null;
+    /** 被右键节点的当前标题（进入重命名时用） */
+    targetTitle: string | null;
   } | null>(null);
-
-  /* ── 创建对话框态 ───────────────────────────────────────────── */
   const [createDialog, setCreateDialog] = useState<{
     type: "folder" | "memo";
     parentId: string | null;
   } | null>(null);
 
-  /* ── 初始化拉取 ─────────────────────────────────────────────── */
+  /* ── toast 自动消失 ────────────────────────────────────────── */
   useEffect(() => {
-    const controller = new AbortController();
-    fetchTree(controller.signal).then((tree) => {
-      const lastId = getLastOpened();
-      if (lastId && findNode(tree, lastId)) {
-        setActiveId(lastId);
-        navigate(`/app/notes/${lastId}`, { replace: true });
-      } else if (tree.length === 0) {
-        // 空树：自动创建一个根级 memo
-        // 由父组件或 store 处理
-      }
-    }).catch(() => {
-      /* AbortError 或网络错误，静默 */
-    });
-    return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!lastError) return;
+    const t = window.setTimeout(() => clearError(), 4000);
+    return () => window.clearTimeout(t);
+  }, [lastError, clearError]);
 
-  /* ── 点击 memo 导航 ────────────────────────────────────────── */
+  /* ── 选择 ──────────────────────────────────────────────────── */
   const handleSelect = useCallback(
     (node: NodeType) => {
-      setActiveId(node.id);
       if (node.node_type === "memo") {
-        setLastOpened(node.id);
+        onMemoOpened?.(node.id);
         navigate(`/app/notes/${node.id}`);
       }
     },
-    [navigate],
+    [navigate, onMemoOpened],
   );
 
-  /* ── FLIP: nodes 变化时执行动画 ────────────────────────────── */
-  useEffect(() => {
-    flip.capture(containerRef.current);
-  });
-
-  useEffect(() => {
-    flip.animate(containerRef.current);
-  });
-
-  /* ── 拖拽：dragStart ───────────────────────────────────────── */
-  const handleDragStart = useCallback(
-    (e: DragEvent, nodeId: string) => {
-      setDragSourceId(nodeId);
-      e.dataTransfer.setData(DRAG_TYPE, nodeId);
-      e.dataTransfer.effectAllowed = "move";
-    },
-    [],
-  );
-
-  /* ── 拖拽：计算 drop 区域 ──────────────────────────────────── */
-  const computeDropZone = useCallback(
-    (e: DragEvent, node: NodeType): DropPosition => {
-      if (node.node_type === "folder") {
-        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-        const ratio = (e.clientY - rect.top) / rect.height;
-        if (ratio < DROP_ZONE_BEFORE) return "before";
-        if (ratio > DROP_ZONE_AFTER) return "after";
-        return "inside";
-      }
-      // memo 只支持 before/after
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const ratio = (e.clientY - rect.top) / rect.height;
-      return ratio < 0.5 ? "before" : "after";
-    },
-    [],
-  );
-
-  /* ── 拖拽：dragOver ────────────────────────────────────────── */
-  const handleDragOver = useCallback(
-    (e: DragEvent, node: NodeType) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-
-      if (!dragSourceId || dragSourceId === node.id) return;
-      // 禁止拖入自己或后代
-      if (
-        node.node_type === "folder" &&
-        isDescendant(nodes, dragSourceId, node.id)
-      ) {
-        return;
-      }
-
-      const position = computeDropZone(e, node);
-      setDropTargetId(node.id);
-      setDropPosition(position);
-
-      // 更新 drop indicator 位置
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const containerRect = containerRef.current?.getBoundingClientRect();
-      if (containerRect) {
-        if (position === "before") {
-          setDropIndicatorStyle({
-            top: rect.top - containerRect.top,
-            left: rect.left - containerRect.left,
-            right: containerRect.right - rect.right,
-          });
-        } else if (position === "after") {
-          setDropIndicatorStyle({
-            top: rect.bottom - containerRect.top,
-            left: rect.left - containerRect.left,
-            right: containerRect.right - rect.right,
-          });
-        } else {
-          setDropIndicatorStyle(null);
-        }
-      }
-    },
-    [dragSourceId, nodes, computeDropZone],
-  );
-
-  /* ── 拖拽：根区域 dragOver ─────────────────────────────────── */
-  const handleRootDragOver = useCallback(
-    (e: DragEvent) => {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-      if (!dragSourceId) return;
-
-      setDropTargetId(null);
-      setDropPosition("root-end");
-      setDropIndicatorStyle(null);
-    },
-    [dragSourceId],
-  );
-
-  /* ── 拖拽：drop ────────────────────────────────────────────── */
-  const handleDrop = useCallback(
-    (e: DragEvent, targetNode?: NodeType) => {
-      e.preventDefault();
-      const sourceId = e.dataTransfer.getData(DRAG_TYPE);
-      if (!sourceId) return;
-
-      // 禁止拖自己
-      if (targetNode && sourceId === targetNode.id) {
-        resetDrag();
-        return;
-      }
-
-      // 禁止拖入后代
-      if (
-        targetNode?.node_type === "folder" &&
-        isDescendant(nodes, sourceId, targetNode.id)
-      ) {
-        resetDrag();
-        return;
-      }
-
-      flip.capture(containerRef.current);
-
-      if (!targetNode || dropPosition === "root-end") {
-        // 放到根目录末尾
-        const siblings = findSiblings(nodes, null).filter(
-          (n) => n.id !== sourceId,
-        );
-        const sortOrder = computeSortOrder(siblings, "append");
-        void moveNode(sourceId, { parent_id: null, sort_order: sortOrder }, sortOrder);
-      } else if (dropPosition === "inside" && targetNode.node_type === "folder") {
-        // 拖入文件夹内部：作为第一个子节点
-        const children = sortNodes(targetNode.children).filter(
-          (n) => n.id !== sourceId,
-        );
-        const sortOrder = computeSortOrder(children, "prepend");
-        void moveNode(
-          sourceId,
-          { parent_id: targetNode.id, sort_order: sortOrder },
-          sortOrder,
-        );
-        // 自动展开目标文件夹
-        setExpanded((prev) => new Set(prev).add(targetNode.id));
-      } else {
-        // before / after 某个节点
-        const siblings = findSiblings(nodes, targetNode.parent_id).filter(
-          (n) => n.id !== sourceId,
-        );
-        const targetIndex = siblings.findIndex((n) => n.id === targetNode.id);
-        const sortOrder =
-          dropPosition === "before"
-            ? computeSortOrder(siblings, { afterIndex: targetIndex - 1 })
-            : computeSortOrder(siblings, { afterIndex: targetIndex });
-        void moveNode(
-          sourceId,
-          { parent_id: targetNode.parent_id, sort_order: sortOrder },
-          sortOrder,
-        );
-      }
-
-      resetDrag();
-    },
-    [dropPosition, nodes, moveNode, flip],
-  );
-
-  const handleRootDrop = useCallback(
-    (e: DragEvent) => {
-      handleDrop(e);
-    },
-    [handleDrop],
-  );
-
+  /* ── 拖拽 helpers ──────────────────────────────────────────── */
   const resetDrag = useCallback(() => {
     setDragSourceId(null);
-    setDropTargetId(null);
-    setDropPosition(null);
-    setDropIndicatorStyle(null);
+    setDropTarget(null);
+  }, []);
+
+  const proposeDropTarget = useCallback(
+    (next: DropTarget) => {
+      if (!dragSourceId) {
+        setDropTarget(null);
+        return;
+      }
+      if (!canDropTarget(nodes, dragSourceId, next)) {
+        setDropTarget(null);
+        return;
+      }
+      setDropTarget((prev) => (sameDropTarget(prev, next) ? prev : next));
+    },
+    [dragSourceId, nodes],
+  );
+
+  const handleDragStart = useCallback((e: DragEvent, nodeId: string) => {
+    setDragSourceId(nodeId);
+    setDropTarget(null);
+    e.dataTransfer.setData(DRAG_TYPE, nodeId);
+    e.dataTransfer.effectAllowed = "move";
   }, []);
 
   const handleDragEnd = useCallback(() => {
     resetDrag();
   }, [resetDrag]);
 
-  /* ── 双击重命名 ────────────────────────────────────────────── */
+  /** folder 标题行三段分区 */
+  const zoneFromFolderRow = useCallback((e: DragEvent): DropPosition => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ratio = (e.clientY - rect.top) / Math.max(rect.height, 1);
+    if (ratio < FOLDER_BEFORE) return "before";
+    if (ratio > FOLDER_AFTER) return "after";
+    return "inside";
+  }, []);
+
+  /** memo 标题行：上 before / 下 after */
+  const zoneFromMemoRow = useCallback((e: DragEvent): DropPosition => {
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ratio = (e.clientY - rect.top) / Math.max(rect.height, 1);
+    return ratio < 0.5 ? "before" : "after";
+  }, []);
+
+  const commitDrop = useCallback(
+    async (sourceId: string, target: DropTarget) => {
+      if (!canDropTarget(nodes, sourceId, target)) {
+        resetDrag();
+        return;
+      }
+
+      const payload = resolveDropPlacement(nodes, sourceId, target);
+
+      // 无实际变化时跳过
+      const current = findNode(nodes, sourceId);
+      if (
+        current &&
+        current.parent_id === payload.parent_id &&
+        String(current.sort_order) === String(payload.sort_order)
+      ) {
+        resetDrag();
+        return;
+      }
+
+      setDraggingBusy(true);
+      flip.capture(containerRef.current);
+
+      // 乐观 move 同步改 store；双 rAF 等 React 提交 DOM 后再 FLIP
+      const movePromise = moveNode(sourceId, payload);
+
+      if (payload.parent_id) {
+        expandFolder(payload.parent_id);
+      }
+
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          flip.animate(containerRef.current);
+        });
+      });
+
+      try {
+        await movePromise;
+      } catch {
+        /* lastError 已由 store 写入；回滚后无需额外 FLIP */
+      } finally {
+        setDraggingBusy(false);
+        resetDrag();
+      }
+    },
+    [nodes, moveNode, expandFolder, flip, resetDrag],
+  );
+
+  const handleDropWithTarget = useCallback(
+    (e: DragEvent, target: DropTarget) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const sourceId =
+        e.dataTransfer.getData(DRAG_TYPE) || dragSourceId || "";
+      if (!sourceId || draggingBusy) {
+        resetDrag();
+        return;
+      }
+      void commitDrop(sourceId, target);
+    },
+    [dragSourceId, draggingBusy, commitDrop, resetDrag],
+  );
+
+  const rootEndTarget: DropTarget = {
+    nodeId: null,
+    parentId: null,
+    position: "after",
+  };
+
+  /* ── 重命名 ────────────────────────────────────────────────── */
   const handleDoubleClick = useCallback((node: NodeType) => {
     setRenamingId(node.id);
     setRenameValue(node.title);
@@ -340,7 +339,7 @@ export function MemoTree() {
       try {
         await renameNode(renamingId, trimmed);
       } catch {
-        /* store 已回滚 */
+        /* store 回滚 + lastError */
       }
     }
     setRenamingId(null);
@@ -352,142 +351,299 @@ export function MemoTree() {
     setRenameValue("");
   }, []);
 
-  /* ── 右键菜单 ──────────────────────────────────────────────── */
+  /* ── 右键 ──────────────────────────────────────────────────── */
   const handleContextMenu = useCallback(
-    (e: React.MouseEvent, parentId: string | null) => {
+    (
+      e: React.MouseEvent,
+      opts: {
+        parentId: string | null;
+        nodeId?: string | null;
+        title?: string | null;
+      },
+    ) => {
       e.preventDefault();
-      setContextMenu({ x: e.clientX, y: e.clientY, targetParentId: parentId });
+      e.stopPropagation();
+      setContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        targetParentId: opts.parentId,
+        targetNodeId: opts.nodeId ?? null,
+        targetTitle: opts.title ?? null,
+      });
     },
     [],
   );
 
   const handleContextAction = useCallback(
     (action: ContextMenuAction) => {
-      const parentId = contextMenu?.targetParentId ?? null;
-      if (action === "create-folder") {
-        setCreateDialog({ type: "folder", parentId });
-      } else {
-        setCreateDialog({ type: "memo", parentId });
+      if (action === "rename") {
+        const id = contextMenu?.targetNodeId;
+        if (!id) return;
+        setRenamingId(id);
+        setRenameValue(contextMenu?.targetTitle ?? "");
+        return;
       }
+      const parentId = contextMenu?.targetParentId ?? null;
+      setCreateDialog({
+        type: action === "create-folder" ? "folder" : "memo",
+        parentId,
+      });
     },
     [contextMenu],
   );
 
-  /* ── 创建回调 ──────────────────────────────────────────────── */
   const handleCreated = useCallback(
     (nodeId: string) => {
       const node = findNode(useMemoTreeStore.getState().nodes, nodeId);
       if (node?.node_type === "memo") {
-        setLastOpened(nodeId);
+        onMemoOpened?.(nodeId);
         navigate(`/app/notes/${nodeId}`);
       }
+      if (node?.parent_id) {
+        expandFolder(node.parent_id);
+      }
     },
-    [navigate],
+    [navigate, expandFolder, onMemoOpened],
   );
 
-  /* ── 递归渲染 ──────────────────────────────────────────────── */
-  const renderNode = useCallback(
-    (node: NodeType, depth: number) => {
-      const isFolder = node.node_type === "folder";
-      const isExpanded = expanded.has(node.id);
-      const isActive = activeId === node.id;
-      const isDropInside =
-        dropTargetId === node.id && dropPosition === "inside";
-      const isRenaming = renamingId === node.id;
-      const sortedChildren = sortNodes(node.children);
+  /* ── 渲染一层列表 ──────────────────────────────────────────── */
+  const renderLevel = useCallback(
+    (levelNodes: NodeType[], parentId: string | null, depth: number) => {
+      const sorted = sortNodes(levelNodes);
+
+      const startTarget: DropTarget = {
+        nodeId: null,
+        parentId,
+        position: "before",
+      };
+      const endTarget: DropTarget = {
+        nodeId: null,
+        parentId,
+        position: "after",
+      };
+
+      const startActive =
+        dropTarget?.nodeId === null &&
+        dropTarget.parentId === parentId &&
+        dropTarget.position === "before";
+      const endActive =
+        dropTarget?.nodeId === null &&
+        dropTarget.parentId === parentId &&
+        dropTarget.position === "after";
+
+      const startDisabled =
+        Boolean(dragSourceId) &&
+        !canDropTarget(nodes, dragSourceId!, startTarget);
+      const endDisabled =
+        Boolean(dragSourceId) &&
+        !canDropTarget(nodes, dragSourceId!, endTarget);
 
       return (
-        <div key={node.id}>
-          <div
-            data-flip-id={node.id}
-            className={cn(
-              "ds-tree-node",
-              isActive && "ds-tree-node--active",
-              isDropInside && "ds-tree-node--drop-inside",
-            )}
-            style={{ paddingLeft: `${depth * 12 + 8}px` }}
-            draggable={!isRenaming}
-            onDragStart={(e) => handleDragStart(e, node.id)}
-            onDragOver={(e) => handleDragOver(e, node)}
-            onDrop={(e) => handleDrop(e, node)}
-            onDragEnd={handleDragEnd}
-            onClick={() => {
-              if (isFolder) toggleExpand(node.id);
-              handleSelect(node);
-            }}
-            onDoubleClick={() => handleDoubleClick(node)}
-            onContextMenu={(e) =>
-              handleContextMenu(e, isFolder ? node.id : node.parent_id)
-            }
-          >
-            {/* 折叠箭头 */}
-            {isFolder ? (
-              <span
-                className={cn(
-                  "ds-tree-node__chevron",
-                  isExpanded && "ds-tree-node__chevron--open",
+        <div className="ds-tree-level">
+          {/* 层级开头落点 */}
+          <DropLine
+            depth={depth}
+            active={Boolean(dragSourceId) && startActive}
+            disabled={startDisabled}
+            onHover={() => proposeDropTarget(startTarget)}
+            onDropLine={(e) => handleDropWithTarget(e, startTarget)}
+          />
+
+          {sorted.map((node) => {
+            const isFolder = node.node_type === "folder";
+            const isExpanded = expanded.has(node.id);
+            const isActive = activeId === node.id;
+            const isRenaming = renamingId === node.id;
+            const isDragging = dragSourceId === node.id;
+
+            const afterTarget: DropTarget = {
+              nodeId: node.id,
+              parentId: node.parent_id,
+              position: "after",
+            };
+            const afterActive =
+              dropTarget?.nodeId === node.id &&
+              dropTarget.position === "after";
+            const afterDisabled =
+              Boolean(dragSourceId) &&
+              !canDropTarget(nodes, dragSourceId!, afterTarget);
+
+            const dropInside =
+              dropTarget?.nodeId === node.id &&
+              dropTarget.position === "inside";
+            const dropBefore =
+              dropTarget?.nodeId === node.id &&
+              dropTarget.position === "before";
+
+            return (
+              <div key={node.id} className="ds-tree-subtree">
+                {/* 节点行 — 自身就是 before/inside/after 落点 */}
+                <div
+                  data-flip-id={node.id}
+                  className={cn(
+                    "ds-tree-node",
+                    isActive && "ds-tree-node--active",
+                    dropInside && "ds-tree-node--drop-inside",
+                    dropBefore && "ds-tree-node--drop-before",
+                    isDragging && "ds-tree-node--dragging",
+                  )}
+                  style={{
+                    paddingLeft: `calc(${depth} * var(--spacing-12) + var(--spacing-8))`,
+                  }}
+                  draggable={!isRenaming && !draggingBusy}
+                  onDragStart={(e) => handleDragStart(e, node.id)}
+                  onDragEnd={handleDragEnd}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!dragSourceId || dragSourceId === node.id) {
+                      e.dataTransfer.dropEffect = "none";
+                      return;
+                    }
+
+                    const position = isFolder
+                      ? zoneFromFolderRow(e)
+                      : zoneFromMemoRow(e);
+                    const next: DropTarget = {
+                      nodeId: node.id,
+                      parentId: node.parent_id,
+                      position,
+                    };
+
+                    if (!canDropTarget(nodes, dragSourceId, next)) {
+                      e.dataTransfer.dropEffect = "none";
+                      setDropTarget(null);
+                      return;
+                    }
+
+                    e.dataTransfer.dropEffect = "move";
+                    proposeDropTarget(next);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (!dragSourceId) return;
+
+                    const position = isFolder
+                      ? zoneFromFolderRow(e)
+                      : zoneFromMemoRow(e);
+                    const next: DropTarget = {
+                      nodeId: node.id,
+                      parentId: node.parent_id,
+                      position,
+                    };
+                    handleDropWithTarget(e, next);
+                  }}
+                  onClick={() => {
+                    if (isFolder) toggleExpand(node.id);
+                    handleSelect(node);
+                  }}
+                  onDoubleClick={() => handleDoubleClick(node)}
+                  onContextMenu={(e) =>
+                    handleContextMenu(e, {
+                      parentId: isFolder ? node.id : node.parent_id,
+                      nodeId: node.id,
+                      title: node.title,
+                    })
+                  }
+                >
+                  {isFolder ? (
+                    <span
+                      className={cn(
+                        "ds-tree-node__chevron",
+                        isExpanded && "ds-tree-node__chevron--open",
+                      )}
+                    >
+                      <ChevronRight />
+                    </span>
+                  ) : (
+                    <span
+                      className="ds-tree-node__chevron"
+                      style={{ visibility: "hidden" }}
+                    >
+                      <ChevronRight />
+                    </span>
+                  )}
+
+                  <span className="ds-tree-node__icon">
+                    {isFolder ? (
+                      isExpanded ? (
+                        <FolderOpen />
+                      ) : (
+                        <Folder />
+                      )
+                    ) : (
+                      <FileText />
+                    )}
+                  </span>
+
+                  {isRenaming ? (
+                    <input
+                      className="ds-tree-node__rename"
+                      value={renameValue}
+                      autoFocus
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void commitRename();
+                        if (e.key === "Escape") cancelRename();
+                      }}
+                      onBlur={() => void commitRename()}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  ) : (
+                    <span className="ds-tree-node__title">{node.title}</span>
+                  )}
+                </div>
+
+                {/* 展开的 children：独立一层列表（有自己的首尾落点） */}
+                {isFolder && isExpanded && (
+                  <div className="ds-tree-children">
+                    {renderLevel(node.children, node.id, depth + 1)}
+                  </div>
                 )}
-              >
-                <ChevronRight />
-              </span>
-            ) : (
-              <span className="ds-tree-node__chevron" style={{ visibility: "hidden" }}>
-                <ChevronRight />
-              </span>
-            )}
 
-            {/* 图标 */}
-            <span className="ds-tree-node__icon">
-              {isFolder ? (
-                isExpanded ? (
-                  <FolderOpen />
-                ) : (
-                  <Folder />
-                )
-              ) : (
-                <FileText />
-              )}
-            </span>
+                {/*
+                  节点后落点：
+                  - 对 folder 表示「整个子树之后」的同级 after
+                  - 必须在 children 之后渲染，不能在 title 与 children 之间
+                */}
+                <DropLine
+                  depth={depth}
+                  active={Boolean(dragSourceId) && afterActive}
+                  disabled={afterDisabled}
+                  onHover={() => proposeDropTarget(afterTarget)}
+                  onDropLine={(e) => handleDropWithTarget(e, afterTarget)}
+                />
+              </div>
+            );
+          })}
 
-            {/* 标题或重命名输入框 */}
-            {isRenaming ? (
-              <input
-                className="ds-tree-node__rename"
-                value={renameValue}
-                autoFocus
-                onChange={(e) => setRenameValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitRename();
-                  if (e.key === "Escape") cancelRename();
-                }}
-                onBlur={commitRename}
-                onClick={(e) => e.stopPropagation()}
-              />
-            ) : (
-              <span className="ds-tree-node__title">{node.title}</span>
-            )}
-          </div>
-
-          {/* 子节点 */}
-          {isFolder && isExpanded && sortedChildren.length > 0 && (
-            <div className="ds-tree-children">
-              {sortedChildren.map((child) => renderNode(child, depth + 1))}
-            </div>
-          )}
+          {/* 层级末尾落点（空层也需要，方便拖入空 folder） */}
+          <DropLine
+            depth={depth}
+            active={Boolean(dragSourceId) && endActive}
+            disabled={endDisabled}
+            onHover={() => proposeDropTarget(endTarget)}
+            onDropLine={(e) => handleDropWithTarget(e, endTarget)}
+          />
         </div>
       );
     },
     [
+      nodes,
       expanded,
       activeId,
-      dropTargetId,
-      dropPosition,
       renamingId,
       renameValue,
+      dragSourceId,
+      dropTarget,
+      draggingBusy,
+      proposeDropTarget,
+      handleDropWithTarget,
       handleDragStart,
-      handleDragOver,
-      handleDrop,
       handleDragEnd,
+      zoneFromFolderRow,
+      zoneFromMemoRow,
       toggleExpand,
       handleSelect,
       handleDoubleClick,
@@ -497,52 +653,166 @@ export function MemoTree() {
     ],
   );
 
-  const rootNodes = sortNodes(nodes);
+  const openCreate = useCallback(
+    (type: "folder" | "memo", parentId: string | null = null) => {
+      setCreateDialog({ type, parentId });
+    },
+    [],
+  );
 
-  if (loading && nodes.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center font-helvetica-now text-ui text-graphite">
-        加载中…
-      </div>
-    );
-  }
+  const rootEndActive =
+    Boolean(dragSourceId) &&
+    dropTarget?.nodeId === null &&
+    dropTarget.parentId === null &&
+    dropTarget.position === "after";
+
+  const showFolderHint = !loading && nodes.length > 0 && !hasAnyFolder(nodes);
+  const showEmptyHint = !loading && nodes.length === 0;
 
   return (
-    <div
-      ref={containerRef}
-      className="relative flex min-h-0 flex-1 flex-col overflow-y-auto"
-      onContextMenu={(e) => handleContextMenu(e, null)}
-      onDragOver={handleRootDragOver}
-      onDrop={handleRootDrop}
-    >
-      {/* Drop indicator 横线 */}
-      {dropIndicatorStyle && (
-        <div
-          className="ds-tree-drop-indicator"
-          style={{
-            top: dropIndicatorStyle.top,
-            left: dropIndicatorStyle.left,
-            right: dropIndicatorStyle.right,
-          }}
-        />
-      )}
+    <div className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden">
+      {/* 侧栏头：标题 + 可见新建入口（不只靠右键） */}
+      <div className="flex shrink-0 items-center justify-between gap-8 border-b border-vellum px-12 py-10">
+        <div className="min-w-0">
+          <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
+            Memo Tree
+          </p>
+          <h1 className="truncate font-davinci text-title font-medium">
+            备忘录
+          </h1>
+        </div>
+        <div className="ds-tree-toolbar">
+          <button
+            type="button"
+            className="ds-tree-toolbar__btn"
+            title="新建文件夹"
+            aria-label="新建文件夹"
+            onClick={() => openCreate("folder", null)}
+          >
+            <FolderPlus className="size-icon-xs" aria-hidden="true" />
+            <span className="hidden sm:inline">文件夹</span>
+          </button>
+          <button
+            type="button"
+            className="ds-tree-toolbar__btn"
+            title="新建备忘录"
+            aria-label="新建备忘录"
+            onClick={() => openCreate("memo", null)}
+          >
+            <FilePlus className="size-icon-xs" aria-hidden="true" />
+            <span className="hidden sm:inline">备忘录</span>
+          </button>
+        </div>
+      </div>
 
-      {rootNodes.map((node) => renderNode(node, 0))}
+      <div
+        ref={containerRef}
+        className="relative flex min-h-0 flex-1 flex-col overflow-y-auto"
+        onContextMenu={(e) =>
+          handleContextMenu(e, { parentId: null, nodeId: null, title: null })
+        }
+        onDragLeave={(e) => {
+          if (
+            e.currentTarget === e.target ||
+            !e.currentTarget.contains(e.relatedTarget as Node)
+          ) {
+            setDropTarget(null);
+          }
+        }}
+      >
+        {loading && nodes.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center font-helvetica-now text-ui text-graphite">
+            加载中…
+          </div>
+        ) : (
+          <>
+            {showEmptyHint && (
+              <div className="ds-tree-empty">
+                <p>还没有内容。先建一个文件夹，或直接写备忘录。</p>
+                <div className="ds-tree-empty__actions">
+                  <button
+                    type="button"
+                    className="ds-tree-toolbar__btn"
+                    onClick={() => openCreate("folder", null)}
+                  >
+                    <FolderPlus className="size-icon-xs" aria-hidden="true" />
+                    新建文件夹
+                  </button>
+                  <button
+                    type="button"
+                    className="ds-tree-toolbar__btn"
+                    onClick={() => openCreate("memo", null)}
+                  >
+                    <FilePlus className="size-icon-xs" aria-hidden="true" />
+                    新建备忘录
+                  </button>
+                </div>
+              </div>
+            )}
 
-      {/* 根区域空白 drop 区 */}
-      <div className="ds-tree-root-drop" />
+            {showFolderHint && (
+              <div className="ds-tree-empty">
+                <p>
+                  当前只有备忘录，还没有文件夹。点右上角「文件夹」创建后，可把备忘录拖进去。
+                </p>
+                <div className="ds-tree-empty__actions">
+                  <button
+                    type="button"
+                    className="ds-tree-toolbar__btn"
+                    onClick={() => openCreate("folder", null)}
+                  >
+                    <FolderPlus className="size-icon-xs" aria-hidden="true" />
+                    新建文件夹
+                  </button>
+                </div>
+              </div>
+            )}
 
-      {/* 右键菜单 */}
+            {renderLevel(nodes, null, 0)}
+
+            {/* 根空白区域：拖到此处 = 根目录末尾 */}
+            <div
+              className={cn(
+                "ds-tree-root-drop",
+                rootEndActive && "ds-tree-root-drop--active",
+              )}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!dragSourceId) {
+                  e.dataTransfer.dropEffect = "none";
+                  return;
+                }
+                if (!canDropTarget(nodes, dragSourceId, rootEndTarget)) {
+                  e.dataTransfer.dropEffect = "none";
+                  setDropTarget(null);
+                  return;
+                }
+                e.dataTransfer.dropEffect = "move";
+                proposeDropTarget(rootEndTarget);
+              }}
+              onDrop={(e) => handleDropWithTarget(e, rootEndTarget)}
+            />
+          </>
+        )}
+
+        {lastError && (
+          <div className="ds-tree-toast" role="alert">
+            {lastError}
+          </div>
+        )}
+      </div>
+
       {contextMenu && (
         <MemoTreeContextMenu
           x={contextMenu.x}
           y={contextMenu.y}
+          canRename={Boolean(contextMenu.targetNodeId)}
           onAction={handleContextAction}
           onClose={() => setContextMenu(null)}
         />
       )}
 
-      {/* 创建对话框 */}
       {createDialog && (
         <CreateNodeDialog
           open={Boolean(createDialog)}

@@ -1,132 +1,133 @@
 /**
- * [INPUT]: 依赖 repository/profile、dto 类型、common/app-error
- * [OUTPUT]: 对外提供当前用户 profile 读改与 username 可用性
- * [POS]: service 层业务编排与权限判断；不依赖 Hono Context
+ * [INPUT]: 依赖 repository/profile、model/profile、common/app-error
+ * [OUTPUT]: 对外提供 getOrCreateProfile / updateProfile
+ * [POS]: service 层 profile 编排与归属校验；不依赖 Hono Context
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  *
- * 身份只认 JWT userId；写入路径强制 id = userId，忽略/禁止 body 身份字段。
+ * 安全：
+ * - user id 只能来自 AuthUser（JWT），禁止 body
+ * - service_role 绕过 RLS，本层必须强制 id = authUser.id
+ * - 日志不打印 Authorization / token
  */
-import { AppError } from "../common/app-error";
+import { HttpError } from "../common/app-error";
 import type {
-  UpdateProfileBody,
-  UpsertProfileBody,
-} from "../dto/profile.dto";
-import { ApiCode } from "../model/response.model";
-import type { User } from "../model/user.model";
-import {
-  findProfileById,
-  findProfileByUsername,
-  updateProfile,
-  upsertProfile,
-} from "../repository/profile.repository";
+  AuthUser,
+  Profile,
+  ProfileUpdate,
+} from "../model/profile.model";
+import * as profileRepo from "../repository/profile.repository";
 
-export type Actor = {
-  userId: string;
-  email: string | null;
-};
+/**
+ * GET /profile：查询；不存在则创建默认 profile。
+ */
+export async function getOrCreateProfile(
+  authUser: AuthUser,
+): Promise<Profile> {
+  const existing = await profileRepo.findProfileById(authUser.id);
+  if (existing) {
+    // 归属双检（service_role 绕过 RLS）
+    assertOwnership(existing.id, authUser.id);
+    return existing;
+  }
 
-/** 读取当前用户 profile；不存在返回 null（由 route 决定 404 或空 data） */
-export async function getMyProfile(actor: Actor): Promise<User | null> {
-  return findProfileById(actor.userId);
+  const defaults = buildDefaultProfile(authUser);
+
+  try {
+    const created = await profileRepo.insertProfile(defaults);
+    assertOwnership(created.id, authUser.id);
+    return created;
+  } catch (err) {
+    // 并发首次访问：唯一主键冲突时回读
+    if (isUniqueViolation(err)) {
+      const raced = await profileRepo.findProfileById(authUser.id);
+      if (raced) {
+        assertOwnership(raced.id, authUser.id);
+        return raced;
+      }
+    }
+    throw err;
+  }
 }
 
 /**
- * 更新本人 profile。
- * repository 条件 id=eq.{userId}；再校验返回行归属（防御性）。
+ * PATCH /profile：先 ensure 存在，再按 JWT id 更新。
  */
-export async function updateMyProfile(
-  actor: Actor,
-  body: UpdateProfileBody,
-): Promise<User> {
-  if (body.username !== undefined) {
-    await assertUsernameAvailable(body.username, actor.userId);
+export async function updateProfile(
+  authUser: AuthUser,
+  patch: ProfileUpdate,
+): Promise<Profile> {
+  // 确保行存在（并完成归属）
+  await getOrCreateProfile(authUser);
+
+  if (Object.keys(patch).length === 0) {
+    throw new HttpError(400, "VALIDATION_ERROR", "请求体无有效更新字段");
   }
 
-  const patch: {
-    username?: string | null;
-    display_name?: string | null;
-  } = {};
-
-  if (body.username !== undefined) {
-    patch.username = body.username;
-  }
-  if (body.displayName !== undefined) {
-    patch.display_name = body.displayName;
-  }
-
-  const updated = await updateProfile(actor.userId, patch);
-  assertOwned(updated, actor.userId);
+  const updated = await profileRepo.updateProfileById(authUser.id, patch);
+  assertOwnership(updated.id, authUser.id);
   return updated;
 }
 
-/**
- * Upsert 本人 profile。
- * id / email 只来自 JWT，body 仅可提供 username / displayName。
- */
-export async function upsertMyProfile(
-  actor: Actor,
-  body: UpsertProfileBody,
-): Promise<User> {
-  const username =
-    body.username === undefined ? null : body.username;
+// ---------------------------------------------------------------------------
+// 内部
+// ---------------------------------------------------------------------------
 
-  if (username) {
-    await assertUsernameAvailable(username, actor.userId);
+function assertOwnership(rowId: string, authUserId: string): void {
+  if (rowId !== authUserId) {
+    // 理论上 service_role + eq(id) 不会走到；防御 BOLA
+    throw new HttpError(403, "FORBIDDEN", "无权访问该 profile");
   }
-
-  const existing = await findProfileById(actor.userId);
-
-  const saved = await upsertProfile({
-    id: actor.userId,
-    email: actor.email,
-    username:
-      body.username !== undefined
-        ? body.username
-        : (existing?.username ?? null),
-    display_name:
-      body.displayName !== undefined
-        ? body.displayName
-        : (existing?.displayName ?? null),
-  });
-
-  assertOwned(saved, actor.userId);
-  return saved;
 }
 
 /**
- * username 是否可用。
- * 已占用但属于本人 → available=true（改名回写自己）。
+ * 默认 nickname：user_metadata 昵称/姓名 → 邮箱前缀 → "user"
+ * 默认 username：supernote_${id 去横线前 6 位}
  */
-export async function isUsernameAvailable(
-  actor: Actor,
-  username: string,
-): Promise<{ available: boolean; username: string }> {
-  const found = await findProfileByUsername(username);
-  if (!found) {
-    return { available: true, username };
-  }
+function buildDefaultProfile(
+  authUser: AuthUser,
+): Pick<Profile, "id" | "email" | "nickname" | "username"> {
+  const meta = authUser.user_metadata ?? {};
+  const metaNickname = firstNonEmptyString(
+    meta.nickname,
+    meta.full_name,
+    meta.name,
+    meta.preferred_username,
+    meta.username,
+  );
+
+  const email = authUser.email ?? null;
+  const emailPrefix =
+    email && email.includes("@")
+      ? email.split("@")[0]?.trim() || null
+      : null;
+
+  const nickname = metaNickname || emailPrefix || "user";
+  const username = `supernote_${authUser.id.replace(/-/g, "").slice(0, 6)}`;
+
   return {
-    available: found.id === actor.userId,
+    id: authUser.id,
+    email,
+    nickname,
     username,
   };
 }
 
-async function assertUsernameAvailable(
-  username: string,
-  ownerId: string,
-): Promise<void> {
-  const found = await findProfileByUsername(username);
-  if (found && found.id !== ownerId) {
-    throw new AppError(ApiCode.CONFLICT, "Username is already taken", 409);
+function firstNonEmptyString(...values: unknown[]): string | null {
+  for (const v of values) {
+    if (typeof v === "string") {
+      const t = v.trim();
+      if (t) return t;
+    }
   }
+  return null;
 }
 
-function assertOwned(user: User, userId: string): void {
-  if (user.id !== userId) {
-    throw new AppError(
-      ApiCode.FORBIDDEN,
-      "Profile does not belong to the authenticated user",
-      403,
-    );
-  }
+function isUniqueViolation(err: unknown): boolean {
+  if (!(err instanceof HttpError)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("duplicate") ||
+    msg.includes("unique") ||
+    msg.includes("23505")
+  );
 }

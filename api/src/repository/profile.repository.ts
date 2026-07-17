@@ -1,201 +1,93 @@
 /**
- * [INPUT]: 依赖 lib/supabase-rest 与 model/user.model
- * [OUTPUT]: 对外提供 profiles 表 REST CRUD（find / upsert / update）
- * [POS]: repository 层；只封装 PostgREST，不写业务判断与归属校验
+ * [INPUT]: 依赖 lib/supabase-rest、model/profile.model、common/app-error
+ * [OUTPUT]: 对外提供 findProfileById / insertProfile / updateProfileById
+ * [POS]: repository 层 profiles CRUD；只走 supabase-rest，无业务权限
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 约定：
+ * - service_role 绕过 RLS；归属由 service 层保证（id 仅来自 JWT）
+ * - Prefer: return=representation 返回写入后的行
+ * - 禁止 supabase-js 客户端 / 连接串
  */
-import { AppError } from "../common/app-error";
-import { supabaseRest, SupabaseRestError } from "../lib/supabase-rest";
-import { ApiCode } from "../model/response.model";
+import { HttpError } from "../common/app-error";
 import {
-  PROFILE_SELECT,
-  PROFILES_TABLE,
-  type ProfileInsert,
-  type ProfileRow,
-  type ProfileUpdate,
-  type User,
-  type UserId,
-  userFromProfileRow,
-} from "../model/user.model";
+  createPostgrestQuery,
+  supabaseRest,
+} from "../lib/supabase-rest";
+import type { Profile, ProfileUpdate } from "../model/profile.model";
 
-export class ProfileRepositoryError extends AppError {
-  readonly missingRelation: boolean;
-  readonly pgCode?: string;
+const TABLE = "profiles";
 
-  constructor(
-    message: string,
-    options?: { code?: string; httpStatus?: number; cause?: unknown },
-  ) {
-    super(
-      options?.httpStatus && options.httpStatus >= 400 && options.httpStatus < 600
-        ? options.httpStatus
-        : ApiCode.BAD_GATEWAY,
-      message,
-      options?.httpStatus ?? 502,
-    );
-    this.name = "ProfileRepositoryError";
-    this.pgCode = options?.code;
-    this.missingRelation = isMissingRelation(message, options?.code);
-    if (options?.cause !== undefined) {
-      this.cause = options.cause;
-    }
-  }
-}
+/** 全列；与 profiles.sql 对齐，由 PostgREST 返回实际列 */
+const PROFILE_SELECT = "*";
 
-function isMissingRelation(message: string, code?: string): boolean {
-  const lower = message.toLowerCase();
-  return (
-    code === "42P01" ||
-    code === "PGRST205" ||
-    lower.includes("does not exist") ||
-    lower.includes("could not find the table") ||
-    lower.includes("schema cache")
-  );
-}
+/** 按主键查询；无行返回 null */
+export async function findProfileById(id: string): Promise<Profile | null> {
+  const query = createPostgrestQuery()
+    .select(PROFILE_SELECT)
+    .eq("id", id)
+    .limit(1)
+    .build();
 
-function throwFromRest(op: string, err: unknown): never {
-  if (err instanceof SupabaseRestError) {
-    const details = err.details as { code?: string } | undefined;
-    throw new ProfileRepositoryError(
-      `[profile.repository] ${op} failed: ${err.message}`,
-      {
-        code: details?.code,
-        httpStatus: err.status,
-        cause: err,
-      },
-    );
-  }
-  const message = err instanceof Error ? err.message : String(err);
-  throw new ProfileRepositoryError(`[profile.repository] ${op} failed: ${message}`, {
-    httpStatus: 502,
-    cause: err,
+  const rows = await supabaseRest<Profile[]>(TABLE, {
+    method: "GET",
+    query,
   });
-}
 
-function firstRow(rows: ProfileRow[] | ProfileRow | null): ProfileRow | null {
-  if (!rows) {
+  if (!rows || rows.length === 0) {
     return null;
   }
-  if (Array.isArray(rows)) {
-    return rows[0] ?? null;
-  }
-  return rows;
+
+  return rows[0] ?? null;
 }
 
-/** 按 id 查询；不存在返回 null */
-export async function findProfileById(id: UserId): Promise<User | null> {
-  try {
-    const { data } = await supabaseRest<ProfileRow[]>(PROFILES_TABLE, {
-      method: "GET",
-      query: {
-        select: PROFILE_SELECT,
-        id: `eq.${id}`,
-        limit: 1,
-      },
-    });
-    const row = firstRow(data);
-    return row ? userFromProfileRow(row) : null;
-  } catch (err) {
-    throwFromRest("findProfileById", err);
+/** 插入完整 profile 行并返回 representation */
+export async function insertProfile(
+  row: Pick<Profile, "id" | "email" | "nickname" | "username"> &
+    Partial<Omit<Profile, "id" | "email" | "nickname" | "username">>,
+): Promise<Profile> {
+  const created = await supabaseRest<Profile[]>(TABLE, {
+    method: "POST",
+    body: row,
+    returnRepresentation: true,
+  });
+
+  const profile = Array.isArray(created) ? created[0] : null;
+  if (!profile) {
+    throw new HttpError(
+      502,
+      "SUPABASE_REST_ERROR",
+      "创建 profile 后未返回行",
+    );
   }
+
+  return profile;
 }
 
 /**
- * 按 username 精确查找（大小写敏感，与写入值一致）。
- * 供唯一性校验使用；service 层负责是否暴露他人数据。
+ * 按 id 更新允许字段；返回更新后的行。
+ * 0 行 → 404（由 service 先 ensure 时不应发生）。
  */
-export async function findProfileByUsername(username: string): Promise<User | null> {
-  const normalized = username.trim();
-  if (!normalized) {
-    return null;
-  }
-
-  try {
-    const { data } = await supabaseRest<ProfileRow[]>(PROFILES_TABLE, {
-      method: "GET",
-      query: {
-        select: PROFILE_SELECT,
-        username: `eq.${normalized}`,
-        limit: 1,
-      },
-    });
-    const row = firstRow(data);
-    return row ? userFromProfileRow(row) : null;
-  } catch (err) {
-    throwFromRest("findProfileByUsername", err);
-  }
-}
-
-/** 按 id upsert（PostgREST merge-duplicates + return=representation） */
-export async function upsertProfile(input: ProfileInsert): Promise<User> {
-  const payload: ProfileInsert = {
-    id: input.id,
-    email: input.email,
-    username: input.username,
-    ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
-  };
-
-  try {
-    const { data } = await supabaseRest<ProfileRow[]>(PROFILES_TABLE, {
-      method: "POST",
-      query: {
-        select: PROFILE_SELECT,
-        // PostgREST upsert：以主键冲突合并，避免重复 insert 409
-        on_conflict: "id",
-      },
-      body: payload,
-      prefer: "resolution=merge-duplicates,return=representation",
-    });
-    const row = firstRow(data);
-    if (!row) {
-      throw new ProfileRepositoryError(
-        "[profile.repository] upsertProfile returned empty representation",
-        { httpStatus: 502 },
-      );
-    }
-    return userFromProfileRow(row);
-  } catch (err) {
-    if (err instanceof ProfileRepositoryError) {
-      throw err;
-    }
-    throwFromRest("upsertProfile", err);
-  }
-}
-
-/** 按 id 部分更新 */
-export async function updateProfile(
-  id: UserId,
+export async function updateProfileById(
+  id: string,
   patch: ProfileUpdate,
-): Promise<User> {
-  try {
-    const { data } = await supabaseRest<ProfileRow[]>(PROFILES_TABLE, {
-      method: "PATCH",
-      query: {
-        id: `eq.${id}`,
-        select: PROFILE_SELECT,
-      },
-      body: patch,
-      prefer: "return=representation",
-    });
-    const row = firstRow(data);
-    if (!row) {
-      throw new ProfileRepositoryError(
-        "[profile.repository] updateProfile: profile not found",
-        { httpStatus: 404 },
-      );
-    }
-    return userFromProfileRow(row);
-  } catch (err) {
-    if (err instanceof ProfileRepositoryError) {
-      throw err;
-    }
-    throwFromRest("updateProfile", err);
-  }
-}
+): Promise<Profile> {
+  const query = createPostgrestQuery().eq("id", id).build();
+  // Prefer return=representation 由 supabaseRest 选项设置；select 用 query
+  const updated = await supabaseRest<Profile[]>(TABLE, {
+    method: "PATCH",
+    query: {
+      ...query,
+      select: PROFILE_SELECT,
+    },
+    body: patch,
+    returnRepresentation: true,
+  });
 
-export const profileRepository = {
-  findById: findProfileById,
-  findByUsername: findProfileByUsername,
-  upsert: upsertProfile,
-  update: updateProfile,
-};
+  const profile = Array.isArray(updated) ? updated[0] : null;
+  if (!profile) {
+    throw new HttpError(404, "NOT_FOUND", "profile 不存在");
+  }
+
+  return profile;
+}

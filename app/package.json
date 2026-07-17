@@ -18,11 +18,14 @@
     "vite": "^8.1.3"
   },
   "dependencies": {
+    "@ai-sdk/react": "^4.0.32",
     "@mdxeditor/editor": "^4.0.4",
     "@supabase/supabase-js": "2.110.0",
+    "ai": "^7.0.29",
     "lucide-react": "^1.23.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.1",
     "zustand": "^5.0.14"
   }

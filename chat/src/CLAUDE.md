@@ -2,18 +2,14 @@
 > L2 | 父级: ../CLAUDE.md
 
 成员清单
-index.ts: Bun.serve 入口
-routes/: /health、/v1/generate
-dto/: DTO 层，负责请求与响应契约描述
-models/: 模型层，负责 AI 服务内部领域对象与类型边界
-services/: generate.service（AI 生成；可换 Mastra）
-mastra/: Mastra 集成层，负责 AI 能力组织
-middleware/: requireTrustedUser（X-Service-Token + X-User-Id）
-config/: env（PORT、INTERNAL_SERVICE_TOKEN）
-common/: TrustedUserContext
+mastra/: Mastra 实例、memo-agent、prompts
+routes/: POST /v1/chat（SSE）
+middleware/: authMiddleware（Bearer JWT → Supabase userId）
+config/: env（zod fail-fast）、models（白名单 + toMastraModelConfig）
 
 ## 鉴权边界
-- 不校验浏览器用户 JWT
-- 只接受 api 转发：`X-Service-Token` + `X-User-Id`（可选 `X-User-Email`）
+- 校验浏览器用户 JWT（Supabase Auth `/auth/v1/user`）
+- 成功后 `requestContext.set('userId', userId)`
+- 无 token / 无效 token → 401
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

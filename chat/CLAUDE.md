@@ -1,20 +1,25 @@
 # chat/
 > L1 | 父级: ../CLAUDE.md
 
-模块定位: AI 能力服务 · Bun + Hono + TypeScript + Mastra + zod
+模块定位: AI 能力服务 · Bun + Mastra + TypeScript + @mastra/ai-sdk + zod
 
-鉴权边界: 不直收浏览器 JWT；只接受 api 转发的可信 user context（`X-Service-Token` + `X-User-Id`）。
+鉴权边界: 浏览器 JWT → `Authorization: Bearer <token>`；经 Supabase Auth 换可信 `userId` 写入 requestContext。身份只信 JWT，绝不从 body 读 userId。
+
+本轮范围: 纯聊天 Agent + SSE `/v1/chat`；无 tools、无 memory。
 
 <directory>
-src/index.ts - 进程入口
-src/routes/ - Hono 路由层，负责 AI 服务 HTTP 入口编排
-src/dto/ - DTO 层，负责请求与响应契约描述
-src/models/ - 模型层，负责 AI 服务内部领域对象与类型边界
-src/services/ - 服务层，负责 AI 能力用例编排
-src/mastra/ - Mastra 集成层，负责 agents、workflows、tools、prompts 的 AI 能力组织
-src/middleware/ - 中间件层，负责请求上下文、鉴权、错误与横切逻辑边界
-src/config/ - 配置层，负责环境变量、运行时配置与服务参数归口
-src/common/ - 公共层，负责 AI 服务内共享常量、工具与基础类型
+src/mastra/ - Mastra 装配与 Agent / prompts
+src/routes/ - 自定义 API 路由（registerApiRoute）
+src/middleware/ - JWT 鉴权中间件
+src/config/ - 环境变量与模型白名单
 </directory>
+
+## 本地开发
+| 项 | 值 |
+| --- | --- |
+| 端口 | `PORT`（建议 20002） |
+| 启动 | `cd chat && bun run dev`（mastra dev） |
+| 类型检查 | `bun run typecheck` |
+| SSE 端点 | `POST /v1/chat` |
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
