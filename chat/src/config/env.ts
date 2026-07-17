@@ -13,6 +13,8 @@
  * - MAX_OUTPUT_TOKENS     单次输出 token 上限（默认 393216）
  * - SUPABASE_URL          Supabase 项目 URL（JWT 鉴权必填）
  * - SUPABASE_ANON_KEY     或 SUPABASE_SERVICE_ROLE_KEY：校验用户 JWT 用（二选一）
+ * - SUPABASE_SERVICE_ROLE_KEY  会话/消息数据访问（service_role，仅后端）
+ * - DATABASE_URL          Mastra Memory 用 PostgreSQL 连接串（可选；缺失则 memory=null 降级）
  */
 import { z } from "zod";
 
@@ -27,6 +29,7 @@ const envSchema = z
     SUPABASE_URL: z.string().url(),
     SUPABASE_ANON_KEY: z.string().min(1).optional(),
     SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional(),
+    DATABASE_URL: z.string().min(1).optional(),
   })
   .superRefine((val, ctx) => {
     if (!val.SUPABASE_ANON_KEY && !val.SUPABASE_SERVICE_ROLE_KEY) {
@@ -51,6 +54,10 @@ export type Env = {
   SUPABASE_URL: string;
   /** Auth REST apikey：优先 anon，否则 service_role */
   SUPABASE_API_KEY: string;
+  /** 数据访问 service_role key（会话/消息落库） */
+  SUPABASE_SERVICE_ROLE_KEY: string;
+  /** Mastra Memory PostgreSQL 连接串（可选；缺失则 memory 降级为 null） */
+  DATABASE_URL: string | undefined;
 };
 
 export const env: Env = {
@@ -65,4 +72,7 @@ export const env: Env = {
   SUPABASE_URL: parsed.SUPABASE_URL.replace(/\/$/, ""),
   SUPABASE_API_KEY:
     parsed.SUPABASE_ANON_KEY ?? parsed.SUPABASE_SERVICE_ROLE_KEY!,
+  SUPABASE_SERVICE_ROLE_KEY:
+    parsed.SUPABASE_SERVICE_ROLE_KEY ?? parsed.SUPABASE_ANON_KEY!,
+  DATABASE_URL: parsed.DATABASE_URL,
 };

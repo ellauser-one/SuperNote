@@ -24,7 +24,7 @@ package.json - 用户端依赖清单，声明 React、React Router、@supabase/s
 bun.lock - Bun 依赖锁定文件
 .env.example - Supabase 浏览器端公开环境变量模板（复制为 .env.local）
 index.html - Vite HTML 入口
-vite.config.ts - Vite 配置，启用 React 与 Tailwind CSS v4 插件；dev server port 10001
+vite.config.ts - Vite 配置，启用 React 与 Tailwind CSS v4 插件；dev server port 20000
 tsconfig.json - TypeScript 编译与编辑器配置
 </config>
 

@@ -7,7 +7,8 @@ MdxMemoEditor.tsx: MDX 所见即所得适配边界；props/onChange 只暴露干
 mdx-whitespace-adapter.ts: 空行/行首尾空格的 inflate·deflate（ZWSP/NBSP/哨兵只活在编辑器内）；mdx-whitespace-adapter.test.ts 验收 round-trip
 MemoEditorView.tsx: 备忘录主编辑区；标题重命名 + 无感知自动保存；只消费干净 markdown，不感知 adapter 标记
 MemoWorkspace.tsx: 历史 Dashboard 主工作区，已迁移至 shared/ui
-AgentPanel/: 右侧备忘录助手 SSE 面板（useChat + DefaultChatTransport）；开合状态见 agent-panel.storeAuthModal/: 登录/注册模态；组合 Dialog/Button/Input + AuthProvider
+AgentPanel/: 右侧备忘录助手 SSE 面板（useChat + DefaultChatTransport）；开合状态见 agent-panel.store；写权拦截 + ToolConfirmCard 确认渲染（详见 features/agent-chat）
+AuthModal/: 登录/注册模态；组合 Dialog/Button/Input + AuthProvider
 UserMenu/: 侧栏账户区；username 展示 + 个人主页 + 退出
 MemoTree/: 左侧文件树侧栏；含 MemoTree 主组件、右键菜单、创建对话框、FLIP 动画 hook。详见 [MemoTree/CLAUDE.md](MemoTree/CLAUDE.md)
 

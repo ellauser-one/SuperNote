@@ -2,7 +2,7 @@
 > L2 | 父级: ../../CLAUDE.md
 
 成员清单
-env.ts: zod 校验 PORT、ALLOWED_ORIGINS、DEEPSEEK_API_KEY、DEFAULT_MODEL、MAX_STEPS、MAX_OUTPUT_TOKENS、SUPABASE_*
+env.ts: zod 校验 PORT、ALLOWED_ORIGINS、DEEPSEEK_API_KEY、DEFAULT_MODEL、MAX_STEPS、MAX_OUTPUT_TOKENS、SUPABASE_*、DATABASE_URL（可选，Memory 降级用）
 models.ts: MODEL_WHITELIST、resolveModel、toMastraModelConfig（{ url, id, apiKey }）
 
 法则: API key 只从环境变量读，禁止硬编码

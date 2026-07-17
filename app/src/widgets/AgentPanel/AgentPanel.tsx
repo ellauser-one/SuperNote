@@ -1,19 +1,37 @@
 /**
  * [INPUT]: 依赖 @ai-sdk/react useChat、ai DefaultChatTransport（via createChatTransport）、
- *         shared/ui Button/Card/Input、agent-panel.store、chat-transport
+ *         ai lastAssistantMessageIsCompleteWithToolCalls、shared/ui Button/Card/Input、
+ *         agent-panel.store、chat-transport、services/chat/client-tools、
+ *         features/agent-chat/tools/memo-write-tools（isWriteTool）、
+ *         features/agent-chat/components/tools/ToolConfirmCard、
+ *         app/providers/AuthProvider（useAuth）
  * [OUTPUT]: 对外提供 AgentPanel（右侧备忘录助手 SSE 对话面板）
  * [POS]: widgets 右侧 Agent 面板；AppShell 按 open 状态挂载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 工具回灌契约：
+ * - onToolCall 命中镜像工具后必须显式 addToolResult（返回值会被 AI SDK 丢弃）
+ * - 未知工具 / execute 抛错也要 addToolResult（output-error），否则 agent loop 卡死
+ * - sendAutomaticallyWhen 收齐工具结果后自动发起下一轮
+ *
+ * 写权拦截（第二道）：
+ * - create_/update_ 前缀工具在 onToolCall 检查 canWrite，无写权直接回灌只读错误
+ * - chat/ 侧第一道已按前缀过滤 schema，此处为双重保险
  */
 import { useChat } from "@ai-sdk/react";
+import { lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import { Bot, PanelRightClose, SendHorizontal, Square } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { useAuth } from "../../app/providers/AuthProvider";
+import { ToolConfirmCard } from "../../features/agent-chat/components/tools/ToolConfirmCard";
+import { isWriteTool } from "../../features/agent-chat/tools/memo-write-tools";
 import {
   ChatClientError,
   createChatTransport,
   isChatConfigured,
 } from "../../shared/services/chat/chat-transport";
+import { findClientTool } from "../../shared/services/chat/client-tools";
 import { useAgentPanelStore } from "../../shared/stores/agent-panel.store";
 import { Button, Card, Input } from "../../shared/ui";
 import { MarkdownMessage } from "./MarkdownMessage";
@@ -38,13 +56,69 @@ function friendlyError(error: Error | undefined): string | null {
 
 export function AgentPanel() {
   const closePanel = useAgentPanelStore((s) => s.closePanel);
+  const { isAuthenticated } = useAuth();
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
 
+  // 写权跟人走：当前登录即有写权（未来可细化为角色检查）
+  const canWrite = isAuthenticated;
+
   const transport = useMemo(() => createChatTransport(), []);
 
-  const { messages, sendMessage, status, stop, error, clearError } = useChat({
+  const {
+    messages,
+    sendMessage,
+    status,
+    stop,
+    error,
+    clearError,
+    addToolResult,
+  } = useChat({
     transport,
+    // 工具结果齐了（全部 output-available / output-error）自动发起下一轮
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
+    onToolCall: async ({ toolCall }) => {
+      const toolName = toolCall.toolName;
+      const tool = findClientTool(toolName);
+
+      // 未知工具也必须回灌结果，否则 agent loop 卡死
+      if (!tool) {
+        await addToolResult({
+          tool: toolName,
+          toolCallId: toolCall.toolCallId,
+          state: "output-error",
+          errorText: `未知工具: ${toolName}`,
+        });
+        return;
+      }
+
+      // 写权第二道拦截：create_/update_ 前缀无写权时直接回灌只读错误
+      if (isWriteTool(toolName) && !canWrite) {
+        await addToolResult({
+          tool: toolName,
+          toolCallId: toolCall.toolCallId,
+          output: { ok: false, error: "只读" },
+        });
+        return;
+      }
+
+      try {
+        const output = await tool.execute(toolCall.input);
+        // 必须显式 addToolResult：onToolCall 的返回值会被 AI SDK 丢弃
+        await addToolResult({
+          tool: toolName,
+          toolCallId: toolCall.toolCallId,
+          output,
+        });
+      } catch (err) {
+        await addToolResult({
+          tool: toolName,
+          toolCallId: toolCall.toolCallId,
+          state: "output-error",
+          errorText: err instanceof Error ? err.message : "工具执行失败",
+        });
+      }
+    },
   });
 
   const isStreaming = status === "streaming" || status === "submitted";
@@ -139,26 +213,29 @@ export function AgentPanel() {
           const text = getMessageText(message);
           const isUser = message.role === "user";
           return (
-            <Card
-              key={message.id}
-              tone={isUser ? "ink" : "chalk"}
-              className={`rounded-md p-8 ${isUser ? "ml-6" : ""}`}
-            >
-              <p className="font-helvetica-now text-label font-medium uppercase opacity-70">
-                {isUser ? "You" : "Assistant"}
-              </p>
-              <div className="mt-2">
-                {isUser ? (
-                  <p className="whitespace-pre-wrap font-helvetica-now text-ui leading-relaxed">
-                    {text}
-                  </p>
-                ) : text ? (
-                  <MarkdownMessage content={text} />
-                ) : isStreaming ? (
-                  <p className="font-helvetica-now text-ui text-graphite">…</p>
-                ) : null}
-              </div>
-            </Card>
+            <div key={message.id}>
+              <Card
+                tone={isUser ? "ink" : "chalk"}
+                className={`rounded-md p-8 ${isUser ? "ml-6" : ""}`}
+              >
+                <p className="font-helvetica-now text-label font-medium uppercase opacity-70">
+                  {isUser ? "You" : "Assistant"}
+                </p>
+                <div className="mt-2">
+                  {isUser ? (
+                    <p className="whitespace-pre-wrap font-helvetica-now text-ui leading-relaxed">
+                      {text}
+                    </p>
+                  ) : text ? (
+                    <MarkdownMessage content={text} />
+                  ) : isStreaming ? (
+                    <p className="font-helvetica-now text-ui text-graphite">…</p>
+                  ) : null}
+                </div>
+              </Card>
+              {/* 助手消息后渲染确认卡（写工具 pending 时） */}
+              {!isUser && <ToolConfirmCard />}
+            </div>
           );
         })}
 

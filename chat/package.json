@@ -11,6 +11,8 @@
   "dependencies": {
     "@mastra/ai-sdk": "^1.6.2",
     "@mastra/core": "^1.51.0",
+    "@mastra/memory": "^1.23.0",
+    "@mastra/pg": "^1.16.0",
     "ai": "^7.0.29",
     "zod": "^4.4.3"
   },

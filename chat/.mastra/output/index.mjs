@@ -1,10 +1,5 @@
 import { scoreTraces, scoreTracesWorkflow } from '@mastra/core/evals/scoreTraces';
-import { Mastra } from '@mastra/core';
-import z$2, { z } from 'zod';
-import { handleChatStream } from '@mastra/ai-sdk';
-import { registerApiRoute, MastraServerBase } from '@mastra/core/server';
-import { createUIMessageStreamResponse } from 'ai';
-import { Agent, isDurableAgentLike, MessageList } from '@mastra/core/agent';
+import { m as mastra } from './mastra.mjs';
 import { readFile } from 'fs/promises';
 import * as https from 'https';
 import { request } from 'https';
@@ -15,16 +10,20 @@ import { Http2ServerRequest, constants } from 'http2';
 import { Readable, Writable } from 'stream';
 import * as crypto2 from 'crypto';
 import crypto2__default, { randomUUID } from 'crypto';
+import { getMimeType } from 'hono/utils/mime';
 import { readFileSync, existsSync, createReadStream, statSync } from 'fs';
 import { versions } from 'process';
+import { html } from 'hono/html';
 import { isVercelTool, isProviderDefinedTool, Tool } from '@mastra/core/tools';
-import { z as z$1, toJSONSchema, ZodOptional, ZodNullable, ZodArray, ZodRecord, ZodObject } from 'zod/v4';
+import { z, toJSONSchema, ZodOptional, ZodNullable, ZodArray, ZodRecord, ZodObject } from 'zod/v4';
 import { MastraMemory } from '@mastra/core/memory';
 import * as authEE from '@mastra/core/auth/ee';
 import { matchesPermission } from '@mastra/core/auth/ee';
 import z3, { ZodFirstPartyTypeKind } from 'zod/v3';
 import { toStandardSchema as toStandardSchema$1 } from '@mastra/core/schema';
 import { zodToJsonSchema as zodToJsonSchema$1 } from '@mastra/core/utils/zod-to-json';
+import z$2, { z as z$1 } from 'zod';
+import { isDurableAgentLike, Agent, MessageList } from '@mastra/core/agent';
 import { AGENT_STREAM_TOPIC, DurableStepIds } from '@mastra/core/agent/durable';
 import { MASTRA_VERSIONS_KEY, mergeVersionOverrides } from '@mastra/core/di';
 import { MastraError as MastraError$1, ErrorDomain as ErrorDomain$1, ErrorCategory } from '@mastra/core/error';
@@ -44,217 +43,22 @@ import { lookup } from 'dns/promises';
 import { isIP } from 'net';
 import { createCachingTransformStream, createReplayStream } from '@mastra/core/stream';
 import { pipeline } from 'stream/promises';
+import { MastraServerBase } from '@mastra/core/server';
+import { Hono } from 'hono';
 import { Buffer as Buffer$1 } from 'buffer';
+import { bodyLimit } from 'hono/body-limit';
+import { stream } from 'hono/streaming';
+import { compress } from 'hono/compress';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { timeout } from 'hono/timeout';
+import { HTTPException as HTTPException$2 } from 'hono/http-exception';
 import { tools } from './tools.mjs';
-
-const envSchema = z.object({
-  PORT: z.coerce.number().int().positive(),
-  ALLOWED_ORIGINS: z.string().min(1),
-  DEEPSEEK_API_KEY: z.string().min(1),
-  DEFAULT_MODEL: z.string().min(1).default("deepseek/deepseek-chat"),
-  MAX_STEPS: z.coerce.number().int().positive().default(50),
-  MAX_OUTPUT_TOKENS: z.coerce.number().int().positive().default(393216),
-  SUPABASE_URL: z.string().url(),
-  SUPABASE_ANON_KEY: z.string().min(1).optional(),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1).optional()
-}).superRefine((val, ctx) => {
-  if (!val.SUPABASE_ANON_KEY && !val.SUPABASE_SERVICE_ROLE_KEY) {
-    ctx.addIssue({
-      code: "custom",
-      message: "\u7F3A\u5C11 SUPABASE_ANON_KEY \u6216 SUPABASE_SERVICE_ROLE_KEY\uFF08JWT \u9274\u6743\u81F3\u5C11\u9700\u8981\u4E00\u4E2A\uFF09",
-      path: ["SUPABASE_ANON_KEY"]
-    });
-  }
-});
-const parsed = envSchema.parse(process.env);
-const env = {
-  PORT: parsed.PORT,
-  ALLOWED_ORIGINS: parsed.ALLOWED_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean),
-  DEEPSEEK_API_KEY: parsed.DEEPSEEK_API_KEY,
-  DEFAULT_MODEL: parsed.DEFAULT_MODEL,
-  MAX_STEPS: parsed.MAX_STEPS,
-  MAX_OUTPUT_TOKENS: parsed.MAX_OUTPUT_TOKENS,
-  SUPABASE_URL: parsed.SUPABASE_URL.replace(/\/$/, ""),
-  SUPABASE_API_KEY: parsed.SUPABASE_ANON_KEY ?? parsed.SUPABASE_SERVICE_ROLE_KEY
-};
-
-async function authMiddleware(c, next) {
-  const authorization = c.req.header("Authorization");
-  const token = extractBearerToken(authorization);
-  if (!token) {
-    return c.json({ error: "Unauthorized", message: "\u7F3A\u5C11 Bearer token" }, 401);
-  }
-  const userId = await fetchSupabaseUserId(token);
-  if (!userId) {
-    return c.json(
-      { error: "Unauthorized", message: "\u65E0\u6548\u6216\u8FC7\u671F\u7684\u8BBF\u95EE\u4EE4\u724C" },
-      401
-    );
-  }
-  const requestContext = c.get("requestContext");
-  if (requestContext && typeof requestContext.set === "function") {
-    requestContext.set("userId", userId);
-  }
-  c.set("userId", userId);
-  await next();
-}
-function extractBearerToken(authorizationHeader) {
-  if (!authorizationHeader || typeof authorizationHeader !== "string") {
-    return null;
-  }
-  const match = /^Bearer\s+(\S+)$/i.exec(authorizationHeader.trim());
-  return match?.[1] ?? null;
-}
-async function fetchSupabaseUserId(accessToken) {
-  const url = `${env.SUPABASE_URL}/auth/v1/user`;
-  let res;
-  try {
-    res = await fetch(url, {
-      method: "GET",
-      headers: {
-        apikey: env.SUPABASE_API_KEY,
-        Authorization: `Bearer ${accessToken}`
-      }
-    });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : "network error";
-    console.error("[chat/auth] Supabase Auth network error:", msg);
-    return null;
-  }
-  if (res.status === 401 || res.status === 403) {
-    console.error("[chat/auth] user invalid", res.status);
-    return null;
-  }
-  if (!res.ok) {
-    console.error("[chat/auth] user error", res.status);
-    return null;
-  }
-  let body;
-  try {
-    body = await res.json();
-  } catch {
-    console.error("[chat/auth] response parse failed");
-    return null;
-  }
-  return extractUserId(body);
-}
-function extractUserId(body) {
-  if (!body || typeof body !== "object") {
-    return null;
-  }
-  const rec = body;
-  const raw = rec.user && typeof rec.user === "object" ? rec.user : rec;
-  const id = raw.id;
-  return typeof id === "string" && id.length > 0 ? id : null;
-}
-
-const chatRoute = registerApiRoute("/v1/chat", {
-  method: "POST",
-  // Mastra 内嵌 hono 与顶层 hono 类型不完全兼容，此处做窄化断言
-  middleware: [authMiddleware],
-  handler: async (c) => {
-    const mastra = c.get("mastra");
-    const params = await c.req.json();
-    const stream = await handleChatStream({
-      mastra,
-      agentId: "memo-agent",
-      version: "v6",
-      params: {
-        ...params,
-        maxSteps: env.MAX_STEPS
-      }
-    });
-    return createUIMessageStreamResponse({ stream });
-  }
-});
-
-const MODEL_WHITELIST = {
-  "deepseek/deepseek-chat": {
-    id: "deepseek/deepseek-chat",
-    url: "https://api.deepseek.com",
-    apiKeyFrom: "DEEPSEEK_API_KEY"
-  },
-  "deepseek/deepseek-reasoner": {
-    id: "deepseek/deepseek-reasoner",
-    url: "https://api.deepseek.com",
-    apiKeyFrom: "DEEPSEEK_API_KEY"
-  }
-};
-function resolveModel(id) {
-  const entry = MODEL_WHITELIST[id];
-  if (!entry) {
-    const allowed = Object.keys(MODEL_WHITELIST).join(", ");
-    throw new Error(`\u6A21\u578B\u4E0D\u5728\u767D\u540D\u5355: ${id}\u3002\u5141\u8BB8: ${allowed}`);
-  }
-  return entry;
-}
-function toMastraModelConfig(entry) {
-  const apiKey = resolveApiKey(entry.apiKeyFrom);
-  return {
-    id: entry.id,
-    url: entry.url,
-    apiKey
-  };
-}
-function resolveApiKey(from) {
-  switch (from) {
-    case "DEEPSEEK_API_KEY":
-      return env.DEEPSEEK_API_KEY;
-    default: {
-      const _exhaustive = from;
-      throw new Error(`\u672A\u77E5 apiKey \u6765\u6E90: ${String(_exhaustive)}`);
-    }
-  }
-}
-
-const memoAgentPrompt = `\u4F60\u662F SuperNote \u7684\u5907\u5FD8\u5F55\u52A9\u624B\u3002
-
-## \u4EBA\u683C
-- \u51B7\u9759\u3001\u6E05\u6670\u3001\u52A1\u5B9E\uFF0C\u50CF\u4E00\u4F4D\u61C2\u77E5\u8BC6\u7BA1\u7406\u7684\u540C\u4E8B\u3002
-- \u4E2D\u6587\u4F18\u5148\u56DE\u590D\uFF1B\u7528\u6237\u7528\u82F1\u6587\u65F6\u8DDF\u968F\u82F1\u6587\u3002
-- \u8868\u8FBE\u7B80\u6D01\uFF0C\u5148\u7ED9\u7ED3\u8BBA\uFF0C\u518D\u8865\u5FC5\u8981\u7EC6\u8282\u3002
-
-## \u804C\u8D23
-- \u5E2E\u52A9\u7528\u6237\u6574\u7406\u60F3\u6CD5\u3001\u63D0\u70BC\u8981\u70B9\u3001\u6539\u5199\u5907\u5FD8\u5F55\u8349\u7A3F\u3002
-- \u534F\u52A9\u89C4\u5212\u6587\u4EF6\u5939/\u4E3B\u9898\u547D\u540D\u4E0E\u5F52\u6863\u601D\u8DEF\uFF08\u4EC5\u5EFA\u8BAE\uFF0C\u672C\u8F6E\u4E0D\u6267\u884C\u843D\u76D8\uFF09\u3002
-- \u56DE\u7B54\u4E0E\u5907\u5FD8\u5F55\u3001\u7B14\u8BB0\u7EC4\u7EC7\u3001\u5199\u4F5C\u76F8\u5173\u7684\u95EE\u9898\u3002
-
-## \u94C1\u5F8B
-1. \u4E0D\u7F16\u9020\u7528\u6237\u672A\u63D0\u4F9B\u7684\u5907\u5FD8\u5F55\u5185\u5BB9\uFF1B\u4FE1\u606F\u4E0D\u8DB3\u65F6\u660E\u786E\u8BF4\u660E\u5047\u8BBE\u3002
-2. \u4E0D\u4E3B\u52A8\u7D22\u53D6\u5BC6\u7801\u3001\u5BC6\u94A5\u3001\u5B8C\u6574 JWT \u7B49\u654F\u611F\u51ED\u8BC1\u3002
-3. \u4E0D\u505A\u4E0E\u5907\u5FD8\u5F55\u52A9\u624B\u65E0\u5173\u7684\u89D2\u8272\u626E\u6F14\u6216\u8D8A\u6743\u64CD\u4F5C\u627F\u8BFA\u3002
-4. \u672C\u8F6E\u6CA1\u6709\u5DE5\u5177\u4E0E\u8BB0\u5FC6\uFF1A\u4E0D\u8981\u5047\u88C5\u5DF2\u7ECF\u521B\u5EFA\u6587\u4EF6\u5939\u6216\u4FDD\u5B58\u7B14\u8BB0\u3002
-5. \u6D89\u53CA\u5220\u9664\u3001\u8986\u76D6\u7B49\u7834\u574F\u6027\u64CD\u4F5C\u65F6\uFF0C\u5148\u63D0\u793A\u98CE\u9669\u518D\u7ED9\u65B9\u6848\u3002
-6. \u8F93\u51FA\u53EF\u6267\u884C\uFF1A\u5217\u8868\u3001\u6807\u9898\u3001\u6BB5\u843D\u7ED3\u6784\u6E05\u6670\uFF0C\u4FBF\u4E8E\u7528\u6237\u76F4\u63A5\u7C98\u8D34\u8FDB\u5907\u5FD8\u5F55\u3002`;
-
-const modelConfig = toMastraModelConfig(resolveModel(env.DEFAULT_MODEL));
-const memoAgent = new Agent({
-  id: "memo-agent",
-  name: "Memo Agent",
-  instructions: memoAgentPrompt,
-  model: modelConfig,
-  defaultOptions: {
-    modelSettings: {
-      maxOutputTokens: env.MAX_OUTPUT_TOKENS
-    }
-  }
-});
-
-const mastra = new Mastra({
-  agents: {
-    "memo-agent": memoAgent
-  },
-  server: {
-    port: env.PORT,
-    cors: {
-      origin: env.ALLOWED_ORIGINS,
-      credentials: true,
-      allowHeaders: ["Content-Type", "Authorization"],
-      allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-    },
-    apiRoutes: [chatRoute]
-  }
-});
+import '@mastra/core';
+import '@mastra/ai-sdk';
+import 'ai';
+import '@mastra/memory';
+import '@mastra/pg';
 
 function normalizeStudioBase(studioBase) {
   studioBase = studioBase.trim();
@@ -303,971 +107,755 @@ function escapeStudioHtmlValue(value) {
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 }
 
-// src/utils/mime.ts
-var getMimeType = (filename, mimes = baseMimes) => {
-  const regexp = /\.([a-zA-Z0-9]+?)$/;
-  const match = filename.match(regexp);
-  if (!match) {
-    return;
-  }
-  return mimes[match[1].toLowerCase()];
-};
-var _baseMimes = {
-  aac: "audio/aac",
-  avi: "video/x-msvideo",
-  avif: "image/avif",
-  av1: "video/av1",
-  bin: "application/octet-stream",
-  bmp: "image/bmp",
-  css: "text/css; charset=utf-8",
-  csv: "text/csv; charset=utf-8",
-  eot: "application/vnd.ms-fontobject",
-  epub: "application/epub+zip",
-  gif: "image/gif",
-  gz: "application/gzip",
-  htm: "text/html; charset=utf-8",
-  html: "text/html; charset=utf-8",
-  ico: "image/x-icon",
-  ics: "text/calendar; charset=utf-8",
-  jpeg: "image/jpeg",
-  jpg: "image/jpeg",
-  js: "text/javascript; charset=utf-8",
-  json: "application/json",
-  jsonld: "application/ld+json",
-  map: "application/json",
-  mid: "audio/x-midi",
-  midi: "audio/x-midi",
-  mjs: "text/javascript; charset=utf-8",
-  mp3: "audio/mpeg",
-  mp4: "video/mp4",
-  mpeg: "video/mpeg",
-  oga: "audio/ogg",
-  ogv: "video/ogg",
-  ogx: "application/ogg",
-  opus: "audio/opus",
-  otf: "font/otf",
-  pdf: "application/pdf",
-  png: "image/png",
-  rtf: "application/rtf",
-  svg: "image/svg+xml; charset=utf-8",
-  tif: "image/tiff",
-  tiff: "image/tiff",
-  ts: "video/mp2t",
-  ttf: "font/ttf",
-  txt: "text/plain; charset=utf-8",
-  wasm: "application/wasm",
-  webm: "video/webm",
-  weba: "audio/webm",
-  webmanifest: "application/manifest+json",
-  webp: "image/webp",
-  woff: "font/woff",
-  woff2: "font/woff2",
-  xhtml: "application/xhtml+xml; charset=utf-8",
-  xml: "application/xml; charset=utf-8",
-  zip: "application/zip",
-  "3gp": "video/3gpp",
-  "3g2": "video/3gpp2",
-  gltf: "model/gltf+json",
-  glb: "model/gltf-binary"
-};
-var baseMimes = _baseMimes;
-
-// src/utils/html.ts
-var HtmlEscapedCallbackPhase = {
-  Stringify: 1};
-var raw = (value, callbacks) => {
-  const escapedString = new String(value);
-  escapedString.isEscaped = true;
-  escapedString.callbacks = callbacks;
-  return escapedString;
-};
-var escapeRe = /[&<>'"]/;
-var stringBufferToString = async (buffer, callbacks) => {
-  let str = "";
-  callbacks ||= [];
-  const resolvedBuffer = await Promise.all(buffer);
-  for (let i = resolvedBuffer.length - 1; ; i--) {
-    str += resolvedBuffer[i];
-    i--;
-    if (i < 0) {
-      break;
-    }
-    let r = resolvedBuffer[i];
-    if (typeof r === "object") {
-      callbacks.push(...r.callbacks || []);
-    }
-    const isEscaped = r.isEscaped;
-    r = await (typeof r === "object" ? r.toString() : r);
-    if (typeof r === "object") {
-      callbacks.push(...r.callbacks || []);
-    }
-    if (r.isEscaped ?? isEscaped) {
-      str += r;
-    } else {
-      const buf = [str];
-      escapeToBuffer(r, buf);
-      str = buf[0];
-    }
-  }
-  return raw(str, callbacks);
-};
-var escapeToBuffer = (str, buffer) => {
-  const match = str.search(escapeRe);
-  if (match === -1) {
-    buffer[0] += str;
-    return;
-  }
-  let escape;
-  let index;
-  let lastIndex = 0;
-  for (index = match; index < str.length; index++) {
-    switch (str.charCodeAt(index)) {
-      case 34:
-        escape = "&quot;";
-        break;
-      case 39:
-        escape = "&#39;";
-        break;
-      case 38:
-        escape = "&amp;";
-        break;
-      case 60:
-        escape = "&lt;";
-        break;
-      case 62:
-        escape = "&gt;";
-        break;
-      default:
-        continue;
-    }
-    buffer[0] += str.substring(lastIndex, index) + escape;
-    lastIndex = index + 1;
-  }
-  buffer[0] += str.substring(lastIndex, index);
-};
-var resolveCallbackSync = (str) => {
-  const callbacks = str.callbacks;
-  if (!callbacks?.length) {
-    return str;
-  }
-  const buffer = [str];
-  const context = {};
-  callbacks.forEach((c) => c({ phase: HtmlEscapedCallbackPhase.Stringify, buffer, context }));
-  return buffer[0];
-};
-var resolveCallback = async (str, phase, preserveCallbacks, context, buffer) => {
-  if (typeof str === "object" && !(str instanceof String)) {
-    if (!(str instanceof Promise)) {
-      str = str.toString();
-    }
-    if (str instanceof Promise) {
-      str = await str;
-    }
-  }
-  const callbacks = str.callbacks;
-  if (!callbacks?.length) {
-    return Promise.resolve(str);
-  }
-  if (buffer) {
-    buffer[0] += str;
-  } else {
-    buffer = [str];
-  }
-  const resStr = Promise.all(callbacks.map((c) => c({ phase, buffer, context }))).then(
-    (res) => Promise.all(
-      res.filter(Boolean).map((str2) => resolveCallback(str2, phase, false, context, buffer))
-    ).then(() => buffer[0])
-  );
-  {
-    return resStr;
-  }
-};
-
-// src/helper/html/index.ts
-var html = (strings, ...values) => {
-  const buffer = [""];
-  for (let i = 0, len = strings.length - 1; i < len; i++) {
-    buffer[0] += strings[i];
-    const children = Array.isArray(values[i]) ? values[i].flat(Infinity) : [values[i]];
-    for (let i2 = 0, len2 = children.length; i2 < len2; i2++) {
-      const child = children[i2];
-      if (typeof child === "string") {
-        escapeToBuffer(child, buffer);
-      } else if (typeof child === "number") {
-        buffer[0] += child;
-      } else if (typeof child === "boolean" || child === null || child === void 0) {
-        continue;
-      } else if (typeof child === "object" && child.isEscaped) {
-        if (child.callbacks) {
-          buffer.unshift("", child);
-        } else {
-          const tmp = child.toString();
-          if (tmp instanceof Promise) {
-            buffer.unshift("", tmp);
-          } else {
-            buffer[0] += tmp;
-          }
-        }
-      } else if (child instanceof Promise) {
-        buffer.unshift("", child);
-      } else {
-        escapeToBuffer(child.toString(), buffer);
-      }
-    }
-  }
-  buffer[0] += strings.at(-1);
-  return buffer.length === 1 ? "callbacks" in buffer ? raw(resolveCallbackSync(raw(buffer[0], buffer.callbacks))) : raw(buffer[0]) : stringBufferToString(buffer, buffer.callbacks);
-};
-
 // src/server/schemas/common.ts
-var runIdSchema = z$1.object({
-  runId: z$1.string().describe("Unique identifier for the run")
+var runIdSchema = z.object({
+  runId: z.string().describe("Unique identifier for the run")
 });
-var optionalRunIdSchema = z$1.object({
-  runId: z$1.string().optional()
+var optionalRunIdSchema = z.object({
+  runId: z.string().optional()
 });
-var paginationInfoSchema$1 = z$1.object({
-  total: z$1.number(),
-  page: z$1.number(),
-  perPage: z$1.union([z$1.number(), z$1.literal(false)]),
-  hasMore: z$1.boolean()
+var paginationInfoSchema$1 = z.object({
+  total: z.number(),
+  page: z.number(),
+  perPage: z.union([z.number(), z.literal(false)]),
+  hasMore: z.boolean()
 });
 var createPagePaginationSchema = (defaultPerPage) => {
   const baseSchema = {
-    page: z$1.coerce.number().optional().default(0)
+    page: z.coerce.number().optional().default(0)
   };
   if (defaultPerPage !== void 0) {
-    return z$1.object({
+    return z.object({
       ...baseSchema,
-      perPage: z$1.coerce.number().optional().default(defaultPerPage)
+      perPage: z.coerce.number().optional().default(defaultPerPage)
     });
   } else {
-    return z$1.object({
+    return z.object({
       ...baseSchema,
-      perPage: z$1.coerce.number().optional()
+      perPage: z.coerce.number().optional()
     });
   }
 };
 var createCombinedPaginationSchema = () => {
-  return z$1.object({
-    page: z$1.coerce.number().optional(),
-    perPage: z$1.coerce.number().optional(),
+  return z.object({
+    page: z.coerce.number().optional(),
+    perPage: z.coerce.number().optional(),
     /**
      * @deprecated Use page and perPage instead
      */
-    offset: z$1.coerce.number().optional(),
+    offset: z.coerce.number().optional(),
     /**
      * @deprecated Use page and perPage instead
      */
-    limit: z$1.coerce.number().optional()
+    limit: z.coerce.number().optional()
   });
 };
-var tracingOptionsSchema = z$1.object({
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  requestContextKeys: z$1.array(z$1.string()).optional(),
-  traceId: z$1.string().optional(),
-  parentSpanId: z$1.string().optional(),
-  tags: z$1.array(z$1.string()).optional(),
-  hideInput: z$1.boolean().optional(),
-  hideOutput: z$1.boolean().optional()
+var tracingOptionsSchema = z.object({
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  requestContextKeys: z.array(z.string()).optional(),
+  traceId: z.string().optional(),
+  parentSpanId: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  hideInput: z.boolean().optional(),
+  hideOutput: z.boolean().optional()
 });
-var coreMessageSchema = z$1.any();
-var successResponseSchema = z$1.object({
-  success: z$1.boolean()
+var coreMessageSchema = z.any();
+var successResponseSchema = z.object({
+  success: z.boolean()
 });
-var messageResponseSchema = z$1.object({
-  message: z$1.string()
+var messageResponseSchema = z.object({
+  message: z.string()
 });
-z$1.object({
-  partial: z$1.string().optional()
+z.object({
+  partial: z.string().optional()
 });
-var statusQuerySchema = z$1.object({
-  status: z$1.enum(["draft", "published", "archived"]).optional().default("published").describe("Which version to resolve: published (active version) or draft (latest version)")
+var statusQuerySchema = z.object({
+  status: z.enum(["draft", "published", "archived"]).optional().default("published").describe("Which version to resolve: published (active version) or draft (latest version)")
 });
-var baseLogMessageSchema = z$1.object({
-  level: z$1.enum(["debug", "info", "warn", "error", "silent"]),
-  msg: z$1.string(),
-  time: z$1.date(),
-  context: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  runId: z$1.string().optional(),
-  pid: z$1.number(),
-  hostname: z$1.string(),
-  name: z$1.string()
+var baseLogMessageSchema = z.object({
+  level: z.enum(["debug", "info", "warn", "error", "silent"]),
+  msg: z.string(),
+  time: z.date(),
+  context: z.record(z.string(), z.unknown()).optional(),
+  runId: z.string().optional(),
+  pid: z.number(),
+  hostname: z.string(),
+  name: z.string()
 });
 
-var storedSkillIdPathParams = z$1.object({
-  storedSkillId: z$1.string().describe("Unique identifier for the stored skill")
+var storedSkillIdPathParams = z.object({
+  storedSkillId: z.string().describe("Unique identifier for the stored skill")
 });
-var storageOrderBySchema$6 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$6 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredSkillsQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$6.optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional().describe("Filter skills by status"),
-  authorId: z$1.string().optional().describe("Filter skills by author identifier"),
-  visibility: z$1.enum(["public"]).optional().describe("Filter to only public skills"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter skills by metadata key-value pairs"),
-  favoritedOnly: z$1.stringbool().optional().describe("When true, return only skills favorited by the caller (requires the `favorites` EE feature)"),
-  pinFavoritedFor: z$1.string().optional().describe(
+  status: z.enum(["draft", "published", "archived"]).optional().describe("Filter skills by status"),
+  authorId: z.string().optional().describe("Filter skills by author identifier"),
+  visibility: z.enum(["public"]).optional().describe("Filter to only public skills"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter skills by metadata key-value pairs"),
+  favoritedOnly: z.stringbool().optional().describe("When true, return only skills favorited by the caller (requires the `favorites` EE feature)"),
+  pinFavoritedFor: z.string().optional().describe(
     "When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller"
   )
 });
-var sourceSchema = z$1.discriminatedUnion("type", [
-  z$1.object({
-    type: z$1.literal("external"),
-    packagePath: z$1.string().describe("Package path for external source")
+var sourceSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("external"),
+    packagePath: z.string().describe("Package path for external source")
   }),
-  z$1.object({
-    type: z$1.literal("local"),
-    projectPath: z$1.string().describe("Project path for local source")
+  z.object({
+    type: z.literal("local"),
+    projectPath: z.string().describe("Project path for local source")
   }),
-  z$1.object({
-    type: z$1.literal("managed"),
-    mastraPath: z$1.string().describe("Mastra path for managed source")
+  z.object({
+    type: z.literal("managed"),
+    mastraPath: z.string().describe("Mastra path for managed source")
   })
 ]);
-var fileNodeSchema = z$1.object({
-  id: z$1.string().optional(),
-  name: z$1.string(),
-  type: z$1.enum(["file", "folder"]),
-  content: z$1.string().optional(),
-  children: z$1.lazy(() => z$1.array(fileNodeSchema)).optional()
+var fileNodeSchema = z.object({
+  id: z.string().optional(),
+  name: z.string(),
+  type: z.enum(["file", "folder"]),
+  content: z.string().optional(),
+  children: z.lazy(() => z.array(fileNodeSchema)).optional()
 });
-z$1.discriminatedUnion("type", [
-  z$1.object({
-    type: z$1.literal("skills-sh"),
-    owner: z$1.string().describe("Repository owner on skills.sh"),
-    repo: z$1.string().describe("Repository name on skills.sh"),
-    skillName: z$1.string().describe("Original skill name on skills.sh"),
-    installedAt: z$1.string().describe("ISO-8601 timestamp of the install")
+z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("skills-sh"),
+    owner: z.string().describe("Repository owner on skills.sh"),
+    repo: z.string().describe("Repository name on skills.sh"),
+    skillName: z.string().describe("Original skill name on skills.sh"),
+    installedAt: z.string().describe("ISO-8601 timestamp of the install")
   }),
-  z$1.object({
-    type: z$1.literal("library-copy"),
-    sourceSkillId: z$1.string().describe("ID of the public Library skill this was copied from"),
-    sourceSkillName: z$1.string().describe("Name of the source skill at copy time"),
-    sourceAuthorId: z$1.string().optional().describe("Author of the source skill at copy time, when known"),
-    copiedAt: z$1.string().describe("ISO-8601 timestamp of the copy")
+  z.object({
+    type: z.literal("library-copy"),
+    sourceSkillId: z.string().describe("ID of the public Library skill this was copied from"),
+    sourceSkillName: z.string().describe("Name of the source skill at copy time"),
+    sourceAuthorId: z.string().optional().describe("Author of the source skill at copy time, when known"),
+    copiedAt: z.string().describe("ISO-8601 timestamp of the copy")
   })
 ]);
-var snapshotConfigSchema$4 = z$1.object({
-  name: z$1.string().describe("Name of the skill"),
-  description: z$1.string().describe("Description of what the skill does and when to use it"),
-  instructions: z$1.string().describe("Markdown instructions for the skill"),
-  license: z$1.string().optional().describe("License identifier for the skill"),
-  compatibility: z$1.unknown().optional().describe("Compatibility requirements"),
+var snapshotConfigSchema$4 = z.object({
+  name: z.string().describe("Name of the skill"),
+  description: z.string().describe("Description of what the skill does and when to use it"),
+  instructions: z.string().describe("Markdown instructions for the skill"),
+  license: z.string().optional().describe("License identifier for the skill"),
+  compatibility: z.unknown().optional().describe("Compatibility requirements"),
   source: sourceSchema.optional().describe("Source location of the skill"),
-  references: z$1.array(z$1.string()).optional().describe("List of reference file paths"),
-  scripts: z$1.array(z$1.string()).optional().describe("List of script file paths"),
-  assets: z$1.array(z$1.string()).optional().describe("List of asset file paths"),
-  files: z$1.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the skill")
+  references: z.array(z.string()).optional().describe("List of reference file paths"),
+  scripts: z.array(z.string()).optional().describe("List of script file paths"),
+  assets: z.array(z.string()).optional().describe("List of asset file paths"),
+  files: z.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the skill")
 });
-var createStoredSkillBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  visibility: z$1.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
+var createStoredSkillBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  visibility: z.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
 }).merge(snapshotConfigSchema$4);
-var updateStoredSkillBodySchema = z$1.object({
-  authorId: z$1.string().optional(),
-  visibility: z$1.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
+var updateStoredSkillBodySchema = z.object({
+  authorId: z.string().optional(),
+  visibility: z.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
 }).partial().merge(snapshotConfigSchema$4.partial());
-var storedSkillSchema = z$1.object({
-  id: z$1.string(),
-  status: z$1.string().describe("Skill status: draft, published, or archived"),
-  activeVersionId: z$1.string().optional(),
-  authorId: z$1.string().optional(),
-  visibility: z$1.enum(["private", "public"]).optional(),
-  favoriteCount: z$1.number().int().nonnegative().optional().describe("Number of users who have favorited this skill"),
-  isFavorited: z$1.boolean().optional().describe("Whether the requesting user has favorited this skill"),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
-  name: z$1.string().describe("Name of the skill"),
-  description: z$1.string().describe("Description of what the skill does and when to use it"),
-  instructions: z$1.string().describe("Markdown instructions for the skill"),
-  license: z$1.string().optional().describe("License identifier for the skill"),
-  compatibility: z$1.unknown().optional().describe("Compatibility requirements"),
+var storedSkillSchema = z.object({
+  id: z.string(),
+  status: z.string().describe("Skill status: draft, published, or archived"),
+  activeVersionId: z.string().optional(),
+  authorId: z.string().optional(),
+  visibility: z.enum(["private", "public"]).optional(),
+  favoriteCount: z.number().int().nonnegative().optional().describe("Number of users who have favorited this skill"),
+  isFavorited: z.boolean().optional().describe("Whether the requesting user has favorited this skill"),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  name: z.string().describe("Name of the skill"),
+  description: z.string().describe("Description of what the skill does and when to use it"),
+  instructions: z.string().describe("Markdown instructions for the skill"),
+  license: z.string().optional().describe("License identifier for the skill"),
+  compatibility: z.unknown().optional().describe("Compatibility requirements"),
   source: sourceSchema.optional().describe("Source location of the skill"),
-  references: z$1.array(z$1.string()).optional().describe("List of reference file paths"),
-  scripts: z$1.array(z$1.string()).optional().describe("List of script file paths"),
-  assets: z$1.array(z$1.string()).optional().describe("List of asset file paths"),
-  files: z$1.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the skill")
+  references: z.array(z.string()).optional().describe("List of reference file paths"),
+  scripts: z.array(z.string()).optional().describe("List of script file paths"),
+  assets: z.array(z.string()).optional().describe("List of asset file paths"),
+  files: z.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the skill")
 });
 var listStoredSkillsResponseSchema = paginationInfoSchema$1.extend({
-  skills: z$1.array(storedSkillSchema)
+  skills: z.array(storedSkillSchema)
 });
 var getStoredSkillResponseSchema = storedSkillSchema;
 var createStoredSkillResponseSchema = storedSkillSchema;
-var updateStoredSkillResponseSchema = z$1.union([
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    visibility: z$1.enum(["private", "public"]).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+var updateStoredSkillResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    visibility: z.enum(["private", "public"]).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   storedSkillSchema
 ]);
-var deleteStoredSkillResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredSkillResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
-var publishStoredSkillBodySchema = z$1.object({
-  skillPath: z$1.string().describe("Path to the skill directory on the server filesystem (containing SKILL.md)")
+var publishStoredSkillBodySchema = z.object({
+  skillPath: z.string().describe("Path to the skill directory on the server filesystem (containing SKILL.md)")
 });
 var publishStoredSkillResponseSchema = storedSkillSchema;
 
 // src/server/schemas/default-options.ts
-var defaultOptionsSchema = z$1.object({
+var defaultOptionsSchema = z.object({
   /** Unique identifier for this execution run */
-  runId: z$1.string().optional(),
+  runId: z.string().optional(),
   /** Save messages incrementally after each stream step completes (default: false) */
-  savePerStep: z$1.boolean().optional(),
+  savePerStep: z.boolean().optional(),
   /** Maximum number of steps to run */
-  maxSteps: z$1.number().optional(),
+  maxSteps: z.number().optional(),
   /** Provider-specific options passed to the language model */
   /** Tools that are active for this execution (stored as tool IDs) */
-  activeTools: z$1.array(z$1.string()).optional(),
+  activeTools: z.array(z.string()).optional(),
   /** Maximum number of times processors can trigger a retry */
-  maxProcessorRetries: z$1.number().optional(),
+  maxProcessorRetries: z.number().optional(),
   /** Tool selection strategy: 'auto', 'none', 'required', or specific tools */
-  toolChoice: z$1.union([
-    z$1.literal("auto"),
-    z$1.literal("none"),
-    z$1.literal("required"),
-    z$1.object({ type: z$1.literal("tool"), toolName: z$1.string() })
+  toolChoice: z.union([
+    z.literal("auto"),
+    z.literal("none"),
+    z.literal("required"),
+    z.object({ type: z.literal("tool"), toolName: z.string() })
   ]).optional(),
   /** Model-specific settings like temperature, maxTokens, topP, etc. */
-  modelSettings: z$1.object({
-    temperature: z$1.number().optional(),
-    maxTokens: z$1.number().optional(),
-    topP: z$1.number().optional(),
-    topK: z$1.number().optional(),
-    frequencyPenalty: z$1.number().optional(),
-    presencePenalty: z$1.number().optional(),
-    stopSequences: z$1.array(z$1.string()).optional(),
-    seed: z$1.number().optional(),
-    maxRetries: z$1.number().optional()
+  modelSettings: z.object({
+    temperature: z.number().optional(),
+    maxTokens: z.number().optional(),
+    topP: z.number().optional(),
+    topK: z.number().optional(),
+    frequencyPenalty: z.number().optional(),
+    presencePenalty: z.number().optional(),
+    stopSequences: z.array(z.string()).optional(),
+    seed: z.number().optional(),
+    maxRetries: z.number().optional()
   }).optional(),
   /** Whether to return detailed scoring data in the response */
-  returnScorerData: z$1.boolean().optional(),
+  returnScorerData: z.boolean().optional(),
   /** Tracing options for starting new traces */
-  tracingOptions: z$1.object({
-    traceName: z$1.string().optional(),
-    attributes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    spanId: z$1.string().optional(),
-    traceId: z$1.string().optional()
+  tracingOptions: z.object({
+    traceName: z.string().optional(),
+    attributes: z.record(z.string(), z.unknown()).optional(),
+    spanId: z.string().optional(),
+    traceId: z.string().optional()
   }).optional(),
   /** Require approval for all tool calls */
-  requireToolApproval: z$1.boolean().optional(),
+  requireToolApproval: z.boolean().optional(),
   /** Automatically resume suspended tools */
-  autoResumeSuspendedTools: z$1.boolean().optional(),
+  autoResumeSuspendedTools: z.boolean().optional(),
   /** Maximum number of tool calls to execute concurrently */
-  toolCallConcurrency: z$1.number().optional(),
+  toolCallConcurrency: z.number().optional(),
   /** Whether to include raw chunks in the stream output */
-  includeRawChunks: z$1.boolean().optional()
+  includeRawChunks: z.boolean().optional()
 }).passthrough().describe("Default options for agent execution");
 
-var jsonValueSchema$1 = z$1.lazy(
-  () => z$1.union([
-    z$1.string(),
-    z$1.number(),
-    z$1.boolean(),
-    z$1.null(),
-    z$1.array(jsonValueSchema$1),
-    z$1.record(z$1.string(), jsonValueSchema$1)
+var jsonValueSchema$1 = z.lazy(
+  () => z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(jsonValueSchema$1),
+    z.record(z.string(), jsonValueSchema$1)
   ])
 );
-var jsonRecordSchema = z$1.record(z$1.string(), jsonValueSchema$1);
-var signalAttributesSchema$1 = z$1.record(
-  z$1.string(),
-  z$1.union([z$1.string(), z$1.number(), z$1.boolean(), z$1.null(), z$1.undefined()])
+var jsonRecordSchema = z.record(z.string(), jsonValueSchema$1);
+var signalAttributesSchema$1 = z.record(
+  z.string(),
+  z.union([z.string(), z.number(), z.boolean(), z.null(), z.undefined()])
 );
-var baseSignalSchema = z$1.object({
-  id: z$1.string().optional(),
-  createdAt: z$1.union([z$1.string(), z$1.date()]).optional(),
+var baseSignalSchema = z.object({
+  id: z.string().optional(),
+  createdAt: z.union([z.string(), z.date()]).optional(),
   metadata: jsonRecordSchema.optional(),
   attributes: signalAttributesSchema$1.optional()
 });
-var partProviderOptionsSchema = z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema$1)).optional();
-var signalTextPartSchema = z$1.object({
-  type: z$1.literal("text"),
-  text: z$1.string(),
+var partProviderOptionsSchema = z.record(z.string(), z.record(z.string(), jsonValueSchema$1)).optional();
+var signalTextPartSchema = z.object({
+  type: z.literal("text"),
+  text: z.string(),
   providerOptions: partProviderOptionsSchema
 });
-var signalFilePartSchema = z$1.object({
-  type: z$1.literal("file"),
-  data: z$1.string(),
-  mediaType: z$1.string(),
-  filename: z$1.string().optional(),
+var signalFilePartSchema = z.object({
+  type: z.literal("file"),
+  data: z.string(),
+  mediaType: z.string(),
+  filename: z.string().optional(),
   providerOptions: partProviderOptionsSchema
 });
-var userMessageSignalContentsSchema = z$1.union([
-  z$1.string(),
-  z$1.array(z$1.union([signalTextPartSchema, signalFilePartSchema]))
+var userMessageSignalContentsSchema = z.union([
+  z.string(),
+  z.array(z.union([signalTextPartSchema, signalFilePartSchema]))
 ]);
-var agentMessageInputObjectSchema = z$1.object({
+var agentMessageInputObjectSchema = z.object({
   contents: userMessageSignalContentsSchema,
   attributes: signalAttributesSchema$1.optional(),
   metadata: jsonRecordSchema.optional(),
-  providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema$1)).optional()
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema$1)).optional()
 });
-var agentMessageInputSchema = z$1.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
+var agentMessageInputSchema = z.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
 var agentSignalSchema = baseSignalSchema.extend({
-  type: z$1.enum(["user", "state", "reactive", "notification", "user-message", "system-reminder"]),
-  tagName: z$1.string().optional(),
+  type: z.enum(["user", "state", "reactive", "notification", "user-message", "system-reminder"]),
+  tagName: z.string().optional(),
   contents: userMessageSignalContentsSchema,
-  providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema$1)).optional()
+  providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema$1)).optional()
 });
-var agentIdPathParams$1 = z$1.object({
-  agentId: z$1.string().describe("Unique identifier for the agent")
+var agentIdPathParams$1 = z.object({
+  agentId: z.string().describe("Unique identifier for the agent")
 });
-var agentVersionQuerySchema = z$1.object({
-  status: z$1.enum(["draft", "published"]).optional().describe(
+var agentVersionQuerySchema = z.object({
+  status: z.enum(["draft", "published"]).optional().describe(
     "Which stored config version to resolve: draft (latest, default) or published (active version). Mutually exclusive with versionId."
   ),
-  versionId: z$1.string().optional().describe(
+  versionId: z.string().optional().describe(
     "Specific version ID to resolve. Mutually exclusive with status \u2014 if both are provided, versionId takes precedence."
   )
 });
-var toolIdPathParams = z$1.object({
-  toolId: z$1.string().describe("Unique identifier for the tool")
+var toolIdPathParams = z.object({
+  toolId: z.string().describe("Unique identifier for the tool")
 });
 var agentToolPathParams = agentIdPathParams$1.extend({
-  toolId: z$1.string().describe("Unique identifier for the tool")
+  toolId: z.string().describe("Unique identifier for the tool")
 });
 var agentSkillPathParams = agentIdPathParams$1.extend({
-  skillName: z$1.string().describe("Name of the skill")
+  skillName: z.string().describe("Name of the skill")
 });
 var modelConfigIdPathParams = agentIdPathParams$1.extend({
-  modelConfigId: z$1.string().describe("Unique identifier for the model configuration")
+  modelConfigId: z.string().describe("Unique identifier for the model configuration")
 });
-var serializedProcessorSchema$1 = z$1.object({
-  id: z$1.string(),
-  name: z$1.string().optional()
+var serializedProcessorSchema$1 = z.object({
+  id: z.string(),
+  name: z.string().optional()
 });
-var serializedToolSchema = z$1.object({
-  id: z$1.string(),
-  description: z$1.string().optional(),
-  inputSchema: z$1.string().optional(),
-  outputSchema: z$1.string().optional(),
-  requireApproval: z$1.boolean().optional()
+var serializedToolSchema = z.object({
+  id: z.string(),
+  description: z.string().optional(),
+  inputSchema: z.string().optional(),
+  outputSchema: z.string().optional(),
+  requireApproval: z.boolean().optional()
 });
-var serializedWorkflowSchema = z$1.object({
-  name: z$1.string(),
-  steps: z$1.record(
-    z$1.string(),
-    z$1.object({
-      id: z$1.string(),
-      description: z$1.string().optional()
+var serializedWorkflowSchema = z.object({
+  name: z.string(),
+  steps: z.record(
+    z.string(),
+    z.object({
+      id: z.string(),
+      description: z.string().optional()
     })
   ).optional()
 });
-var serializedAgentDefinitionSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string()
+var serializedAgentDefinitionSchema = z.object({
+  id: z.string(),
+  name: z.string()
 });
-var systemMessageSchema = z$1.union([
-  z$1.string(),
-  z$1.array(z$1.string()),
-  z$1.any(),
+var systemMessageSchema = z.union([
+  z.string(),
+  z.array(z.string()),
+  z.any(),
   // CoreSystemMessage or SystemModelMessage
-  z$1.array(z$1.any())
+  z.array(z.any())
 ]);
-var modelConfigSchema$1 = z$1.object({
-  model: z$1.object({
-    modelId: z$1.string(),
-    provider: z$1.string(),
-    modelVersion: z$1.string()
+var modelConfigSchema$1 = z.object({
+  model: z.object({
+    modelId: z.string(),
+    provider: z.string(),
+    modelVersion: z.string()
   })
   // Additional fields from AgentModelManagerConfig can be added here
 });
-var agentEditorConfigSchema = z$1.union([
-  z$1.literal(false),
-  z$1.object({
-    instructions: z$1.boolean().optional(),
-    tools: z$1.union([z$1.boolean(), z$1.object({ description: z$1.boolean().optional() })]).optional()
+var agentEditorConfigSchema = z.union([
+  z.literal(false),
+  z.object({
+    instructions: z.boolean().optional(),
+    tools: z.union([z.boolean(), z.object({ description: z.boolean().optional() })]).optional()
   })
 ]);
-var serializedAgentSchema = z$1.object({
-  name: z$1.string(),
-  description: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+var serializedAgentSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   instructions: systemMessageSchema.optional(),
-  tools: z$1.record(z$1.string(), serializedToolSchema),
-  agents: z$1.record(z$1.string(), serializedAgentDefinitionSchema),
-  workflows: z$1.record(z$1.string(), serializedWorkflowSchema),
-  inputProcessors: z$1.array(serializedProcessorSchema$1),
-  outputProcessors: z$1.array(serializedProcessorSchema$1),
-  provider: z$1.string().optional(),
-  modelId: z$1.string().optional(),
-  modelVersion: z$1.string().optional(),
-  supportsMemory: z$1.boolean().optional(),
-  modelList: z$1.array(modelConfigSchema$1).optional(),
+  tools: z.record(z.string(), serializedToolSchema),
+  agents: z.record(z.string(), serializedAgentDefinitionSchema),
+  workflows: z.record(z.string(), serializedWorkflowSchema),
+  inputProcessors: z.array(serializedProcessorSchema$1),
+  outputProcessors: z.array(serializedProcessorSchema$1),
+  provider: z.string().optional(),
+  modelId: z.string().optional(),
+  modelVersion: z.string().optional(),
+  supportsMemory: z.boolean().optional(),
+  modelList: z.array(modelConfigSchema$1).optional(),
   defaultOptions: defaultOptionsSchema.optional(),
-  defaultGenerateOptionsLegacy: z$1.record(z$1.string(), z$1.any()).optional(),
-  defaultStreamOptionsLegacy: z$1.record(z$1.string(), z$1.any()).optional(),
-  source: z$1.enum(["code", "stored", "fs"]).optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional(),
-  activeVersionId: z$1.string().optional(),
-  hasDraft: z$1.boolean().optional(),
+  defaultGenerateOptionsLegacy: z.record(z.string(), z.any()).optional(),
+  defaultStreamOptionsLegacy: z.record(z.string(), z.any()).optional(),
+  source: z.enum(["code", "stored", "fs"]).optional(),
+  status: z.enum(["draft", "published", "archived"]).optional(),
+  activeVersionId: z.string().optional(),
+  hasDraft: z.boolean().optional(),
   editor: agentEditorConfigSchema.optional()
 });
 serializedAgentSchema.extend({
-  id: z$1.string()
+  id: z.string()
 });
-var providerSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  label: z$1.string().optional(),
-  description: z$1.string().optional(),
-  envVar: z$1.union([z$1.string(), z$1.array(z$1.string())]),
-  connected: z$1.boolean(),
-  docUrl: z$1.string().optional(),
-  models: z$1.array(z$1.string())
+var providerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  label: z.string().optional(),
+  description: z.string().optional(),
+  envVar: z.union([z.string(), z.array(z.string())]),
+  connected: z.boolean(),
+  docUrl: z.string().optional(),
+  models: z.array(z.string())
 });
-var providersResponseSchema = z$1.object({
-  providers: z$1.array(providerSchema)
+var providersResponseSchema = z.object({
+  providers: z.array(providerSchema)
 });
-var listAgentsResponseSchema = z$1.record(z$1.string(), serializedAgentSchema);
-var listToolsResponseSchema = z$1.record(z$1.string(), serializedToolSchema);
-var agentMemoryOptionSchema = z$1.object({
-  thread: z$1.union([z$1.string(), z$1.object({ id: z$1.string() }).passthrough()]),
-  resource: z$1.string(),
-  options: z$1.record(z$1.string(), z$1.any()).optional(),
-  readOnly: z$1.boolean().optional()
+var listAgentsResponseSchema = z.record(z.string(), serializedAgentSchema);
+var listToolsResponseSchema = z.record(z.string(), serializedToolSchema);
+var agentMemoryOptionSchema = z.object({
+  thread: z.union([z.string(), z.object({ id: z.string() }).passthrough()]),
+  resource: z.string(),
+  options: z.record(z.string(), z.any()).optional(),
+  readOnly: z.boolean().optional()
 });
-var toolChoiceSchema = z$1.union([
-  z$1.enum(["auto", "none", "required"]),
-  z$1.object({ type: z$1.literal("tool"), toolName: z$1.string() })
+var toolChoiceSchema = z.union([
+  z.enum(["auto", "none", "required"]),
+  z.object({ type: z.literal("tool"), toolName: z.string() })
 ]);
-var agentExecutionBodySchema$1 = z$1.object({
+var agentExecutionBodySchema$1 = z.object({
   // REQUIRED
-  messages: z$1.union([
-    z$1.array(coreMessageSchema),
+  messages: z.union([
+    z.array(coreMessageSchema),
     // Array of messages
-    z$1.string()
+    z.string()
     // Single user message shorthand
   ]),
   // Message Configuration
   instructions: systemMessageSchema.optional(),
   system: systemMessageSchema.optional(),
-  context: z$1.array(coreMessageSchema).optional(),
+  context: z.array(coreMessageSchema).optional(),
   // Memory & Persistence
   memory: agentMemoryOptionSchema.optional(),
-  runId: z$1.string().optional(),
-  savePerStep: z$1.boolean().optional(),
+  runId: z.string().optional(),
+  savePerStep: z.boolean().optional(),
   // Request Context (handler-specific field - merged with server's requestContext)
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional(),
+  requestContext: z.record(z.string(), z.any()).optional(),
   // Version overrides for sub-agents (and future primitives)
-  versions: z$1.object({
-    agents: z$1.record(
-      z$1.string(),
-      z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])
+  versions: z.object({
+    agents: z.record(
+      z.string(),
+      z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])
     ).optional(),
-    defaultStatus: z$1.enum(["draft", "published"]).optional()
+    defaultStatus: z.enum(["draft", "published"]).optional()
   }).optional(),
   // Execution Control
-  maxSteps: z$1.number().optional(),
-  stopWhen: z$1.any().optional(),
+  maxSteps: z.number().optional(),
+  stopWhen: z.any().optional(),
   // Model Configuration
-  providerOptions: z$1.object({
-    anthropic: z$1.record(z$1.string(), z$1.any()).optional(),
-    google: z$1.record(z$1.string(), z$1.any()).optional(),
-    openai: z$1.record(z$1.string(), z$1.any()).optional(),
-    xai: z$1.record(z$1.string(), z$1.any()).optional()
+  providerOptions: z.object({
+    anthropic: z.record(z.string(), z.any()).optional(),
+    google: z.record(z.string(), z.any()).optional(),
+    openai: z.record(z.string(), z.any()).optional(),
+    xai: z.record(z.string(), z.any()).optional()
   }).optional(),
-  modelSettings: z$1.any().optional(),
+  modelSettings: z.any().optional(),
   // Tool Configuration
-  activeTools: z$1.array(z$1.string()).optional(),
-  toolsets: z$1.record(z$1.string(), z$1.any()).optional(),
-  clientTools: z$1.record(z$1.string(), z$1.any()).optional(),
+  activeTools: z.array(z.string()).optional(),
+  toolsets: z.record(z.string(), z.any()).optional(),
+  clientTools: z.record(z.string(), z.any()).optional(),
   toolChoice: toolChoiceSchema.optional(),
-  requireToolApproval: z$1.boolean().optional(),
+  requireToolApproval: z.boolean().optional(),
   // Evaluation
-  scorers: z$1.union([
-    z$1.record(z$1.string(), z$1.any()),
-    z$1.record(
-      z$1.string(),
-      z$1.object({
-        scorer: z$1.string(),
-        sampling: z$1.any().optional()
+  scorers: z.union([
+    z.record(z.string(), z.any()),
+    z.record(
+      z.string(),
+      z.object({
+        scorer: z.string(),
+        sampling: z.any().optional()
       })
     )
   ]).optional(),
-  returnScorerData: z$1.boolean().optional(),
+  returnScorerData: z.boolean().optional(),
   // Observability
   tracingOptions: tracingOptionsSchema.optional(),
   // Structured Output
-  output: z$1.any().optional(),
+  output: z.any().optional(),
   // Zod schema, JSON schema, or structured output object
-  structuredOutput: z$1.object({
-    schema: z$1.object({}).passthrough(),
-    model: z$1.union([z$1.string(), z$1.any()]).optional(),
-    instructions: z$1.string().optional(),
-    jsonPromptInjection: z$1.boolean().optional(),
-    errorStrategy: z$1.enum(["strict", "warn", "fallback"]).optional(),
-    fallbackValue: z$1.any().optional()
+  structuredOutput: z.object({
+    schema: z.object({}).passthrough(),
+    model: z.union([z.string(), z.any()]).optional(),
+    instructions: z.string().optional(),
+    jsonPromptInjection: z.boolean().optional(),
+    errorStrategy: z.enum(["strict", "warn", "fallback"]).optional(),
+    fallbackValue: z.any().optional()
   }).optional(),
   // Idle-loop streaming (collapses streamUntilIdle into stream)
-  untilIdle: z$1.union([z$1.boolean(), z$1.object({ maxIdleMs: z$1.number().int().positive().optional() })]).optional()
+  untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional()
 }).passthrough();
 var agentExecutionLegacyBodySchema = agentExecutionBodySchema$1.extend({
-  resourceId: z$1.string().optional(),
-  resourceid: z$1.string().optional(),
+  resourceId: z.string().optional(),
+  resourceid: z.string().optional(),
   // lowercase variant
-  threadId: z$1.string().optional()
+  threadId: z.string().optional()
 });
 var streamUntilIdleBodySchema = agentExecutionBodySchema$1.extend({
-  maxIdleMs: z$1.number().int().positive().optional(),
-  untilIdle: z$1.union([z$1.boolean(), z$1.object({ maxIdleMs: z$1.number().int().positive().optional() })]).optional()
+  maxIdleMs: z.number().int().positive().optional(),
+  untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional()
 });
 var resumeStreamUntilIdleBodySchema = agentExecutionBodySchema$1.omit({ messages: true }).extend({
-  runId: z$1.string(),
-  resumeData: z$1.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
-  toolCallId: z$1.string().optional(),
-  maxIdleMs: z$1.number().int().positive().optional()
+  runId: z.string(),
+  resumeData: z.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
+  toolCallId: z.string().optional(),
+  maxIdleMs: z.number().int().positive().optional()
 });
-var executeToolDataBodySchema = z$1.object({
-  data: z$1.unknown().refine((x) => x !== void 0, { message: "data is required" })
+var executeToolDataBodySchema = z.object({
+  data: z.unknown().refine((x) => x !== void 0, { message: "data is required" })
 });
 var executeToolBodySchema$1 = executeToolDataBodySchema.extend({
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional()
+  requestContext: z.record(z.string(), z.any()).optional()
 });
 var executeToolContextBodySchema = executeToolDataBodySchema.extend({
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional()
+  requestContext: z.record(z.string(), z.any()).optional()
 });
-var toolCallActionBodySchema = z$1.object({
-  runId: z$1.string(),
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional(),
-  toolCallId: z$1.string(),
-  format: z$1.string().optional()
+var toolCallActionBodySchema = z.object({
+  runId: z.string(),
+  requestContext: z.record(z.string(), z.any()).optional(),
+  toolCallId: z.string(),
+  format: z.string().optional()
 });
-var networkToolCallActionBodySchema = z$1.object({
-  runId: z$1.string(),
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional(),
-  format: z$1.string().optional()
+var networkToolCallActionBodySchema = z.object({
+  runId: z.string(),
+  requestContext: z.record(z.string(), z.any()).optional(),
+  format: z.string().optional()
 });
 var approveToolCallBodySchema = toolCallActionBodySchema;
 var declineToolCallBodySchema = toolCallActionBodySchema;
 var approveNetworkToolCallBodySchema = networkToolCallActionBodySchema;
 var declineNetworkToolCallBodySchema = networkToolCallActionBodySchema;
-var toolCallResponseSchema = z$1.object({
-  fullStream: z$1.any()
+var toolCallResponseSchema = z.object({
+  fullStream: z.any()
   // ReadableStream
 });
-var sendToolApprovalResponseSchema = z$1.object({
-  accepted: z$1.literal(true),
-  runId: z$1.string(),
-  toolCallId: z$1.string().optional()
+var sendToolApprovalResponseSchema = z.object({
+  accepted: z.literal(true),
+  runId: z.string(),
+  toolCallId: z.string().optional()
 });
-var listSuspendedRunsQuerySchema = z$1.object({
-  threadId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
-  fromDate: z$1.coerce.date().optional(),
-  toDate: z$1.coerce.date().optional(),
-  perPage: z$1.coerce.number().int().positive().optional(),
+var listSuspendedRunsQuerySchema = z.object({
+  threadId: z.string().optional(),
+  resourceId: z.string().optional(),
+  fromDate: z.coerce.date().optional(),
+  toDate: z.coerce.date().optional(),
+  perPage: z.coerce.number().int().positive().optional(),
   // page is zero-indexed, so 0 is valid
-  page: z$1.coerce.number().int().nonnegative().optional()
+  page: z.coerce.number().int().nonnegative().optional()
 }).refine((data) => !data.fromDate || !data.toDate || data.fromDate <= data.toDate, {
   message: "fromDate must be less than or equal to toDate",
   path: ["fromDate"]
 });
-var listSuspendedRunsResponseSchema = z$1.object({
-  runs: z$1.array(
-    z$1.object({
-      runId: z$1.string(),
-      status: z$1.literal("suspended"),
-      threadId: z$1.string().optional(),
-      resourceId: z$1.string().optional(),
-      suspendedAt: z$1.date(),
-      toolCalls: z$1.array(
-        z$1.object({
-          toolCallId: z$1.string().optional(),
-          toolName: z$1.string().optional(),
-          args: z$1.unknown().optional(),
-          requiresApproval: z$1.boolean(),
-          suspendPayload: z$1.unknown().optional()
+var listSuspendedRunsResponseSchema = z.object({
+  runs: z.array(
+    z.object({
+      runId: z.string(),
+      status: z.literal("suspended"),
+      threadId: z.string().optional(),
+      resourceId: z.string().optional(),
+      suspendedAt: z.date(),
+      toolCalls: z.array(
+        z.object({
+          toolCallId: z.string().optional(),
+          toolName: z.string().optional(),
+          args: z.unknown().optional(),
+          requiresApproval: z.boolean(),
+          suspendPayload: z.unknown().optional()
         })
       )
     })
   ),
-  total: z$1.number().int().nonnegative()
+  total: z.number().int().nonnegative()
 });
 var resumeStreamBodySchema = agentExecutionBodySchema$1.omit({ messages: true }).extend({
-  runId: z$1.string(),
-  resumeData: z$1.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
-  toolCallId: z$1.string().optional()
+  runId: z.string(),
+  resumeData: z.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
+  toolCallId: z.string().optional()
 });
-var recoverBodySchema = z$1.object({
-  runId: z$1.string(),
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional(),
-  versions: z$1.object({
-    agents: z$1.record(
-      z$1.string(),
-      z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])
+var recoverBodySchema = z.object({
+  runId: z.string(),
+  requestContext: z.record(z.string(), z.any()).optional(),
+  versions: z.object({
+    agents: z.record(
+      z.string(),
+      z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])
     ).optional(),
-    defaultStatus: z$1.enum(["draft", "published"]).optional()
+    defaultStatus: z.enum(["draft", "published"]).optional()
   }).optional()
 });
-var updateAgentModelBodySchema = z$1.object({
-  modelId: z$1.string(),
-  provider: z$1.string()
+var updateAgentModelBodySchema = z.object({
+  modelId: z.string(),
+  provider: z.string()
 });
-var reorderAgentModelListBodySchema = z$1.object({
-  reorderedModelIds: z$1.array(z$1.string())
+var reorderAgentModelListBodySchema = z.object({
+  reorderedModelIds: z.array(z.string())
 });
-var updateAgentModelInModelListBodySchema = z$1.object({
-  model: z$1.object({
-    modelId: z$1.string(),
-    provider: z$1.string()
+var updateAgentModelInModelListBodySchema = z.object({
+  model: z.object({
+    modelId: z.string(),
+    provider: z.string()
   }).optional(),
-  maxRetries: z$1.number().optional(),
-  enabled: z$1.boolean().optional()
+  maxRetries: z.number().optional(),
+  enabled: z.boolean().optional()
 });
 var modelManagementResponseSchema = messageResponseSchema;
-var generateResponseSchema = z$1.any();
-var streamResponseSchema = z$1.any();
-var executeToolResponseSchema$1 = z$1.any();
-var enhanceInstructionsBodySchema = z$1.object({
-  instructions: z$1.string().describe("The current agent instructions to enhance"),
-  comment: z$1.string().describe("User comment describing how to enhance the instructions")
+var generateResponseSchema = z.any();
+var streamResponseSchema = z.any();
+var executeToolResponseSchema$1 = z.any();
+var enhanceInstructionsBodySchema = z.object({
+  instructions: z.string().describe("The current agent instructions to enhance"),
+  comment: z.string().describe("User comment describing how to enhance the instructions")
 });
-var enhanceInstructionsResponseSchema = z$1.object({
-  explanation: z$1.string().describe("Explanation of the changes made"),
-  new_prompt: z$1.string().describe("The enhanced instructions")
+var enhanceInstructionsResponseSchema = z.object({
+  explanation: z.string().describe("Explanation of the changes made"),
+  new_prompt: z.string().describe("The enhanced instructions")
 });
-var observeAgentBodySchema = z$1.object({
-  runId: z$1.string().describe("The run ID to observe/reconnect to"),
-  offset: z$1.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
+var observeAgentBodySchema = z.object({
+  runId: z.string().describe("The run ID to observe/reconnect to"),
+  offset: z.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
 });
-var signalActiveBehaviorSchema = z$1.enum(["deliver", "persist", "discard"]);
-var signalIdleBehaviorSchema = z$1.enum(["wake", "persist", "discard"]);
-var signalTargetBaseBodySchema = z$1.object({
-  ifActive: z$1.object({
+var signalActiveBehaviorSchema = z.enum(["deliver", "persist", "discard"]);
+var signalIdleBehaviorSchema = z.enum(["wake", "persist", "discard"]);
+var signalTargetBaseBodySchema = z.object({
+  ifActive: z.object({
     behavior: signalActiveBehaviorSchema.optional(),
     attributes: signalAttributesSchema$1.optional()
   }).optional()
 });
-var signalTargetBodySchema = z$1.union([
+var signalTargetBodySchema = z.union([
   signalTargetBaseBodySchema.extend({
-    runId: z$1.string(),
-    resourceId: z$1.string().optional(),
-    threadId: z$1.string().optional(),
-    ifIdle: z$1.undefined().optional()
+    runId: z.string(),
+    resourceId: z.string().optional(),
+    threadId: z.string().optional(),
+    ifIdle: z.undefined().optional()
   }),
   signalTargetBaseBodySchema.extend({
-    runId: z$1.undefined().optional(),
-    resourceId: z$1.string(),
-    threadId: z$1.string(),
-    ifIdle: z$1.object({
+    runId: z.undefined().optional(),
+    resourceId: z.string(),
+    threadId: z.string(),
+    ifIdle: z.object({
       behavior: signalIdleBehaviorSchema.optional(),
       streamOptions: agentExecutionBodySchema$1.omit({ messages: true }).optional(),
       attributes: signalAttributesSchema$1.optional()
     }).optional()
   })
 ]);
-var sendAgentSignalBodySchema = z$1.union([
+var sendAgentSignalBodySchema = z.union([
   signalTargetBodySchema.options[0].extend({ signal: agentSignalSchema }),
   signalTargetBodySchema.options[1].extend({ signal: agentSignalSchema })
 ]);
-var sendAgentMessageBodySchema = z$1.union([
+var sendAgentMessageBodySchema = z.union([
   signalTargetBodySchema.options[0].extend({ message: agentMessageInputSchema }),
   signalTargetBodySchema.options[1].extend({ message: agentMessageInputSchema })
 ]);
 var queueAgentMessageBodySchema = sendAgentMessageBodySchema;
-var subscribeAgentThreadBodySchema = z$1.object({
-  resourceId: z$1.string().optional(),
-  threadId: z$1.string()
+var subscribeAgentThreadBodySchema = z.object({
+  resourceId: z.string().optional(),
+  threadId: z.string()
 });
 var abortAgentThreadBodySchema = subscribeAgentThreadBodySchema;
-var sendToolApprovalBodySchema = z$1.object({
-  resourceId: z$1.string(),
-  threadId: z$1.string(),
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional(),
-  toolCallId: z$1.string(),
-  approved: z$1.boolean(),
-  resumeData: z$1.any().optional(),
-  format: z$1.string().optional(),
-  messages: z$1.array(coreMessageSchema).optional(),
-  streamOptions: z$1.any().optional()
+var sendToolApprovalBodySchema = z.object({
+  resourceId: z.string(),
+  threadId: z.string(),
+  requestContext: z.record(z.string(), z.any()).optional(),
+  toolCallId: z.string(),
+  approved: z.boolean(),
+  resumeData: z.any().optional(),
+  format: z.string().optional(),
+  messages: z.array(coreMessageSchema).optional(),
+  streamOptions: z.any().optional()
 });
-var abortAgentThreadResponseSchema = z$1.object({
-  aborted: z$1.boolean()
+var abortAgentThreadResponseSchema = z.object({
+  aborted: z.boolean()
 });
-var observeAgentResponseSchema = z$1.any();
+var observeAgentResponseSchema = z.any();
 
-var agentFeaturesSchema = z$1.object({
-  tools: z$1.boolean().optional(),
-  agents: z$1.boolean().optional(),
-  workflows: z$1.boolean().optional(),
-  scorers: z$1.boolean().optional(),
-  skills: z$1.boolean().optional(),
-  memory: z$1.boolean().optional(),
-  variables: z$1.boolean().optional(),
-  favorites: z$1.boolean().optional(),
-  avatarUpload: z$1.boolean().optional(),
-  browser: z$1.boolean().optional(),
+var agentFeaturesSchema = z.object({
+  tools: z.boolean().optional(),
+  agents: z.boolean().optional(),
+  workflows: z.boolean().optional(),
+  scorers: z.boolean().optional(),
+  skills: z.boolean().optional(),
+  memory: z.boolean().optional(),
+  variables: z.boolean().optional(),
+  favorites: z.boolean().optional(),
+  avatarUpload: z.boolean().optional(),
+  browser: z.boolean().optional(),
   /**
    * Whether the model picker is visible in the Agent Builder.
    * Omitted ⇒ picker visible (default-on). Explicit `false` ⇒ picker hidden
    * (locked mode); `models.default` is required and applied.
    */
-  model: z$1.boolean().optional()
+  model: z.boolean().optional()
 });
-var knownProviderEntrySchema = z$1.object({
-  provider: z$1.string().min(1),
-  modelId: z$1.string().min(1).optional()
+var knownProviderEntrySchema = z.object({
+  provider: z.string().min(1),
+  modelId: z.string().min(1).optional()
 }).strict();
-var customProviderEntrySchema = z$1.object({
-  kind: z$1.literal("custom"),
-  provider: z$1.string().min(1),
-  modelId: z$1.string().min(1).optional()
+var customProviderEntrySchema = z.object({
+  kind: z.literal("custom"),
+  provider: z.string().min(1),
+  modelId: z.string().min(1).optional()
 }).strict();
-var knownDefaultModelEntrySchema = z$1.object({
-  provider: z$1.string().min(1),
-  modelId: z$1.string().min(1)
+var knownDefaultModelEntrySchema = z.object({
+  provider: z.string().min(1),
+  modelId: z.string().min(1)
 }).strict();
-var customDefaultModelEntrySchema = z$1.object({
-  kind: z$1.literal("custom"),
-  provider: z$1.string().min(1),
-  modelId: z$1.string().min(1)
+var customDefaultModelEntrySchema = z.object({
+  kind: z.literal("custom"),
+  provider: z.string().min(1),
+  modelId: z.string().min(1)
 }).strict();
-var providerModelEntrySchema = z$1.union([customProviderEntrySchema, knownProviderEntrySchema]);
-var defaultModelEntrySchema = z$1.union([customDefaultModelEntrySchema, knownDefaultModelEntrySchema]);
-var agentModelsSchema = z$1.object({
-  allowed: z$1.array(providerModelEntrySchema).optional(),
+var providerModelEntrySchema = z.union([customProviderEntrySchema, knownProviderEntrySchema]);
+var defaultModelEntrySchema = z.union([customDefaultModelEntrySchema, knownDefaultModelEntrySchema]);
+var agentModelsSchema = z.object({
+  allowed: z.array(providerModelEntrySchema).optional(),
   default: defaultModelEntrySchema.optional()
 });
-var pickerAllowlistSchema = z$1.object({
-  allowed: z$1.array(z$1.string()).optional()
+var pickerAllowlistSchema = z.object({
+  allowed: z.array(z.string()).optional()
 }).strict();
-var agentConfigurationSchema = z$1.object({
+var agentConfigurationSchema = z.object({
   models: agentModelsSchema.optional(),
   tools: pickerAllowlistSchema.optional(),
   agents: pickerAllowlistSchema.optional(),
   workflows: pickerAllowlistSchema.optional()
-}).catchall(z$1.unknown());
-var builderPickerSchema = z$1.object({
-  visibleTools: z$1.array(z$1.string()).nullable(),
-  visibleAgents: z$1.array(z$1.string()).nullable(),
-  visibleWorkflows: z$1.array(z$1.string()).nullable()
+}).catchall(z.unknown());
+var builderPickerSchema = z.object({
+  visibleTools: z.array(z.string()).nullable(),
+  visibleAgents: z.array(z.string()).nullable(),
+  visibleWorkflows: z.array(z.string()).nullable()
 });
-var builderModelPolicySchema = z$1.object({
-  active: z$1.boolean(),
-  pickerVisible: z$1.boolean().optional(),
-  allowed: z$1.array(providerModelEntrySchema).optional(),
+var builderModelPolicySchema = z.object({
+  active: z.boolean(),
+  pickerVisible: z.boolean().optional(),
+  allowed: z.array(providerModelEntrySchema).optional(),
   default: defaultModelEntrySchema.optional()
 });
-var builderSettingsResponseSchema = z$1.object({
-  enabled: z$1.boolean(),
-  features: z$1.object({
+var builderSettingsResponseSchema = z.object({
+  enabled: z.boolean(),
+  features: z.object({
     agent: agentFeaturesSchema.optional()
   }).optional(),
-  configuration: z$1.object({
+  configuration: z.object({
     agent: agentConfigurationSchema.optional()
   }).optional(),
   modelPolicy: builderModelPolicySchema.optional(),
@@ -1282,172 +870,172 @@ var builderSettingsResponseSchema = z$1.object({
    * picker allowlist entries that don't match a registered ID). UI surfaces
    * these as a banner in the Builder admin view.
    */
-  modelPolicyWarnings: z$1.array(z$1.string()).optional()
+  modelPolicyWarnings: z.array(z.string()).optional()
 });
-var infrastructureStatusResponseSchema = z$1.object({
-  channels: z$1.object({
-    providers: z$1.array(
-      z$1.object({
-        id: z$1.string(),
-        name: z$1.string(),
-        isConfigured: z$1.boolean(),
-        routeCount: z$1.number()
+var infrastructureStatusResponseSchema = z.object({
+  channels: z.object({
+    providers: z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        isConfigured: z.boolean(),
+        routeCount: z.number()
       })
     )
   }),
-  browser: z$1.object({
-    type: z$1.string().nullable(),
-    provider: z$1.string().nullable(),
-    env: z$1.string().nullable(),
-    registered: z$1.boolean(),
-    availableProviders: z$1.array(z$1.string()),
-    config: z$1.array(z$1.object({ key: z$1.string(), value: z$1.string() }))
+  browser: z.object({
+    type: z.string().nullable(),
+    provider: z.string().nullable(),
+    env: z.string().nullable(),
+    registered: z.boolean(),
+    availableProviders: z.array(z.string()),
+    config: z.array(z.object({ key: z.string(), value: z.string() }))
   }),
-  workspace: z$1.object({
-    type: z$1.string().nullable(),
-    workspaceId: z$1.string().nullable(),
-    name: z$1.string().nullable(),
-    source: z$1.string().nullable(),
-    registered: z$1.boolean(),
-    hasFilesystem: z$1.boolean(),
-    hasSandbox: z$1.boolean(),
-    filesystemProvider: z$1.string().nullable(),
-    sandboxProvider: z$1.string().nullable(),
-    config: z$1.array(z$1.object({ key: z$1.string(), value: z$1.string() }))
+  workspace: z.object({
+    type: z.string().nullable(),
+    workspaceId: z.string().nullable(),
+    name: z.string().nullable(),
+    source: z.string().nullable(),
+    registered: z.boolean(),
+    hasFilesystem: z.boolean(),
+    hasSandbox: z.boolean(),
+    filesystemProvider: z.string().nullable(),
+    sandboxProvider: z.string().nullable(),
+    config: z.array(z.object({ key: z.string(), value: z.string() }))
   }),
-  registries: z$1.object({
-    skillsSh: z$1.object({
-      enabled: z$1.boolean()
+  registries: z.object({
+    skillsSh: z.object({
+      enabled: z.boolean()
     })
   })
 });
-var builderAvailableModelsResponseSchema = z$1.object({
-  providers: z$1.array(providerSchema)
+var builderAvailableModelsResponseSchema = z.object({
+  providers: z.array(providerSchema)
 });
 
-var storedWorkspaceIdPathParams = z$1.object({
-  storedWorkspaceId: z$1.string().describe("Unique identifier for the stored workspace")
+var storedWorkspaceIdPathParams = z.object({
+  storedWorkspaceId: z.string().describe("Unique identifier for the stored workspace")
 });
-var storageOrderBySchema$5 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$5 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredWorkspacesQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$5.optional(),
-  authorId: z$1.string().optional().describe("Filter workspaces by author identifier"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter workspaces by metadata key-value pairs")
+  authorId: z.string().optional().describe("Filter workspaces by author identifier"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter workspaces by metadata key-value pairs")
 });
-var filesystemConfigSchema = z$1.object({
-  provider: z$1.string().describe("Filesystem provider name"),
-  config: z$1.record(z$1.string(), z$1.unknown()).describe("Filesystem provider configuration")
+var filesystemConfigSchema = z.object({
+  provider: z.string().describe("Filesystem provider name"),
+  config: z.record(z.string(), z.unknown()).describe("Filesystem provider configuration")
 });
-var sandboxConfigSchema = z$1.object({
-  provider: z$1.string().describe("Sandbox provider name"),
-  config: z$1.record(z$1.string(), z$1.unknown()).describe("Sandbox provider configuration")
+var sandboxConfigSchema = z.object({
+  provider: z.string().describe("Sandbox provider name"),
+  config: z.record(z.string(), z.unknown()).describe("Sandbox provider configuration")
 });
-var searchConfigSchema = z$1.object({
-  vectorProvider: z$1.string().optional().describe("Vector store provider identifier"),
-  vectorConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Vector store provider-specific configuration"),
-  embedderProvider: z$1.string().optional().describe("Embedder provider identifier"),
-  embedderModel: z$1.string().optional().describe("Embedder model name"),
-  embedderConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Embedder provider-specific configuration"),
-  bm25: z$1.union([z$1.boolean(), z$1.object({ k1: z$1.number().optional(), b: z$1.number().optional() })]).optional().describe("BM25 keyword search config"),
-  searchIndexName: z$1.string().optional().describe("Custom index name for the vector store"),
-  autoIndexPaths: z$1.array(z$1.string()).optional().describe("Paths to auto-index on init")
+var searchConfigSchema = z.object({
+  vectorProvider: z.string().optional().describe("Vector store provider identifier"),
+  vectorConfig: z.record(z.string(), z.unknown()).optional().describe("Vector store provider-specific configuration"),
+  embedderProvider: z.string().optional().describe("Embedder provider identifier"),
+  embedderModel: z.string().optional().describe("Embedder model name"),
+  embedderConfig: z.record(z.string(), z.unknown()).optional().describe("Embedder provider-specific configuration"),
+  bm25: z.union([z.boolean(), z.object({ k1: z.number().optional(), b: z.number().optional() })]).optional().describe("BM25 keyword search config"),
+  searchIndexName: z.string().optional().describe("Custom index name for the vector store"),
+  autoIndexPaths: z.array(z.string()).optional().describe("Paths to auto-index on init")
 });
-var workspaceToolConfigSchema = z$1.object({
-  enabled: z$1.boolean().optional().describe("Whether the tool is enabled"),
-  requireApproval: z$1.boolean().optional().describe("Whether the tool requires user approval before execution"),
-  requireReadBeforeWrite: z$1.boolean().optional().describe("For write tools: require reading a file before writing to it")
+var workspaceToolConfigSchema = z.object({
+  enabled: z.boolean().optional().describe("Whether the tool is enabled"),
+  requireApproval: z.boolean().optional().describe("Whether the tool requires user approval before execution"),
+  requireReadBeforeWrite: z.boolean().optional().describe("For write tools: require reading a file before writing to it")
 });
-var workspaceToolsConfigSchema = z$1.object({
-  enabled: z$1.boolean().optional().describe("Default: whether all tools are enabled"),
-  requireApproval: z$1.boolean().optional().describe("Default: whether all tools require user approval"),
-  tools: z$1.record(z$1.string(), workspaceToolConfigSchema).optional().describe("Per-tool overrides keyed by workspace tool name")
+var workspaceToolsConfigSchema = z.object({
+  enabled: z.boolean().optional().describe("Default: whether all tools are enabled"),
+  requireApproval: z.boolean().optional().describe("Default: whether all tools require user approval"),
+  tools: z.record(z.string(), workspaceToolConfigSchema).optional().describe("Per-tool overrides keyed by workspace tool name")
 });
-var snapshotConfigSchema$3 = z$1.object({
-  name: z$1.string().describe("Name of the workspace"),
-  description: z$1.string().optional().describe("Description of the workspace"),
+var snapshotConfigSchema$3 = z.object({
+  name: z.string().describe("Name of the workspace"),
+  description: z.string().optional().describe("Description of the workspace"),
   filesystem: filesystemConfigSchema.optional().describe("Filesystem configuration"),
   sandbox: sandboxConfigSchema.optional().describe("Sandbox configuration"),
-  mounts: z$1.record(z$1.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
+  mounts: z.record(z.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
   search: searchConfigSchema.optional().describe("Search configuration"),
-  skills: z$1.array(z$1.string()).optional().describe("Array of skill IDs"),
+  skills: z.array(z.string()).optional().describe("Array of skill IDs"),
   tools: workspaceToolsConfigSchema.optional().describe("Workspace tool configuration"),
-  autoSync: z$1.boolean().optional().describe("Whether to automatically sync the workspace"),
-  operationTimeout: z$1.number().optional().describe("Operation timeout in milliseconds")
+  autoSync: z.boolean().optional().describe("Whether to automatically sync the workspace"),
+  operationTimeout: z.number().optional().describe("Operation timeout in milliseconds")
 });
-var createStoredWorkspaceBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the workspace")
+var createStoredWorkspaceBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the workspace")
 }).merge(snapshotConfigSchema$3);
-var updateStoredWorkspaceBodySchema = z$1.object({
+var updateStoredWorkspaceBodySchema = z.object({
   // Note: authorId is intentionally not accepted. Ownership cannot be
   // transferred via PATCH.
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+  metadata: z.record(z.string(), z.unknown()).optional()
 }).partial().merge(snapshotConfigSchema$3.partial());
-var storedWorkspaceSchema = z$1.object({
-  id: z$1.string(),
-  status: z$1.string().describe("Workspace status: draft, published, or archived"),
-  activeVersionId: z$1.string().optional(),
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
-  name: z$1.string().describe("Name of the workspace"),
-  description: z$1.string().optional().describe("Description of the workspace"),
+var storedWorkspaceSchema = z.object({
+  id: z.string(),
+  status: z.string().describe("Workspace status: draft, published, or archived"),
+  activeVersionId: z.string().optional(),
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  name: z.string().describe("Name of the workspace"),
+  description: z.string().optional().describe("Description of the workspace"),
   filesystem: filesystemConfigSchema.optional().describe("Filesystem configuration"),
   sandbox: sandboxConfigSchema.optional().describe("Sandbox configuration"),
-  mounts: z$1.record(z$1.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
+  mounts: z.record(z.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
   search: searchConfigSchema.optional().describe("Search configuration"),
-  skills: z$1.array(z$1.string()).optional().describe("Array of skill IDs"),
+  skills: z.array(z.string()).optional().describe("Array of skill IDs"),
   tools: workspaceToolsConfigSchema.optional().describe("Workspace tool configuration"),
-  autoSync: z$1.boolean().optional().describe("Whether to automatically sync the workspace"),
-  operationTimeout: z$1.number().optional().describe("Operation timeout in milliseconds")
+  autoSync: z.boolean().optional().describe("Whether to automatically sync the workspace"),
+  operationTimeout: z.number().optional().describe("Operation timeout in milliseconds")
 });
 var listedWorkspaceSchema = storedWorkspaceSchema.extend({
-  runtimeRegistered: z$1.boolean().optional().describe("Whether this workspace is registered at runtime")
+  runtimeRegistered: z.boolean().optional().describe("Whether this workspace is registered at runtime")
 });
 var listStoredWorkspacesResponseSchema = paginationInfoSchema$1.extend({
-  workspaces: z$1.array(listedWorkspaceSchema)
+  workspaces: z.array(listedWorkspaceSchema)
 });
 var getStoredWorkspaceResponseSchema = storedWorkspaceSchema;
 var createStoredWorkspaceResponseSchema = storedWorkspaceSchema;
-var updateStoredWorkspaceResponseSchema = z$1.union([
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+var updateStoredWorkspaceResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   storedWorkspaceSchema
 ]);
-var deleteStoredWorkspaceResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredWorkspaceResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
 
 // src/server/schemas/tool-providers.ts
-var labelSchema = z$1.string().min(1, "Connection label is required").max(32, "Connection label must be \u2264 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -");
-var connectionScopeSchema = z$1.enum(["shared", "per-author", "caller-supplied"]);
-var connectionSchema = z$1.object({
-  kind: z$1.enum(["author", "invoker", "platform"]),
-  toolkit: z$1.string().min(1),
-  connectionId: z$1.string(),
+var labelSchema = z.string().min(1, "Connection label is required").max(32, "Connection label must be \u2264 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -");
+var connectionScopeSchema = z.enum(["shared", "per-author", "caller-supplied"]);
+var connectionSchema = z.object({
+  kind: z.enum(["author", "invoker", "platform"]),
+  toolkit: z.string().min(1),
+  connectionId: z.string(),
   label: labelSchema.optional(),
   scope: connectionScopeSchema.optional()
 });
-var toolMetaSchema = z$1.object({
-  toolkit: z$1.string().min(1).optional(),
-  description: z$1.string().optional()
+var toolMetaSchema = z.object({
+  toolkit: z.string().min(1).optional(),
+  description: z.string().optional()
 });
-var toolProviderConfigSchema = z$1.object({
-  tools: z$1.record(z$1.string(), toolMetaSchema),
-  connections: z$1.record(z$1.string(), z$1.array(connectionSchema))
+var toolProviderConfigSchema = z.object({
+  tools: z.record(z.string(), toolMetaSchema),
+  connections: z.record(z.string(), z.array(connectionSchema))
 }).superRefine((value, ctx) => {
   for (const [toolkit, connections] of Object.entries(value.connections)) {
     if (connections.length < 2) continue;
@@ -1477,172 +1065,172 @@ var toolProviderConfigSchema = z$1.object({
     }
   }
 });
-var toolProvidersSchema = z$1.record(z$1.string(), toolProviderConfigSchema);
-var toolProviderIdPathParams = z$1.object({
-  providerId: z$1.string().describe("Unique identifier for the tool provider")
+var toolProvidersSchema = z.record(z.string(), toolProviderConfigSchema);
+var toolProviderIdPathParams = z.object({
+  providerId: z.string().describe("Unique identifier for the tool provider")
 });
 var toolSlugPathParams = toolProviderIdPathParams.extend({
-  toolSlug: z$1.string().describe("Slug identifier for the tool")
+  toolSlug: z.string().describe("Slug identifier for the tool")
 });
 var toolProviderAuthStatusPathParams = toolProviderIdPathParams.extend({
-  authId: z$1.string().describe("Opaque auth handle returned by authorize")
+  authId: z.string().describe("Opaque auth handle returned by authorize")
 });
 var toolProviderConnectionPathParams = toolProviderIdPathParams.extend({
-  connectionId: z$1.string().describe("Adapter-native connection id (e.g. Composio ca_...)")
+  connectionId: z.string().describe("Adapter-native connection id (e.g. Composio ca_...)")
 });
-var listToolProviderToolsQuerySchema = z$1.object({
-  toolkit: z$1.string().optional().describe("Filter tools by toolkit slug"),
-  search: z$1.string().optional().describe("Search tools by name or description"),
-  page: z$1.coerce.number().optional().describe("Page number for pagination (1-indexed)"),
-  perPage: z$1.coerce.number().optional().describe("Number of items per page")
+var listToolProviderToolsQuerySchema = z.object({
+  toolkit: z.string().optional().describe("Filter tools by toolkit slug"),
+  search: z.string().optional().describe("Search tools by name or description"),
+  page: z.coerce.number().optional().describe("Page number for pagination (1-indexed)"),
+  perPage: z.coerce.number().optional().describe("Number of items per page")
 });
-var listConnectionFieldsQuerySchema = z$1.object({
-  toolkit: z$1.string().describe("Toolkit slug whose connection field schema to list")
+var listConnectionFieldsQuerySchema = z.object({
+  toolkit: z.string().describe("Toolkit slug whose connection field schema to list")
 });
-var listConnectionsQuerySchema = z$1.object({
-  toolkit: z$1.string().describe("Toolkit slug whose connections to list"),
-  authorId: z$1.string().optional().describe("Admin-only: restrict listing to a specific author. Silently ignored for non-admin callers."),
+var listConnectionsQuerySchema = z.object({
+  toolkit: z.string().describe("Toolkit slug whose connections to list"),
+  authorId: z.string().optional().describe("Admin-only: restrict listing to a specific author. Silently ignored for non-admin callers."),
   scope: connectionScopeSchema.optional().describe("Filter results by scope. Omit to include shared + per-author pins for the caller."),
-  page: z$1.coerce.number().int().positive().optional().describe("Page number for pagination (1-indexed)"),
-  perPage: z$1.coerce.number().int().positive().max(200).optional().describe("Number of items per page (default 50, max 200)")
+  page: z.coerce.number().int().positive().optional().describe("Page number for pagination (1-indexed)"),
+  perPage: z.coerce.number().int().positive().max(200).optional().describe("Number of items per page (default 50, max 200)")
 });
-var disconnectConnectionQuerySchema = z$1.object({
-  force: z$1.union([z$1.boolean(), z$1.enum(["true", "false"])]).optional().describe("When true, revoke at the provider and drop the row even if pinned by agents"),
-  toolkit: z$1.string().optional().describe("Toolkit slug for the connection (used when the row was upserted with one)")
+var disconnectConnectionQuerySchema = z.object({
+  force: z.union([z.boolean(), z.enum(["true", "false"])]).optional().describe("When true, revoke at the provider and drop the row even if pinned by agents"),
+  toolkit: z.string().optional().describe("Toolkit slug for the connection (used when the row was upserted with one)")
 });
-var connectionUsageQuerySchema = z$1.object({
-  toolkit: z$1.string().optional().describe("Optional toolkit slug to scope the usage scan")
+var connectionUsageQuerySchema = z.object({
+  toolkit: z.string().optional().describe("Optional toolkit slug to scope the usage scan")
 });
-var authorizeToolProviderBodySchema = z$1.object({
-  toolkit: z$1.string().describe("Toolkit slug being authorized"),
-  connectionId: z$1.string().optional().describe("Existing connection bucket id when re-authorizing; omit for a brand-new connection"),
-  toolName: z$1.string().optional().describe("Optional tool slug for tool-scoped authorization"),
-  config: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Provider-specific user-supplied connection fields (e.g. subdomain)"),
-  label: z$1.string().min(1, "Connection label is required").max(32, "Connection label must be \u2264 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -").nullish().describe(
+var authorizeToolProviderBodySchema = z.object({
+  toolkit: z.string().describe("Toolkit slug being authorized"),
+  connectionId: z.string().optional().describe("Existing connection bucket id when re-authorizing; omit for a brand-new connection"),
+  toolName: z.string().optional().describe("Optional tool slug for tool-scoped authorization"),
+  config: z.record(z.string(), z.unknown()).optional().describe("Provider-specific user-supplied connection fields (e.g. subdomain)"),
+  label: z.string().min(1, "Connection label is required").max(32, "Connection label must be \u2264 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -").nullish().describe(
     "Optional human label to persist on the resulting tool_provider_connections row. Must match the stored connection label rules (\u2264 32 chars, [A-Za-z0-9 _-]+)."
   ),
   scope: connectionScopeSchema.optional().describe(
     'Identity bucket. "shared" pins under SHARED_BUCKET_ID. "caller-supplied" pins under the request-context resourceId (returns 400 when missing). Defaults to "per-author".'
   )
 });
-var connectionStatusToolProviderBodySchema = z$1.object({
-  items: z$1.array(
-    z$1.object({
-      connectionId: z$1.string(),
-      toolkit: z$1.string()
+var connectionStatusToolProviderBodySchema = z.object({
+  items: z.array(
+    z.object({
+      connectionId: z.string(),
+      toolkit: z.string()
     })
   ).describe("Connection tuples to batch-check")
 });
-var paginationSchema = z$1.object({
-  total: z$1.number().optional(),
-  page: z$1.number().optional(),
-  perPage: z$1.number().optional(),
-  hasMore: z$1.boolean()
+var paginationSchema = z.object({
+  total: z.number().optional(),
+  page: z.number().optional(),
+  perPage: z.number().optional(),
+  hasMore: z.boolean()
 }).optional();
-var capabilitiesSchema = z$1.object({
-  multipleConnectionsPerToolkit: z$1.boolean(),
-  batchConnectionStatus: z$1.boolean(),
-  reauthorizeReusesConnectionId: z$1.boolean(),
-  supportsRevoke: z$1.boolean().optional()
+var capabilitiesSchema = z.object({
+  multipleConnectionsPerToolkit: z.boolean(),
+  batchConnectionStatus: z.boolean(),
+  reauthorizeReusesConnectionId: z.boolean(),
+  supportsRevoke: z.boolean().optional()
 });
-var listToolProvidersResponseSchema = z$1.object({
-  providers: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string().optional(),
-      displayName: z$1.string().optional(),
+var listToolProvidersResponseSchema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string().optional(),
+      displayName: z.string().optional(),
       capabilities: capabilitiesSchema.optional()
     })
   )
 });
-var listToolProviderToolkitsResponseSchema = z$1.object({
-  data: z$1.array(
-    z$1.object({
-      slug: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string().optional(),
-      icon: z$1.string().optional()
+var listToolProviderToolkitsResponseSchema = z.object({
+  data: z.array(
+    z.object({
+      slug: z.string(),
+      name: z.string(),
+      description: z.string().optional(),
+      icon: z.string().optional()
     })
   ),
   pagination: paginationSchema
 });
-var listToolProviderToolsResponseSchema = z$1.object({
-  data: z$1.array(
-    z$1.object({
-      slug: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string().optional(),
-      toolkit: z$1.string().optional()
+var listToolProviderToolsResponseSchema = z.object({
+  data: z.array(
+    z.object({
+      slug: z.string(),
+      name: z.string(),
+      description: z.string().optional(),
+      toolkit: z.string().optional()
     })
   ),
   pagination: paginationSchema
 });
-var getToolProviderToolSchemaResponseSchema = z$1.record(z$1.string(), z$1.unknown());
-var authorizeToolProviderResponseSchema = z$1.object({
-  url: z$1.string(),
-  authId: z$1.string()
+var getToolProviderToolSchemaResponseSchema = z.record(z.string(), z.unknown());
+var authorizeToolProviderResponseSchema = z.object({
+  url: z.string(),
+  authId: z.string()
 });
-var authStatusToolProviderResponseSchema = z$1.object({
-  status: z$1.enum(["pending", "completed", "failed"])
+var authStatusToolProviderResponseSchema = z.object({
+  status: z.enum(["pending", "completed", "failed"])
 });
-var connectionStatusToolProviderResponseSchema = z$1.object({
-  items: z$1.record(z$1.string(), z$1.object({ connected: z$1.boolean() }))
+var connectionStatusToolProviderResponseSchema = z.object({
+  items: z.record(z.string(), z.object({ connected: z.boolean() }))
 });
-var listConnectionsResponseSchema = z$1.object({
-  items: z$1.array(
-    z$1.object({
-      connectionId: z$1.string(),
-      status: z$1.enum(["active", "pending", "failed", "inactive"]),
-      createdAt: z$1.string().optional(),
-      label: z$1.string().nullish().describe("Persisted display label from tool_provider_connections, if any"),
-      authorId: z$1.string().optional().describe("Owner of the connection (when known)"),
+var listConnectionsResponseSchema = z.object({
+  items: z.array(
+    z.object({
+      connectionId: z.string(),
+      status: z.enum(["active", "pending", "failed", "inactive"]),
+      createdAt: z.string().optional(),
+      label: z.string().nullish().describe("Persisted display label from tool_provider_connections, if any"),
+      authorId: z.string().optional().describe("Owner of the connection (when known)"),
       scope: connectionScopeSchema.optional().describe("Persisted scope from tool_provider_connections. Missing for rows that predate the scope field.")
     })
   ),
   pagination: paginationSchema
 });
-var listConnectionFieldsResponseSchema = z$1.object({
-  fields: z$1.array(
-    z$1.object({
-      name: z$1.string(),
-      displayName: z$1.string().optional(),
-      description: z$1.string().optional(),
-      type: z$1.enum(["string", "number", "boolean"]),
-      required: z$1.boolean(),
-      default: z$1.unknown().optional()
+var listConnectionFieldsResponseSchema = z.object({
+  fields: z.array(
+    z.object({
+      name: z.string(),
+      displayName: z.string().optional(),
+      description: z.string().optional(),
+      type: z.enum(["string", "number", "boolean"]),
+      required: z.boolean(),
+      default: z.unknown().optional()
     })
   )
 });
-var disconnectConnectionResponseSchema = z$1.object({
-  ok: z$1.literal(true),
-  revoked: z$1.boolean().describe("Whether the provider-side connection was revoked")
+var disconnectConnectionResponseSchema = z.object({
+  ok: z.literal(true),
+  revoked: z.boolean().describe("Whether the provider-side connection was revoked")
 });
-var updateConnectionBodySchema = z$1.object({
-  label: z$1.union([labelSchema, z$1.literal(""), z$1.null()]).describe("New display label for the connection. Pass null (or empty string) to clear the existing label.")
+var updateConnectionBodySchema = z.object({
+  label: z.union([labelSchema, z.literal(""), z.null()]).describe("New display label for the connection. Pass null (or empty string) to clear the existing label.")
 });
-var updateConnectionResponseSchema = z$1.object({
-  ok: z$1.literal(true),
-  label: z$1.string().nullable().describe("The persisted label after the update (null when cleared)")
+var updateConnectionResponseSchema = z.object({
+  ok: z.literal(true),
+  label: z.string().nullable().describe("The persisted label after the update (null when cleared)")
 });
-var connectionUsageResponseSchema = z$1.object({
-  agents: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string()
+var connectionUsageResponseSchema = z.object({
+  agents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string()
     })
   )
 });
-var toolProviderHealthResponseSchema = z$1.object({
-  ok: z$1.boolean(),
-  message: z$1.string().optional(),
-  details: z$1.record(z$1.string(), z$1.unknown()).optional()
+var toolProviderHealthResponseSchema = z.object({
+  ok: z.boolean(),
+  message: z.string().optional(),
+  details: z.record(z.string(), z.unknown()).optional()
 });
 
 // src/server/schemas/rule-group.ts
-var ruleSchema = z$1.object({
-  field: z$1.string(),
-  operator: z$1.enum([
+var ruleSchema = z.object({
+  field: z.string(),
+  operator: z.enum([
     "equals",
     "not_equals",
     "contains",
@@ -1656,80 +1244,80 @@ var ruleSchema = z$1.object({
     "exists",
     "not_exists"
   ]),
-  value: z$1.unknown().optional()
+  value: z.unknown().optional()
 });
-var ruleGroupDepth2 = z$1.object({
-  operator: z$1.enum(["AND", "OR"]),
-  conditions: z$1.array(ruleSchema)
+var ruleGroupDepth2 = z.object({
+  operator: z.enum(["AND", "OR"]),
+  conditions: z.array(ruleSchema)
 });
-var ruleGroupDepth1 = z$1.object({
-  operator: z$1.enum(["AND", "OR"]),
-  conditions: z$1.array(z$1.union([ruleSchema, ruleGroupDepth2]))
+var ruleGroupDepth1 = z.object({
+  operator: z.enum(["AND", "OR"]),
+  conditions: z.array(z.union([ruleSchema, ruleGroupDepth2]))
 });
-var ruleGroupSchema = z$1.object({
-  operator: z$1.enum(["AND", "OR"]),
-  conditions: z$1.array(z$1.union([ruleSchema, ruleGroupDepth1]))
+var ruleGroupSchema = z.object({
+  operator: z.enum(["AND", "OR"]),
+  conditions: z.array(z.union([ruleSchema, ruleGroupDepth1]))
 });
 
-var semanticRecallSchema = z$1.object({
-  topK: z$1.number().describe("Number of semantically similar messages to retrieve"),
-  messageRange: z$1.union([
-    z$1.number(),
-    z$1.object({
-      before: z$1.number(),
-      after: z$1.number()
+var semanticRecallSchema = z.object({
+  topK: z.number().describe("Number of semantically similar messages to retrieve"),
+  messageRange: z.union([
+    z.number(),
+    z.object({
+      before: z.number(),
+      after: z.number()
     })
   ]).describe("Amount of surrounding context to include with each retrieved message"),
-  scope: z$1.enum(["thread", "resource"]).optional().describe("Scope for semantic search queries"),
-  threshold: z$1.number().min(0).max(1).optional().describe("Minimum similarity score threshold"),
-  indexName: z$1.string().optional().describe("Index name for the vector store")
+  scope: z.enum(["thread", "resource"]).optional().describe("Scope for semantic search queries"),
+  threshold: z.number().min(0).max(1).optional().describe("Minimum similarity score threshold"),
+  indexName: z.string().optional().describe("Index name for the vector store")
 });
-var titleGenerationSchema = z$1.union([
-  z$1.boolean(),
-  z$1.object({
-    model: z$1.string().describe("Model ID in format provider/model-name (ModelRouterModelId)"),
-    instructions: z$1.string().optional().describe("Custom instructions for title generation")
+var titleGenerationSchema = z.union([
+  z.boolean(),
+  z.object({
+    model: z.string().describe("Model ID in format provider/model-name (ModelRouterModelId)"),
+    instructions: z.string().optional().describe("Custom instructions for title generation")
   })
 ]);
-var serializedObservationConfigSchema = z$1.object({
-  model: z$1.string().optional().describe("Observer model ID"),
-  messageTokens: z$1.number().optional().describe("Token threshold that triggers observation"),
-  modelSettings: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Model settings (temperature, etc.)"),
-  providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.unknown()).optional()).optional().describe("Provider-specific options"),
-  maxTokensPerBatch: z$1.number().optional().describe("Maximum tokens per batch"),
-  bufferTokens: z$1.union([z$1.number(), z$1.literal(false)]).optional().describe("Async buffering interval or false"),
-  bufferActivation: z$1.number().optional().describe("Ratio of buffered observations to activate"),
-  blockAfter: z$1.number().optional().describe("Token threshold for synchronous blocking")
+var serializedObservationConfigSchema = z.object({
+  model: z.string().optional().describe("Observer model ID"),
+  messageTokens: z.number().optional().describe("Token threshold that triggers observation"),
+  modelSettings: z.record(z.string(), z.unknown()).optional().describe("Model settings (temperature, etc.)"),
+  providerOptions: z.record(z.string(), z.record(z.string(), z.unknown()).optional()).optional().describe("Provider-specific options"),
+  maxTokensPerBatch: z.number().optional().describe("Maximum tokens per batch"),
+  bufferTokens: z.union([z.number(), z.literal(false)]).optional().describe("Async buffering interval or false"),
+  bufferActivation: z.number().optional().describe("Ratio of buffered observations to activate"),
+  blockAfter: z.number().optional().describe("Token threshold for synchronous blocking")
 });
-var serializedReflectionConfigSchema = z$1.object({
-  model: z$1.string().optional().describe("Reflector model ID"),
-  observationTokens: z$1.number().optional().describe("Token threshold that triggers reflection"),
-  modelSettings: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Model settings (temperature, etc.)"),
-  providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.unknown()).optional()).optional().describe("Provider-specific options"),
-  blockAfter: z$1.number().optional().describe("Token threshold for synchronous blocking"),
-  bufferActivation: z$1.number().optional().describe("Ratio for async reflection buffering")
+var serializedReflectionConfigSchema = z.object({
+  model: z.string().optional().describe("Reflector model ID"),
+  observationTokens: z.number().optional().describe("Token threshold that triggers reflection"),
+  modelSettings: z.record(z.string(), z.unknown()).optional().describe("Model settings (temperature, etc.)"),
+  providerOptions: z.record(z.string(), z.record(z.string(), z.unknown()).optional()).optional().describe("Provider-specific options"),
+  blockAfter: z.number().optional().describe("Token threshold for synchronous blocking"),
+  bufferActivation: z.number().optional().describe("Ratio for async reflection buffering")
 });
-var serializedObservationalMemoryConfigObjectSchema = z$1.object({
-  model: z$1.string().optional().describe("Model ID for both Observer and Reflector"),
-  scope: z$1.enum(["resource", "thread"]).optional().describe("Memory scope"),
-  shareTokenBudget: z$1.boolean().optional().describe("Share token budget between messages and observations"),
+var serializedObservationalMemoryConfigObjectSchema = z.object({
+  model: z.string().optional().describe("Model ID for both Observer and Reflector"),
+  scope: z.enum(["resource", "thread"]).optional().describe("Memory scope"),
+  shareTokenBudget: z.boolean().optional().describe("Share token budget between messages and observations"),
   observation: serializedObservationConfigSchema.optional().describe("Observation step configuration"),
   reflection: serializedReflectionConfigSchema.optional().describe("Reflection step configuration")
 });
-var serializedObservationalMemoryConfigSchema = z$1.union([
-  z$1.boolean(),
+var serializedObservationalMemoryConfigSchema = z.union([
+  z.boolean(),
   serializedObservationalMemoryConfigObjectSchema
 ]);
-var serializedMemoryConfigSchema = z$1.object({
-  vector: z$1.union([z$1.string(), z$1.literal(false)]).optional().describe("Vector database identifier or false to disable"),
-  options: z$1.object({
-    readOnly: z$1.boolean().optional(),
-    lastMessages: z$1.union([z$1.number(), z$1.literal(false)]).optional(),
-    semanticRecall: z$1.union([z$1.boolean(), semanticRecallSchema]).optional(),
+var serializedMemoryConfigSchema = z.object({
+  vector: z.union([z.string(), z.literal(false)]).optional().describe("Vector database identifier or false to disable"),
+  options: z.object({
+    readOnly: z.boolean().optional(),
+    lastMessages: z.union([z.number(), z.literal(false)]).optional(),
+    semanticRecall: z.union([z.boolean(), semanticRecallSchema]).optional(),
     generateTitle: titleGenerationSchema.optional()
   }).optional().describe("Memory behavior configuration, excluding workingMemory and threads"),
-  embedder: z$1.string().optional().describe('Embedding model ID in the format "provider/model" (e.g., "openai/text-embedding-3-small")'),
-  embedderOptions: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Options to pass to the embedder, omitting telemetry"),
+  embedder: z.string().optional().describe('Embedding model ID in the format "provider/model" (e.g., "openai/text-embedding-3-small")'),
+  embedderOptions: z.record(z.string(), z.unknown()).optional().describe("Options to pass to the embedder, omitting telemetry"),
   observationalMemory: serializedObservationalMemoryConfigSchema.optional().describe("Serialized observational memory configuration")
 }).refine(
   (data) => {
@@ -1747,328 +1335,328 @@ var serializedMemoryConfigSchema = z$1.object({
     path: ["options", "semanticRecall"]
   }
 );
-var storedAgentIdPathParams = z$1.object({
-  storedAgentId: z$1.string().describe("Unique identifier for the stored agent")
+var storedAgentIdPathParams = z.object({
+  storedAgentId: z.string().describe("Unique identifier for the stored agent")
 });
-var storageOrderBySchema$4 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$4 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredAgentsQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$4.optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter agents by status (defaults to published)"),
-  authorId: z$1.string().optional().describe("Filter agents by author identifier"),
-  visibility: z$1.enum(["public"]).optional().describe("Filter to only public agents"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter agents by metadata key-value pairs"),
-  favoritedOnly: z$1.stringbool().optional().describe("When true, return only agents favorited by the caller (requires the `favorites` EE feature)"),
-  pinFavoritedFor: z$1.string().optional().describe(
+  status: z.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter agents by status (defaults to published)"),
+  authorId: z.string().optional().describe("Filter agents by author identifier"),
+  visibility: z.enum(["public"]).optional().describe("Filter to only public agents"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter agents by metadata key-value pairs"),
+  favoritedOnly: z.stringbool().optional().describe("When true, return only agents favorited by the caller (requires the `favorites` EE feature)"),
+  pinFavoritedFor: z.string().optional().describe(
     "When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller"
   )
 });
-var scorerConfigSchema = z$1.object({
-  description: z$1.string().optional(),
-  sampling: z$1.union([
-    z$1.object({ type: z$1.literal("none") }),
-    z$1.object({ type: z$1.literal("ratio"), rate: z$1.number().min(0).max(1) })
+var scorerConfigSchema = z.object({
+  description: z.string().optional(),
+  sampling: z.union([
+    z.object({ type: z.literal("none") }),
+    z.object({ type: z.literal("ratio"), rate: z.number().min(0).max(1) })
   ]).optional(),
   rules: ruleGroupSchema.optional()
 });
-var agentInstructionBlockSchema = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("text"), content: z$1.string() }),
-  z$1.object({ type: z$1.literal("prompt_block_ref"), id: z$1.string() }),
-  z$1.object({ type: z$1.literal("prompt_block"), content: z$1.string(), rules: ruleGroupSchema.optional() })
+var agentInstructionBlockSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("text"), content: z.string() }),
+  z.object({ type: z.literal("prompt_block_ref"), id: z.string() }),
+  z.object({ type: z.literal("prompt_block"), content: z.string(), rules: ruleGroupSchema.optional() })
 ]);
 function conditionalFieldSchema(valueSchema) {
-  const variantSchema = z$1.object({
+  const variantSchema = z.object({
     value: valueSchema,
     rules: ruleGroupSchema.optional()
   });
-  return z$1.union([valueSchema, z$1.array(variantSchema)]);
+  return z.union([valueSchema, z.array(variantSchema)]);
 }
-var instructionsSchema = z$1.union([z$1.string(), z$1.array(agentInstructionBlockSchema)]).describe("System instructions for the agent (string or array of instruction blocks)");
-var modelConfigSchema = z$1.object({
-  provider: z$1.string().describe("Model provider (e.g., openai, anthropic)"),
-  name: z$1.string().describe("Model name (e.g., gpt-4o, claude-3-opus)")
+var instructionsSchema = z.union([z.string(), z.array(agentInstructionBlockSchema)]).describe("System instructions for the agent (string or array of instruction blocks)");
+var modelConfigSchema = z.object({
+  provider: z.string().describe("Model provider (e.g., openai, anthropic)"),
+  name: z.string().describe("Model name (e.g., gpt-4o, claude-3-opus)")
 }).passthrough();
-var toolConfigSchema = z$1.object({ description: z$1.string().optional(), rules: ruleGroupSchema.optional() });
-var toolsConfigSchema = z$1.record(z$1.string(), toolConfigSchema);
-var mcpClientToolsConfigSchema$1 = z$1.object({
-  tools: z$1.record(z$1.string(), toolConfigSchema).optional()
+var toolConfigSchema = z.object({ description: z.string().optional(), rules: ruleGroupSchema.optional() });
+var toolsConfigSchema = z.record(z.string(), toolConfigSchema);
+var mcpClientToolsConfigSchema$1 = z.object({
+  tools: z.record(z.string(), toolConfigSchema).optional()
 });
-var skillConfigSchema = z$1.object({
-  description: z$1.string().optional(),
-  instructions: z$1.string().optional(),
-  pin: z$1.string().optional(),
-  strategy: z$1.enum(["latest", "live"]).optional()
+var skillConfigSchema = z.object({
+  description: z.string().optional(),
+  instructions: z.string().optional(),
+  pin: z.string().optional(),
+  strategy: z.enum(["latest", "live"]).optional()
 });
-var skillsConfigSchema = z$1.record(z$1.string(), skillConfigSchema);
-var workspaceRefSchema = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("id"), workspaceId: z$1.string() }),
-  z$1.object({ type: z$1.literal("inline"), config: snapshotConfigSchema$3 }),
-  z$1.object({
-    type: z$1.literal("provider"),
-    provider: z$1.string().describe("Workspace provider identifier"),
-    config: z$1.record(z$1.string(), z$1.unknown()).describe("Provider-specific configuration")
+var skillsConfigSchema = z.record(z.string(), skillConfigSchema);
+var workspaceRefSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("id"), workspaceId: z.string() }),
+  z.object({ type: z.literal("inline"), config: snapshotConfigSchema$3 }),
+  z.object({
+    type: z.literal("provider"),
+    provider: z.string().describe("Workspace provider identifier"),
+    config: z.record(z.string(), z.unknown()).describe("Provider-specific configuration")
   })
 ]);
-var screencastOptionsSchema = z$1.object({
-  format: z$1.enum(["jpeg", "png"]).optional().describe("Image format (default: jpeg)"),
-  quality: z$1.number().min(0).max(100).optional().describe("JPEG quality 0-100 (default: 80)"),
-  maxWidth: z$1.number().optional().describe("Max width in pixels (default: 1280)"),
-  maxHeight: z$1.number().optional().describe("Max height in pixels (default: 720)"),
-  everyNthFrame: z$1.number().optional().describe("Capture every Nth frame (default: 1)")
+var screencastOptionsSchema = z.object({
+  format: z.enum(["jpeg", "png"]).optional().describe("Image format (default: jpeg)"),
+  quality: z.number().min(0).max(100).optional().describe("JPEG quality 0-100 (default: 80)"),
+  maxWidth: z.number().optional().describe("Max width in pixels (default: 1280)"),
+  maxHeight: z.number().optional().describe("Max height in pixels (default: 720)"),
+  everyNthFrame: z.number().optional().describe("Capture every Nth frame (default: 1)")
 });
-var browserConfigSchema = z$1.object({
-  provider: z$1.string().describe("Browser provider type (e.g., stagehand, playwright)"),
-  headless: z$1.boolean().optional().describe("Run browser in headless mode (default: true)"),
-  viewport: z$1.object({
-    width: z$1.number().describe("Viewport width in pixels"),
-    height: z$1.number().describe("Viewport height in pixels")
+var browserConfigSchema = z.object({
+  provider: z.string().describe("Browser provider type (e.g., stagehand, playwright)"),
+  headless: z.boolean().optional().describe("Run browser in headless mode (default: true)"),
+  viewport: z.object({
+    width: z.number().describe("Viewport width in pixels"),
+    height: z.number().describe("Viewport height in pixels")
   }).optional().describe("Browser viewport dimensions"),
-  timeout: z$1.number().optional().describe("Default timeout in milliseconds (default: 10000)"),
+  timeout: z.number().optional().describe("Default timeout in milliseconds (default: 10000)"),
   screencast: screencastOptionsSchema.optional().describe("Screencast options for streaming browser frames")
 });
-var browserRefSchema = z$1.object({
-  type: z$1.literal("inline"),
+var browserRefSchema = z.object({
+  type: z.literal("inline"),
   config: browserConfigSchema
 });
-var processorPhaseSchema$1 = z$1.enum([
+var processorPhaseSchema$1 = z.enum([
   "processInput",
   "processInputStep",
   "processOutputStream",
   "processOutputResult",
   "processOutputStep"
 ]);
-var processorGraphStepSchema = z$1.object({
-  id: z$1.string().describe("Unique ID for this step within the graph"),
-  providerId: z$1.string().describe("ProcessorProvider ID that creates this processor"),
-  config: z$1.record(z$1.string(), z$1.unknown()).describe("Configuration matching the provider configSchema"),
-  enabledPhases: z$1.array(processorPhaseSchema$1).min(1).describe("Which processor phases to enable")
+var processorGraphStepSchema = z.object({
+  id: z.string().describe("Unique ID for this step within the graph"),
+  providerId: z.string().describe("ProcessorProvider ID that creates this processor"),
+  config: z.record(z.string(), z.unknown()).describe("Configuration matching the provider configSchema"),
+  enabledPhases: z.array(processorPhaseSchema$1).min(1).describe("Which processor phases to enable")
 });
-var processorGraphEntryDepth3 = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("step"), step: processorGraphStepSchema })
+var processorGraphEntryDepth3 = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("step"), step: processorGraphStepSchema })
 ]);
-var processorGraphEntryDepth2 = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("step"), step: processorGraphStepSchema }),
-  z$1.object({ type: z$1.literal("parallel"), branches: z$1.array(z$1.array(processorGraphEntryDepth3)) }),
-  z$1.object({
-    type: z$1.literal("conditional"),
-    conditions: z$1.array(
-      z$1.object({
-        steps: z$1.array(processorGraphEntryDepth3),
+var processorGraphEntryDepth2 = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("step"), step: processorGraphStepSchema }),
+  z.object({ type: z.literal("parallel"), branches: z.array(z.array(processorGraphEntryDepth3)) }),
+  z.object({
+    type: z.literal("conditional"),
+    conditions: z.array(
+      z.object({
+        steps: z.array(processorGraphEntryDepth3),
         rules: ruleGroupSchema.optional()
       })
     )
   })
 ]);
-var processorGraphEntrySchema = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("step"), step: processorGraphStepSchema }),
-  z$1.object({ type: z$1.literal("parallel"), branches: z$1.array(z$1.array(processorGraphEntryDepth2)) }),
-  z$1.object({
-    type: z$1.literal("conditional"),
-    conditions: z$1.array(
-      z$1.object({
-        steps: z$1.array(processorGraphEntryDepth2),
+var processorGraphEntrySchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("step"), step: processorGraphStepSchema }),
+  z.object({ type: z.literal("parallel"), branches: z.array(z.array(processorGraphEntryDepth2)) }),
+  z.object({
+    type: z.literal("conditional"),
+    conditions: z.array(
+      z.object({
+        steps: z.array(processorGraphEntryDepth2),
         rules: ruleGroupSchema.optional()
       })
     )
   })
 ]);
-var storedProcessorGraphSchema = z$1.object({
-  steps: z$1.array(processorGraphEntrySchema).describe("Ordered list of processor graph entries")
+var storedProcessorGraphSchema = z.object({
+  steps: z.array(processorGraphEntrySchema).describe("Ordered list of processor graph entries")
 });
-var snapshotConfigSchema2 = z$1.object({
-  name: z$1.string().describe("Name of the agent"),
-  description: z$1.string().optional().describe("Description of the agent"),
+var snapshotConfigSchema2 = z.object({
+  name: z.string().describe("Name of the agent"),
+  description: z.string().optional().describe("Description of the agent"),
   instructions: instructionsSchema,
   model: conditionalFieldSchema(modelConfigSchema).describe(
     "Model configuration \u2014 static value or array of conditional variants"
   ),
   tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config \u2014 static or conditional"),
   defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls \u2014 static or conditional"),
-  workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
-  agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
-  integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
+  workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
+  agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
+  integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
   toolProviders: conditionalFieldSchema(toolProvidersSchema).optional().describe(
     "Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field."
   ),
-  mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
+  mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
   inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph \u2014 static or conditional"),
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph \u2014 static or conditional"),
   memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration \u2014 static or conditional"),
-  scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
+  scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
   skills: conditionalFieldSchema(skillsConfigSchema).optional().describe("Skill IDs mapped to per-skill config \u2014 static or conditional"),
   workspace: conditionalFieldSchema(workspaceRefSchema).optional().describe("Workspace reference (stored ID or inline config) \u2014 static or conditional"),
-  browser: z$1.union([conditionalFieldSchema(browserRefSchema), z$1.boolean(), z$1.null()]).optional().describe("Browser configuration \u2014 object config, true (apply default), false/null (disable)"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables for conditional rule evaluation")
+  browser: z.union([conditionalFieldSchema(browserRefSchema), z.boolean(), z.null()]).optional().describe("Browser configuration \u2014 object config, true (apply default), false/null (disable)"),
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables for conditional rule evaluation")
 });
-var agentMetadataSchema = z$1.object({
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the agent"),
-  visibility: z$1.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
+var agentMetadataSchema = z.object({
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the agent"),
+  visibility: z.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
 });
 var snapshotConfigCreateSchema = snapshotConfigSchema2.extend({
   model: conditionalFieldSchema(modelConfigSchema).optional().describe(
     "Model configuration \u2014 static value or array of conditional variants. When omitted, the builder default model is applied server-side."
   )
 });
-var createStoredAgentBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier for the agent. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the agent"),
-  visibility: z$1.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
+var createStoredAgentBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier for the agent. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the agent"),
+  visibility: z.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
 }).merge(snapshotConfigCreateSchema);
 var snapshotConfigUpdateSchema = snapshotConfigSchema2.extend({
-  memory: z$1.union([conditionalFieldSchema(serializedMemoryConfigSchema), z$1.null()]).optional().describe("Memory configuration \u2014 static, conditional, or null to disable memory")
+  memory: z.union([conditionalFieldSchema(serializedMemoryConfigSchema), z.null()]).optional().describe("Memory configuration \u2014 static, conditional, or null to disable memory")
 });
 var updateStoredAgentBodySchema = agentMetadataSchema.partial().merge(snapshotConfigUpdateSchema.partial()).extend({
-  changeMessage: z$1.string().trim().max(500).optional().describe("Optional message describing the changes for the auto-created version")
+  changeMessage: z.string().trim().max(500).optional().describe("Optional message describing the changes for the auto-created version")
 });
 var exportStoredAgentBodySchema = snapshotConfigUpdateSchema.partial();
 var openStoredAgentChangeRequestBodySchema = exportStoredAgentBodySchema.extend({
-  changeMessage: z$1.string().trim().max(500).optional(),
-  userName: z$1.string().trim().min(1).max(120).optional(),
-  inspectOnly: z$1.boolean().optional()
+  changeMessage: z.string().trim().max(500).optional(),
+  userName: z.string().trim().min(1).max(120).optional(),
+  inspectOnly: z.boolean().optional()
 });
-var resolvedAuthorSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string().optional(),
-  email: z$1.string().optional(),
-  avatarUrl: z$1.string().optional()
+var resolvedAuthorSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  email: z.string().optional(),
+  avatarUrl: z.string().optional()
 });
-var storedAgentSchema = z$1.object({
+var storedAgentSchema = z.object({
   // Thin agent record fields
-  id: z$1.string(),
-  status: z$1.string().describe("Agent status: draft or published"),
-  activeVersionId: z$1.string().optional(),
-  authorId: z$1.string().optional(),
+  id: z.string(),
+  status: z.string().describe("Agent status: draft or published"),
+  activeVersionId: z.string().optional(),
+  authorId: z.string().optional(),
   author: resolvedAuthorSchema.optional().describe("Resolved author identity (when an auth provider is configured)"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  visibility: z$1.enum(["private", "public"]).optional(),
-  favoriteCount: z$1.number().int().nonnegative().optional().describe("Number of users who have favorited this agent"),
-  isFavorited: z$1.boolean().optional().describe("Whether the requesting user has favorited this agent"),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  visibility: z.enum(["private", "public"]).optional(),
+  favoriteCount: z.number().int().nonnegative().optional().describe("Number of users who have favorited this agent"),
+  isFavorited: z.boolean().optional().describe("Whether the requesting user has favorited this agent"),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
   // Version snapshot config fields (resolved from active version)
-  name: z$1.string().describe("Name of the agent"),
-  description: z$1.string().optional().describe("Description of the agent"),
+  name: z.string().describe("Name of the agent"),
+  description: z.string().optional().describe("Description of the agent"),
   instructions: instructionsSchema,
   model: conditionalFieldSchema(modelConfigSchema).describe(
     "Model configuration \u2014 static value or array of conditional variants"
   ),
   tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config \u2014 static or conditional"),
   defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls \u2014 static or conditional"),
-  workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
-  agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
-  integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
+  workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
+  agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
+  integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
   toolProviders: conditionalFieldSchema(toolProvidersSchema).optional().describe(
     "Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field."
   ),
-  mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
+  mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
   inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph \u2014 static or conditional"),
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph \u2014 static or conditional"),
   memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration \u2014 static or conditional"),
-  scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
+  scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
   skills: conditionalFieldSchema(skillsConfigSchema).optional().describe("Skill IDs mapped to per-skill config \u2014 static or conditional"),
   workspace: conditionalFieldSchema(workspaceRefSchema).optional().describe("Workspace reference (stored ID or inline config) \u2014 static or conditional"),
-  browser: z$1.union([conditionalFieldSchema(browserRefSchema), z$1.boolean(), z$1.null()]).optional().describe("Browser configuration \u2014 object config, true (apply default), false/null (disable)"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables")
+  browser: z.union([conditionalFieldSchema(browserRefSchema), z.boolean(), z.null()]).optional().describe("Browser configuration \u2014 object config, true (apply default), false/null (disable)"),
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables")
 });
 var listStoredAgentsResponseSchema = paginationInfoSchema$1.extend({
-  agents: z$1.array(storedAgentSchema)
+  agents: z.array(storedAgentSchema)
 });
 var getStoredAgentResponseSchema = storedAgentSchema;
 var createStoredAgentResponseSchema = storedAgentSchema;
-var updateStoredAgentResponseSchema = z$1.union([
+var updateStoredAgentResponseSchema = z.union([
   // Thin agent record (no version config)
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    visibility: z$1.enum(["private", "public"]).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    visibility: z.enum(["private", "public"]).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   // Resolved agent (thin record + version config)
   storedAgentSchema
 ]);
-var deleteStoredAgentResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredAgentResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
-var getStoredAgentDependentsResponseSchema = z$1.object({
-  dependents: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string()
+var getStoredAgentDependentsResponseSchema = z.object({
+  dependents: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string()
     })
   ),
-  hiddenCount: z$1.number().int().nonnegative()
+  hiddenCount: z.number().int().nonnegative()
 });
-var exportStoredAgentResponseSchema = z$1.object({
-  agentId: z$1.string(),
-  fileName: z$1.string(),
-  content: z$1.string(),
-  config: z$1.record(z$1.string(), z$1.unknown())
+var exportStoredAgentResponseSchema = z.object({
+  agentId: z.string(),
+  fileName: z.string(),
+  content: z.string(),
+  config: z.record(z.string(), z.unknown())
 });
-var openStoredAgentChangeRequestResponseSchema = z$1.object({
-  id: z$1.union([z$1.string(), z$1.number()]).optional(),
-  url: z$1.string(),
-  ref: z$1.string().optional()
+var openStoredAgentChangeRequestResponseSchema = z.object({
+  id: z.union([z.string(), z.number()]).optional(),
+  url: z.string(),
+  ref: z.string().optional()
 });
-var previewInstructionsBodySchema = z$1.object({
-  blocks: z$1.array(agentInstructionBlockSchema).describe("Array of instruction blocks to resolve"),
-  context: z$1.record(z$1.string(), z$1.unknown()).optional().default({}).describe("Request context for variable interpolation and rule evaluation")
+var previewInstructionsBodySchema = z.object({
+  blocks: z.array(agentInstructionBlockSchema).describe("Array of instruction blocks to resolve"),
+  context: z.record(z.string(), z.unknown()).optional().default({}).describe("Request context for variable interpolation and rule evaluation")
 });
-var previewInstructionsResponseSchema = z$1.object({
-  result: z$1.string().describe("The resolved instructions string")
+var previewInstructionsResponseSchema = z.object({
+  result: z.string().describe("The resolved instructions string")
 });
 
 // src/server/schemas/workspace.ts
-z$1.object({
-  path: z$1.string().describe("File or directory path (URL encoded)")
+z.object({
+  path: z.string().describe("File or directory path (URL encoded)")
 });
-var workspaceIdPathParams = z$1.object({
-  workspaceId: z$1.string().describe("Workspace ID")
+var workspaceIdPathParams = z.object({
+  workspaceId: z.string().describe("Workspace ID")
 });
-var fsReadQuerySchema = z$1.object({
-  path: z$1.string().describe("Path to the file to read"),
-  encoding: z$1.string().optional().describe("Encoding for text files (default: utf-8)")
+var fsReadQuerySchema = z.object({
+  path: z.string().describe("Path to the file to read"),
+  encoding: z.string().optional().describe("Encoding for text files (default: utf-8)")
 });
-var fsListQuerySchema = z$1.object({
-  path: z$1.string().describe("Path to the directory to list"),
-  recursive: z$1.coerce.boolean().optional().describe("Include subdirectories")
+var fsListQuerySchema = z.object({
+  path: z.string().describe("Path to the directory to list"),
+  recursive: z.coerce.boolean().optional().describe("Include subdirectories")
 });
-var fsStatQuerySchema = z$1.object({
-  path: z$1.string().describe("Path to get info about")
+var fsStatQuerySchema = z.object({
+  path: z.string().describe("Path to get info about")
 });
-var fsDeleteQuerySchema = z$1.object({
-  path: z$1.string().describe("Path to delete"),
-  recursive: z$1.coerce.boolean().optional().describe("Delete directories recursively"),
-  force: z$1.coerce.boolean().optional().describe("Don't error if path doesn't exist")
+var fsDeleteQuerySchema = z.object({
+  path: z.string().describe("Path to delete"),
+  recursive: z.coerce.boolean().optional().describe("Delete directories recursively"),
+  force: z.coerce.boolean().optional().describe("Don't error if path doesn't exist")
 });
-var fsWriteBodySchema = z$1.object({
-  path: z$1.string().describe("Path to write to"),
-  content: z$1.string().describe("Content to write (text or base64-encoded binary)"),
-  encoding: z$1.enum(["utf-8", "base64"]).optional().default("utf-8").describe("Content encoding"),
-  recursive: z$1.coerce.boolean().optional().describe("Create parent directories if needed")
+var fsWriteBodySchema = z.object({
+  path: z.string().describe("Path to write to"),
+  content: z.string().describe("Content to write (text or base64-encoded binary)"),
+  encoding: z.enum(["utf-8", "base64"]).optional().default("utf-8").describe("Content encoding"),
+  recursive: z.coerce.boolean().optional().describe("Create parent directories if needed")
 });
-var fsMkdirBodySchema = z$1.object({
-  path: z$1.string().describe("Directory path to create"),
-  recursive: z$1.coerce.boolean().optional().describe("Create parent directories if needed")
+var fsMkdirBodySchema = z.object({
+  path: z.string().describe("Directory path to create"),
+  recursive: z.coerce.boolean().optional().describe("Create parent directories if needed")
 });
-var fileEntrySchema = z$1.object({
-  name: z$1.string(),
-  type: z$1.enum(["file", "directory"]),
-  size: z$1.number().optional(),
-  mount: z$1.object({
-    provider: z$1.string(),
-    icon: z$1.string().optional(),
-    displayName: z$1.string().optional(),
-    description: z$1.string().optional(),
-    status: z$1.enum([
+var fileEntrySchema = z.object({
+  name: z.string(),
+  type: z.enum(["file", "directory"]),
+  size: z.number().optional(),
+  mount: z.object({
+    provider: z.string(),
+    icon: z.string().optional(),
+    displayName: z.string().optional(),
+    description: z.string().optional(),
+    status: z.enum([
       "pending",
       "initializing",
       "ready",
@@ -2080,280 +1668,280 @@ var fileEntrySchema = z$1.object({
       "destroyed",
       "error"
     ]).optional(),
-    error: z$1.string().optional()
+    error: z.string().optional()
   }).optional()
 });
-var fsReadResponseSchema = z$1.object({
-  path: z$1.string(),
-  content: z$1.string(),
-  type: z$1.enum(["file", "directory"]),
-  size: z$1.number().optional(),
-  mimeType: z$1.string().optional()
+var fsReadResponseSchema = z.object({
+  path: z.string(),
+  content: z.string(),
+  type: z.enum(["file", "directory"]),
+  size: z.number().optional(),
+  mimeType: z.string().optional()
 });
-var fsWriteResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  path: z$1.string()
+var fsWriteResponseSchema = z.object({
+  success: z.boolean(),
+  path: z.string()
 });
-var fsListResponseSchema = z$1.object({
-  path: z$1.string(),
-  entries: z$1.array(fileEntrySchema)
+var fsListResponseSchema = z.object({
+  path: z.string(),
+  entries: z.array(fileEntrySchema)
 });
-var fsDeleteResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  path: z$1.string()
+var fsDeleteResponseSchema = z.object({
+  success: z.boolean(),
+  path: z.string()
 });
-var fsMkdirResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  path: z$1.string()
+var fsMkdirResponseSchema = z.object({
+  success: z.boolean(),
+  path: z.string()
 });
-var fsStatResponseSchema = z$1.object({
-  path: z$1.string(),
-  type: z$1.enum(["file", "directory"]),
-  size: z$1.number().optional(),
-  createdAt: z$1.string().optional(),
-  modifiedAt: z$1.string().optional(),
-  mimeType: z$1.string().optional()
+var fsStatResponseSchema = z.object({
+  path: z.string(),
+  type: z.enum(["file", "directory"]),
+  size: z.number().optional(),
+  createdAt: z.string().optional(),
+  modifiedAt: z.string().optional(),
+  mimeType: z.string().optional()
 });
-var searchQuerySchema = z$1.object({
-  query: z$1.string().describe("Search query text"),
-  topK: z$1.coerce.number().optional().default(5).describe("Maximum number of results"),
-  mode: z$1.enum(["bm25", "vector", "hybrid"]).optional().describe("Search mode"),
-  minScore: z$1.coerce.number().optional().describe("Minimum relevance score threshold")
+var searchQuerySchema = z.object({
+  query: z.string().describe("Search query text"),
+  topK: z.coerce.number().optional().default(5).describe("Maximum number of results"),
+  mode: z.enum(["bm25", "vector", "hybrid"]).optional().describe("Search mode"),
+  minScore: z.coerce.number().optional().describe("Minimum relevance score threshold")
 });
-var searchResultSchema = z$1.object({
-  id: z$1.string().describe("Document ID (file path)"),
-  content: z$1.string(),
-  score: z$1.number(),
-  lineRange: z$1.object({
-    start: z$1.number(),
-    end: z$1.number()
+var searchResultSchema = z.object({
+  id: z.string().describe("Document ID (file path)"),
+  content: z.string(),
+  score: z.number(),
+  lineRange: z.object({
+    start: z.number(),
+    end: z.number()
   }).optional(),
-  scoreDetails: z$1.object({
-    vector: z$1.number().optional(),
-    bm25: z$1.number().optional()
+  scoreDetails: z.object({
+    vector: z.number().optional(),
+    bm25: z.number().optional()
   }).optional()
 });
-var searchResponseSchema = z$1.object({
-  results: z$1.array(searchResultSchema),
-  query: z$1.string(),
-  mode: z$1.enum(["bm25", "vector", "hybrid"])
+var searchResponseSchema = z.object({
+  results: z.array(searchResultSchema),
+  query: z.string(),
+  mode: z.enum(["bm25", "vector", "hybrid"])
 });
-var indexBodySchema = z$1.object({
-  path: z$1.string().describe("Path to use as document ID"),
-  content: z$1.string().describe("Content to index"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata")
+var indexBodySchema = z.object({
+  path: z.string().describe("Path to use as document ID"),
+  content: z.string().describe("Content to index"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata")
 });
-var indexResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  path: z$1.string()
+var indexResponseSchema = z.object({
+  success: z.boolean(),
+  path: z.string()
 });
-var mountInfoSchema = z$1.object({
-  path: z$1.string().describe("Mount path"),
-  provider: z$1.string().describe("Filesystem provider type"),
-  readOnly: z$1.boolean().describe("Whether the mount is read-only"),
-  displayName: z$1.string().optional().describe("Human-readable name"),
-  icon: z$1.string().optional().describe("UI icon identifier"),
-  name: z$1.string().optional().describe("Filesystem instance name")
+var mountInfoSchema = z.object({
+  path: z.string().describe("Mount path"),
+  provider: z.string().describe("Filesystem provider type"),
+  readOnly: z.boolean().describe("Whether the mount is read-only"),
+  displayName: z.string().optional().describe("Human-readable name"),
+  icon: z.string().optional().describe("UI icon identifier"),
+  name: z.string().optional().describe("Filesystem instance name")
 });
-var workspaceInfoResponseSchema = z$1.object({
-  isWorkspaceConfigured: z$1.boolean(),
-  id: z$1.string().optional(),
-  name: z$1.string().optional(),
-  status: z$1.string().optional(),
-  capabilities: z$1.object({
-    hasFilesystem: z$1.boolean(),
-    hasSandbox: z$1.boolean(),
-    canBM25: z$1.boolean(),
-    canVector: z$1.boolean(),
-    canHybrid: z$1.boolean(),
-    hasSkills: z$1.boolean()
+var workspaceInfoResponseSchema = z.object({
+  isWorkspaceConfigured: z.boolean(),
+  id: z.string().optional(),
+  name: z.string().optional(),
+  status: z.string().optional(),
+  capabilities: z.object({
+    hasFilesystem: z.boolean(),
+    hasSandbox: z.boolean(),
+    canBM25: z.boolean(),
+    canVector: z.boolean(),
+    canHybrid: z.boolean(),
+    hasSkills: z.boolean()
   }).optional(),
-  safety: z$1.object({
-    readOnly: z$1.boolean()
+  safety: z.object({
+    readOnly: z.boolean()
   }).optional(),
-  filesystem: z$1.object({
-    id: z$1.string(),
-    name: z$1.string(),
-    provider: z$1.string(),
-    status: z$1.string().optional(),
-    error: z$1.string().optional(),
-    readOnly: z$1.boolean().optional(),
-    icon: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+  filesystem: z.object({
+    id: z.string(),
+    name: z.string(),
+    provider: z.string(),
+    status: z.string().optional(),
+    error: z.string().optional(),
+    readOnly: z.boolean().optional(),
+    icon: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional()
   }).optional(),
-  mounts: z$1.array(mountInfoSchema).optional().describe("Mount points (only present for CompositeFilesystem)")
+  mounts: z.array(mountInfoSchema).optional().describe("Mount points (only present for CompositeFilesystem)")
 });
-var workspaceItemSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  status: z$1.string(),
-  source: z$1.enum(["mastra", "agent"]),
-  agentId: z$1.string().optional(),
-  agentName: z$1.string().optional(),
-  capabilities: z$1.object({
-    hasFilesystem: z$1.boolean(),
-    hasSandbox: z$1.boolean(),
-    canBM25: z$1.boolean(),
-    canVector: z$1.boolean(),
-    canHybrid: z$1.boolean(),
-    hasSkills: z$1.boolean()
+var workspaceItemSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.string(),
+  source: z.enum(["mastra", "agent"]),
+  agentId: z.string().optional(),
+  agentName: z.string().optional(),
+  capabilities: z.object({
+    hasFilesystem: z.boolean(),
+    hasSandbox: z.boolean(),
+    canBM25: z.boolean(),
+    canVector: z.boolean(),
+    canHybrid: z.boolean(),
+    hasSkills: z.boolean()
   }),
-  safety: z$1.object({
-    readOnly: z$1.boolean()
+  safety: z.object({
+    readOnly: z.boolean()
   })
 });
-var listWorkspacesResponseSchema = z$1.object({
-  workspaces: z$1.array(workspaceItemSchema)
+var listWorkspacesResponseSchema = z.object({
+  workspaces: z.array(workspaceItemSchema)
 });
 var skillNamePathParams = workspaceIdPathParams.extend({
-  skillName: z$1.string().describe("Skill name identifier")
+  skillName: z.string().describe("Skill name identifier")
 });
 var skillReferencePathParams = skillNamePathParams.extend({
-  referencePath: z$1.string().describe("Reference file path (URL encoded)")
+  referencePath: z.string().describe("Reference file path (URL encoded)")
 });
-var skillDisambiguationQuerySchema = z$1.object({
-  path: z$1.string().optional().describe("Skill path for disambiguation when multiple skills share the same name")
+var skillDisambiguationQuerySchema = z.object({
+  path: z.string().optional().describe("Skill path for disambiguation when multiple skills share the same name")
 });
-var searchSkillsQuerySchema = z$1.object({
-  query: z$1.string().describe("Search query text"),
-  topK: z$1.coerce.number().optional().default(5).describe("Maximum number of results"),
-  minScore: z$1.coerce.number().optional().describe("Minimum relevance score threshold"),
-  skillNames: z$1.string().optional().describe("Comma-separated list of skill names to search within"),
-  includeReferences: z$1.coerce.boolean().optional().default(true).describe("Include reference files in search")
+var searchSkillsQuerySchema = z.object({
+  query: z.string().describe("Search query text"),
+  topK: z.coerce.number().optional().default(5).describe("Maximum number of results"),
+  minScore: z.coerce.number().optional().describe("Minimum relevance score threshold"),
+  skillNames: z.string().optional().describe("Comma-separated list of skill names to search within"),
+  includeReferences: z.coerce.boolean().optional().default(true).describe("Include reference files in search")
 });
-var skillMetadataSchema = z$1.object({
-  name: z$1.string(),
-  description: z$1.string(),
-  license: z$1.string().optional(),
-  compatibility: z$1.unknown().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  path: z$1.string()
+var skillMetadataSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  license: z.string().optional(),
+  compatibility: z.unknown().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  path: z.string()
 });
-var skillSourceSchema = z$1.discriminatedUnion("type", [
-  z$1.object({ type: z$1.literal("external"), packagePath: z$1.string() }),
-  z$1.object({ type: z$1.literal("local"), projectPath: z$1.string() }),
-  z$1.object({ type: z$1.literal("managed"), mastraPath: z$1.string() })
+var skillSourceSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("external"), packagePath: z.string() }),
+  z.object({ type: z.literal("local"), projectPath: z.string() }),
+  z.object({ type: z.literal("managed"), mastraPath: z.string() })
 ]);
 var skillSchema = skillMetadataSchema.extend({
-  instructions: z$1.string(),
+  instructions: z.string(),
   source: skillSourceSchema,
-  references: z$1.array(z$1.string()),
-  scripts: z$1.array(z$1.string()),
-  assets: z$1.array(z$1.string())
+  references: z.array(z.string()),
+  scripts: z.array(z.string()),
+  assets: z.array(z.string())
 });
-var skillsShSourceSchema = z$1.object({
-  owner: z$1.string().describe("GitHub owner/org"),
-  repo: z$1.string().describe("GitHub repository")
+var skillsShSourceSchema = z.object({
+  owner: z.string().describe("GitHub owner/org"),
+  repo: z.string().describe("GitHub repository")
 });
 var skillMetadataWithPathSchema = skillMetadataSchema.extend({
   /** Source info for skills installed via skills.sh (from .meta.json) */
   skillsShSource: skillsShSourceSchema.optional()
 });
-var listSkillsResponseSchema = z$1.object({
-  skills: z$1.array(skillMetadataWithPathSchema),
-  isSkillsConfigured: z$1.boolean().describe("Whether skills are configured in the workspace")
+var listSkillsResponseSchema = z.object({
+  skills: z.array(skillMetadataWithPathSchema),
+  isSkillsConfigured: z.boolean().describe("Whether skills are configured in the workspace")
 });
 var getSkillResponseSchema = skillSchema;
 var getAgentSkillResponseSchema = skillMetadataSchema.extend({
-  path: z$1.string().optional(),
-  instructions: z$1.string().optional(),
+  path: z.string().optional(),
+  instructions: z.string().optional(),
   source: skillSourceSchema.optional(),
-  references: z$1.array(z$1.string()).optional(),
-  scripts: z$1.array(z$1.string()).optional(),
-  assets: z$1.array(z$1.string()).optional()
+  references: z.array(z.string()).optional(),
+  scripts: z.array(z.string()).optional(),
+  assets: z.array(z.string()).optional()
 });
-var skillReferenceResponseSchema = z$1.object({
-  skillName: z$1.string(),
-  referencePath: z$1.string(),
-  content: z$1.string()
+var skillReferenceResponseSchema = z.object({
+  skillName: z.string(),
+  referencePath: z.string(),
+  content: z.string()
 });
-var listReferencesResponseSchema = z$1.object({
-  skillName: z$1.string(),
-  references: z$1.array(z$1.string())
+var listReferencesResponseSchema = z.object({
+  skillName: z.string(),
+  references: z.array(z.string())
 });
-var skillSearchResultSchema = z$1.object({
-  skillName: z$1.string(),
-  skillPath: z$1.string(),
-  source: z$1.string(),
-  content: z$1.string(),
-  score: z$1.number(),
-  lineRange: z$1.object({
-    start: z$1.number(),
-    end: z$1.number()
+var skillSearchResultSchema = z.object({
+  skillName: z.string(),
+  skillPath: z.string(),
+  source: z.string(),
+  content: z.string(),
+  score: z.number(),
+  lineRange: z.object({
+    start: z.number(),
+    end: z.number()
   }).optional(),
-  scoreDetails: z$1.object({
-    vector: z$1.number().optional(),
-    bm25: z$1.number().optional()
+  scoreDetails: z.object({
+    vector: z.number().optional(),
+    bm25: z.number().optional()
   }).optional()
 });
-var searchSkillsResponseSchema = z$1.object({
-  results: z$1.array(skillSearchResultSchema),
-  query: z$1.string()
+var searchSkillsResponseSchema = z.object({
+  results: z.array(skillSearchResultSchema),
+  query: z.string()
 });
-var skillsShSearchQuerySchema = z$1.object({
-  q: z$1.string().describe("Search query"),
-  limit: z$1.coerce.number().optional().default(10).describe("Maximum number of results")
+var skillsShSearchQuerySchema = z.object({
+  q: z.string().describe("Search query"),
+  limit: z.coerce.number().optional().default(10).describe("Maximum number of results")
 });
-var skillsShPopularQuerySchema = z$1.object({
-  limit: z$1.coerce.number().optional().default(10).describe("Maximum number of results"),
-  offset: z$1.coerce.number().optional().default(0).describe("Offset for pagination")
+var skillsShPopularQuerySchema = z.object({
+  limit: z.coerce.number().optional().default(10).describe("Maximum number of results"),
+  offset: z.coerce.number().optional().default(0).describe("Offset for pagination")
 });
-var skillsShSkillSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  installs: z$1.number(),
-  topSource: z$1.string()
+var skillsShSkillSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  installs: z.number(),
+  topSource: z.string()
 });
-var skillsShSearchResponseSchema = z$1.object({
-  query: z$1.string(),
-  searchType: z$1.string(),
-  skills: z$1.array(skillsShSkillSchema),
-  count: z$1.number()
+var skillsShSearchResponseSchema = z.object({
+  query: z.string(),
+  searchType: z.string(),
+  skills: z.array(skillsShSkillSchema),
+  count: z.number()
 });
-var skillsShListResponseSchema = z$1.object({
-  skills: z$1.array(skillsShSkillSchema),
-  count: z$1.number(),
-  limit: z$1.number(),
-  offset: z$1.number()
+var skillsShListResponseSchema = z.object({
+  skills: z.array(skillsShSkillSchema),
+  count: z.number(),
+  limit: z.number(),
+  offset: z.number()
 });
-var skillsShPreviewQuerySchema = z$1.object({
-  owner: z$1.string().describe("GitHub repository owner"),
-  repo: z$1.string().describe("GitHub repository name"),
-  path: z$1.string().describe("Path to skill within repo")
+var skillsShPreviewQuerySchema = z.object({
+  owner: z.string().describe("GitHub repository owner"),
+  repo: z.string().describe("GitHub repository name"),
+  path: z.string().describe("Path to skill within repo")
 });
-var skillsShPreviewResponseSchema = z$1.object({
-  content: z$1.string()
+var skillsShPreviewResponseSchema = z.object({
+  content: z.string()
 });
-var skillsShInstallBodySchema = z$1.object({
-  owner: z$1.string().describe("GitHub repository owner"),
-  repo: z$1.string().describe("GitHub repository name"),
-  skillName: z$1.string().describe("Skill name from skills.sh"),
-  mount: z$1.string().optional().describe("Mount path to install into (for CompositeFilesystem)")
+var skillsShInstallBodySchema = z.object({
+  owner: z.string().describe("GitHub repository owner"),
+  repo: z.string().describe("GitHub repository name"),
+  skillName: z.string().describe("Skill name from skills.sh"),
+  mount: z.string().optional().describe("Mount path to install into (for CompositeFilesystem)")
 });
-var skillsShInstallResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  skillName: z$1.string(),
-  installedPath: z$1.string(),
-  filesWritten: z$1.number()
+var skillsShInstallResponseSchema = z.object({
+  success: z.boolean(),
+  skillName: z.string(),
+  installedPath: z.string(),
+  filesWritten: z.number()
 });
-var skillsShRemoveBodySchema = z$1.object({
-  skillName: z$1.string().describe("Name of the installed skill to remove")
+var skillsShRemoveBodySchema = z.object({
+  skillName: z.string().describe("Name of the installed skill to remove")
 });
-var skillsShRemoveResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  skillName: z$1.string(),
-  removedPath: z$1.string()
+var skillsShRemoveResponseSchema = z.object({
+  success: z.boolean(),
+  skillName: z.string(),
+  removedPath: z.string()
 });
-var skillsShUpdateBodySchema = z$1.object({
-  skillName: z$1.string().optional().describe("Specific skill to update, or omit to update all")
+var skillsShUpdateBodySchema = z.object({
+  skillName: z.string().optional().describe("Specific skill to update, or omit to update all")
 });
-var skillsShUpdateResponseSchema = z$1.object({
-  updated: z$1.array(
-    z$1.object({
-      skillName: z$1.string(),
-      success: z$1.boolean(),
-      filesWritten: z$1.number().optional(),
-      error: z$1.string().optional()
+var skillsShUpdateResponseSchema = z.object({
+  updated: z.array(
+    z.object({
+      skillName: z.string(),
+      success: z.boolean(),
+      filesWritten: z.number().optional(),
+      error: z.string().optional()
     })
   )
 });
@@ -2448,7 +2036,7 @@ async function resolveToolConfig(toolsConfig, toolName, context) {
 }
 
 // src/server/http-exception.ts
-var HTTPException$2 = class HTTPException extends Error {
+var HTTPException$1 = class HTTPException extends Error {
   res;
   status;
   /**
@@ -2504,7 +2092,7 @@ function validateBody$1(body) {
     return acc;
   }, {});
   if (Object.keys(errorResponse).length > 0) {
-    throw new HTTPException$2(400, { message: Object.values(errorResponse)[0] });
+    throw new HTTPException$1(400, { message: Object.values(errorResponse)[0] });
   }
 }
 function sanitizeBody(body, disallowedKeys) {
@@ -2534,7 +2122,7 @@ function getEffectiveThreadId(requestContext, clientThreadId) {
 }
 async function validateThreadOwnership(thread, effectiveResourceId) {
   if (thread && effectiveResourceId && thread.resourceId && thread.resourceId !== effectiveResourceId) {
-    throw new HTTPException$2(403, { message: "Access denied: thread belongs to a different resource" });
+    throw new HTTPException$1(403, { message: "Access denied: thread belongs to a different resource" });
   }
 }
 async function enforceThreadAccess({
@@ -2552,7 +2140,7 @@ async function enforceThreadAccess({
   }
   const user = requestContext?.get("user");
   if (!user || typeof user !== "object") {
-    throw new HTTPException$2(403, { message: "FGA authorization denied: authenticated user is required" });
+    throw new HTTPException$1(403, { message: "FGA authorization denied: authenticated user is required" });
   }
   await MastraMemory.checkThreadFGA({
     mastra,
@@ -2565,7 +2153,7 @@ async function enforceThreadAccess({
 }
 async function validateRunOwnership(run, effectiveResourceId) {
   if (run && effectiveResourceId && run.resourceId && run.resourceId !== effectiveResourceId) {
-    throw new HTTPException$2(403, { message: "Access denied: workflow run belongs to a different resource" });
+    throw new HTTPException$1(403, { message: "Access denied: workflow run belongs to a different resource" });
   }
 }
 
@@ -3852,7 +3440,7 @@ function patchRecordSchemas(schema) {
   const def = schema._zod?.def;
   if (def?.type === "record" && def.keyType && !def.valueType) {
     def.valueType = def.keyType;
-    def.keyType = z$1.string();
+    def.keyType = z.string();
   }
   if (!def) return schema;
   if (def.type === "object" && def.shape) {
@@ -12323,7 +11911,7 @@ async function getStoredResourceScope(mastra, requestContext) {
     if (options.requireScope === false) {
       return void 0;
     }
-    throw new HTTPException$2(403, { message: "Stored resource scope is required" });
+    throw new HTTPException$1(403, { message: "Stored resource scope is required" });
   }
   return { metadataKey, value: resolved };
 }
@@ -12341,7 +11929,7 @@ function assertStoredResourceScope(resource, scope) {
     return;
   }
   if (resource.metadata?.[scope.metadataKey] !== scope.value) {
-    throw new HTTPException$2(404, { message: "Stored resource not found" });
+    throw new HTTPException$1(404, { message: "Stored resource not found" });
   }
 }
 function looksLikeProcessorStepSchema(schema) {
@@ -12553,7 +12141,7 @@ function handleError$2(error, defaultMessage) {
       status: 422,
       headers: { "content-type": "application/json" }
     });
-    throw new HTTPException$2(422, {
+    throw new HTTPException$1(422, {
       res,
       message: error.message,
       cause: error
@@ -12561,7 +12149,7 @@ function handleError$2(error, defaultMessage) {
   }
   const apiError = error;
   const apiErrorStatus = apiError.status || apiError.details?.status || 500;
-  throw new HTTPException$2(apiErrorStatus, {
+  throw new HTTPException$1(apiErrorStatus, {
     message: apiError.message || defaultMessage,
     stack: apiError.stack,
     cause: apiError.cause
@@ -15509,11 +15097,11 @@ var NoObjectGeneratedError = class extends AISDKError {
   }
 };
 _a42 = symbol42;
-var dataContentSchema = z.union([
-  z.string(),
-  z.instanceof(Uint8Array),
-  z.instanceof(ArrayBuffer),
-  z.custom(
+var dataContentSchema = z$1.union([
+  z$1.string(),
+  z$1.instanceof(Uint8Array),
+  z$1.instanceof(ArrayBuffer),
+  z$1.custom(
     // Buffer might not be available in some environments such as CloudFlare:
     (value) => {
       var _a17, _b;
@@ -15522,102 +15110,102 @@ var dataContentSchema = z.union([
     { message: "Must be a Buffer" }
   )
 ]);
-var jsonValueSchema = z.lazy(
-  () => z.union([
-    z.null(),
-    z.string(),
-    z.number(),
-    z.boolean(),
-    z.record(z.string(), jsonValueSchema),
-    z.array(jsonValueSchema)
+var jsonValueSchema = z$1.lazy(
+  () => z$1.union([
+    z$1.null(),
+    z$1.string(),
+    z$1.number(),
+    z$1.boolean(),
+    z$1.record(z$1.string(), jsonValueSchema),
+    z$1.array(jsonValueSchema)
   ])
 );
-var providerMetadataSchema = z.record(
-  z.string(),
-  z.record(z.string(), jsonValueSchema)
+var providerMetadataSchema = z$1.record(
+  z$1.string(),
+  z$1.record(z$1.string(), jsonValueSchema)
 );
-var toolResultContentSchema = z.array(
-  z.union([
-    z.object({ type: z.literal("text"), text: z.string() }),
-    z.object({
-      type: z.literal("image"),
-      data: z.string(),
-      mimeType: z.string().optional()
+var toolResultContentSchema = z$1.array(
+  z$1.union([
+    z$1.object({ type: z$1.literal("text"), text: z$1.string() }),
+    z$1.object({
+      type: z$1.literal("image"),
+      data: z$1.string(),
+      mimeType: z$1.string().optional()
     })
   ])
 );
-var textPartSchema$1 = z.object({
-  type: z.literal("text"),
-  text: z.string(),
+var textPartSchema$1 = z$1.object({
+  type: z$1.literal("text"),
+  text: z$1.string(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var imagePartSchema = z.object({
-  type: z.literal("image"),
-  image: z.union([dataContentSchema, z.instanceof(URL)]),
-  mimeType: z.string().optional(),
+var imagePartSchema = z$1.object({
+  type: z$1.literal("image"),
+  image: z$1.union([dataContentSchema, z$1.instanceof(URL)]),
+  mimeType: z$1.string().optional(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var filePartSchema$1 = z.object({
-  type: z.literal("file"),
-  data: z.union([dataContentSchema, z.instanceof(URL)]),
-  filename: z.string().optional(),
-  mimeType: z.string(),
+var filePartSchema$1 = z$1.object({
+  type: z$1.literal("file"),
+  data: z$1.union([dataContentSchema, z$1.instanceof(URL)]),
+  filename: z$1.string().optional(),
+  mimeType: z$1.string(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var reasoningPartSchema = z.object({
-  type: z.literal("reasoning"),
-  text: z.string(),
+var reasoningPartSchema = z$1.object({
+  type: z$1.literal("reasoning"),
+  text: z$1.string(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var redactedReasoningPartSchema = z.object({
-  type: z.literal("redacted-reasoning"),
-  data: z.string(),
+var redactedReasoningPartSchema = z$1.object({
+  type: z$1.literal("redacted-reasoning"),
+  data: z$1.string(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var toolCallPartSchema = z.object({
-  type: z.literal("tool-call"),
-  toolCallId: z.string(),
-  toolName: z.string(),
-  args: z.unknown(),
+var toolCallPartSchema = z$1.object({
+  type: z$1.literal("tool-call"),
+  toolCallId: z$1.string(),
+  toolName: z$1.string(),
+  args: z$1.unknown(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var toolResultPartSchema = z.object({
-  type: z.literal("tool-result"),
-  toolCallId: z.string(),
-  toolName: z.string(),
-  result: z.unknown(),
+var toolResultPartSchema = z$1.object({
+  type: z$1.literal("tool-result"),
+  toolCallId: z$1.string(),
+  toolName: z$1.string(),
+  result: z$1.unknown(),
   content: toolResultContentSchema.optional(),
-  isError: z.boolean().optional(),
+  isError: z$1.boolean().optional(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreSystemMessageSchema = z.object({
-  role: z.literal("system"),
-  content: z.string(),
+var coreSystemMessageSchema = z$1.object({
+  role: z$1.literal("system"),
+  content: z$1.string(),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreUserMessageSchema = z.object({
-  role: z.literal("user"),
-  content: z.union([
-    z.string(),
-    z.array(z.union([textPartSchema$1, imagePartSchema, filePartSchema$1]))
+var coreUserMessageSchema = z$1.object({
+  role: z$1.literal("user"),
+  content: z$1.union([
+    z$1.string(),
+    z$1.array(z$1.union([textPartSchema$1, imagePartSchema, filePartSchema$1]))
   ]),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreAssistantMessageSchema = z.object({
-  role: z.literal("assistant"),
-  content: z.union([
-    z.string(),
-    z.array(
-      z.union([
+var coreAssistantMessageSchema = z$1.object({
+  role: z$1.literal("assistant"),
+  content: z$1.union([
+    z$1.string(),
+    z$1.array(
+      z$1.union([
         textPartSchema$1,
         filePartSchema$1,
         reasoningPartSchema,
@@ -15629,13 +15217,13 @@ var coreAssistantMessageSchema = z.object({
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreToolMessageSchema = z.object({
-  role: z.literal("tool"),
-  content: z.array(toolResultPartSchema),
+var coreToolMessageSchema = z$1.object({
+  role: z$1.literal("tool"),
+  content: z$1.array(toolResultPartSchema),
   providerOptions: providerMetadataSchema.optional(),
   experimental_providerMetadata: providerMetadataSchema.optional()
 });
-z.union([
+z$1.union([
   coreSystemMessageSchema,
   coreUserMessageSchema,
   coreAssistantMessageSchema,
@@ -15845,125 +15433,125 @@ createIdGenerator({
   prefix: "msg",
   size: 24
 });
-var ClientOrServerImplementationSchema = z.object({
-  name: z.string(),
-  version: z.string()
+var ClientOrServerImplementationSchema = z$1.object({
+  name: z$1.string(),
+  version: z$1.string()
 }).passthrough();
-var BaseParamsSchema = z.object({
-  _meta: z.optional(z.object({}).passthrough())
+var BaseParamsSchema = z$1.object({
+  _meta: z$1.optional(z$1.object({}).passthrough())
 }).passthrough();
 var ResultSchema = BaseParamsSchema;
-var RequestSchema = z.object({
-  method: z.string(),
-  params: z.optional(BaseParamsSchema)
+var RequestSchema = z$1.object({
+  method: z$1.string(),
+  params: z$1.optional(BaseParamsSchema)
 });
-var ServerCapabilitiesSchema = z.object({
-  experimental: z.optional(z.object({}).passthrough()),
-  logging: z.optional(z.object({}).passthrough()),
-  prompts: z.optional(
-    z.object({
-      listChanged: z.optional(z.boolean())
+var ServerCapabilitiesSchema = z$1.object({
+  experimental: z$1.optional(z$1.object({}).passthrough()),
+  logging: z$1.optional(z$1.object({}).passthrough()),
+  prompts: z$1.optional(
+    z$1.object({
+      listChanged: z$1.optional(z$1.boolean())
     }).passthrough()
   ),
-  resources: z.optional(
-    z.object({
-      subscribe: z.optional(z.boolean()),
-      listChanged: z.optional(z.boolean())
+  resources: z$1.optional(
+    z$1.object({
+      subscribe: z$1.optional(z$1.boolean()),
+      listChanged: z$1.optional(z$1.boolean())
     }).passthrough()
   ),
-  tools: z.optional(
-    z.object({
-      listChanged: z.optional(z.boolean())
+  tools: z$1.optional(
+    z$1.object({
+      listChanged: z$1.optional(z$1.boolean())
     }).passthrough()
   )
 }).passthrough();
 ResultSchema.extend({
-  protocolVersion: z.string(),
+  protocolVersion: z$1.string(),
   capabilities: ServerCapabilitiesSchema,
   serverInfo: ClientOrServerImplementationSchema,
-  instructions: z.optional(z.string())
+  instructions: z$1.optional(z$1.string())
 });
 var PaginatedResultSchema = ResultSchema.extend({
-  nextCursor: z.optional(z.string())
+  nextCursor: z$1.optional(z$1.string())
 });
-var ToolSchema = z.object({
-  name: z.string(),
-  description: z.optional(z.string()),
-  inputSchema: z.object({
-    type: z.literal("object"),
-    properties: z.optional(z.object({}).passthrough())
+var ToolSchema = z$1.object({
+  name: z$1.string(),
+  description: z$1.optional(z$1.string()),
+  inputSchema: z$1.object({
+    type: z$1.literal("object"),
+    properties: z$1.optional(z$1.object({}).passthrough())
   }).passthrough()
 }).passthrough();
 PaginatedResultSchema.extend({
-  tools: z.array(ToolSchema)
+  tools: z$1.array(ToolSchema)
 });
-var TextContentSchema = z.object({
-  type: z.literal("text"),
-  text: z.string()
+var TextContentSchema = z$1.object({
+  type: z$1.literal("text"),
+  text: z$1.string()
 }).passthrough();
-var ImageContentSchema = z.object({
-  type: z.literal("image"),
-  data: z.string().base64(),
-  mimeType: z.string()
+var ImageContentSchema = z$1.object({
+  type: z$1.literal("image"),
+  data: z$1.string().base64(),
+  mimeType: z$1.string()
 }).passthrough();
-var ResourceContentsSchema = z.object({
+var ResourceContentsSchema = z$1.object({
   /**
    * The URI of this resource.
    */
-  uri: z.string(),
+  uri: z$1.string(),
   /**
    * The MIME type of this resource, if known.
    */
-  mimeType: z.optional(z.string())
+  mimeType: z$1.optional(z$1.string())
 }).passthrough();
 var TextResourceContentsSchema = ResourceContentsSchema.extend({
-  text: z.string()
+  text: z$1.string()
 });
 var BlobResourceContentsSchema = ResourceContentsSchema.extend({
-  blob: z.string().base64()
+  blob: z$1.string().base64()
 });
-var EmbeddedResourceSchema = z.object({
-  type: z.literal("resource"),
-  resource: z.union([TextResourceContentsSchema, BlobResourceContentsSchema])
+var EmbeddedResourceSchema = z$1.object({
+  type: z$1.literal("resource"),
+  resource: z$1.union([TextResourceContentsSchema, BlobResourceContentsSchema])
 }).passthrough();
 ResultSchema.extend({
-  content: z.array(
-    z.union([TextContentSchema, ImageContentSchema, EmbeddedResourceSchema])
+  content: z$1.array(
+    z$1.union([TextContentSchema, ImageContentSchema, EmbeddedResourceSchema])
   ),
-  isError: z.boolean().default(false).optional()
+  isError: z$1.boolean().default(false).optional()
 }).or(
   ResultSchema.extend({
-    toolResult: z.unknown()
+    toolResult: z$1.unknown()
   })
 );
 var JSONRPC_VERSION = "2.0";
-var JSONRPCRequestSchema = z.object({
-  jsonrpc: z.literal(JSONRPC_VERSION),
-  id: z.union([z.string(), z.number().int()])
+var JSONRPCRequestSchema = z$1.object({
+  jsonrpc: z$1.literal(JSONRPC_VERSION),
+  id: z$1.union([z$1.string(), z$1.number().int()])
 }).merge(RequestSchema).strict();
-var JSONRPCResponseSchema = z.object({
-  jsonrpc: z.literal(JSONRPC_VERSION),
-  id: z.union([z.string(), z.number().int()]),
+var JSONRPCResponseSchema = z$1.object({
+  jsonrpc: z$1.literal(JSONRPC_VERSION),
+  id: z$1.union([z$1.string(), z$1.number().int()]),
   result: ResultSchema
 }).strict();
-var JSONRPCErrorSchema = z.object({
-  jsonrpc: z.literal(JSONRPC_VERSION),
-  id: z.union([z.string(), z.number().int()]),
-  error: z.object({
-    code: z.number().int(),
-    message: z.string(),
-    data: z.optional(z.unknown())
+var JSONRPCErrorSchema = z$1.object({
+  jsonrpc: z$1.literal(JSONRPC_VERSION),
+  id: z$1.union([z$1.string(), z$1.number().int()]),
+  error: z$1.object({
+    code: z$1.number().int(),
+    message: z$1.string(),
+    data: z$1.optional(z$1.unknown())
   })
 }).strict();
-var JSONRPCNotificationSchema = z.object({
-  jsonrpc: z.literal(JSONRPC_VERSION)
+var JSONRPCNotificationSchema = z$1.object({
+  jsonrpc: z$1.literal(JSONRPC_VERSION)
 }).merge(
-  z.object({
-    method: z.string(),
-    params: z.optional(BaseParamsSchema)
+  z$1.object({
+    method: z$1.string(),
+    params: z$1.optional(BaseParamsSchema)
   })
 ).strict();
-z.union([
+z$1.union([
   JSONRPCRequestSchema,
   JSONRPCNotificationSchema,
   JSONRPCResponseSchema,
@@ -16370,30 +15958,30 @@ function pickParams(schema, params) {
   return result;
 }
 function jsonQueryParam(schema) {
-  return z$1.union([
+  return z.union([
     schema,
     // Already the expected type (non-string input)
-    z$1.string().transform((val, ctx) => {
+    z.string().transform((val, ctx) => {
       try {
         const parsed = JSON.parse(val);
         const result = schema.safeParse(parsed);
         if (!result.success) {
           for (const issue of result.error.issues) {
             ctx.addIssue({
-              code: z$1.ZodIssueCode.custom,
+              code: z.ZodIssueCode.custom,
               message: issue.message,
               path: issue.path
             });
           }
-          return z$1.NEVER;
+          return z.NEVER;
         }
         return result.data;
       } catch (e) {
         ctx.addIssue({
-          code: z$1.ZodIssueCode.custom,
+          code: z.ZodIssueCode.custom,
           message: `Invalid JSON: ${e instanceof Error ? e.message : "parse error"}`
         });
-        return z$1.NEVER;
+        return z.NEVER;
       }
     })
   ]);
@@ -16415,7 +16003,7 @@ function wrapSchemaForQueryParams(schema) {
       newShape[key] = fieldSchema;
     }
   }
-  return z$1.object(newShape);
+  return z.object(newShape);
 }
 function createRoute$1(config) {
   const { summary, description, tags, deprecated, requiresAuth, requiresPermission, onValidationError, ...baseRoute } = config;
@@ -16939,7 +16527,7 @@ async function getAgentFromSystem$1({
 }) {
   const logger = mastra.getLogger();
   if (!agentId) {
-    throw new HTTPException$2(400, { message: "Agent ID is required" });
+    throw new HTTPException$1(400, { message: "Agent ID is required" });
   }
   let agent;
   try {
@@ -16988,7 +16576,7 @@ async function getAgentFromSystem$1({
     }
   }
   if (!agent) {
-    throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+    throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
   }
   return agent;
 }
@@ -17127,8 +16715,8 @@ var LIST_AGENTS_ROUTE = createRoute$1({
   method: "GET",
   path: "/agents",
   responseType: "json",
-  queryParamSchema: z$1.object({
-    partial: z$1.string().optional()
+  queryParamSchema: z.object({
+    partial: z.string().optional()
   }),
   responseSchema: listAgentsResponseSchema,
   summary: "List all agents",
@@ -17262,11 +16850,11 @@ var CLONE_AGENT_ROUTE = createRoute$1({
   path: "/agents/:agentId/clone",
   responseType: "json",
   pathParamSchema: agentIdPathParams$1,
-  bodySchema: z$1.object({
-    newId: z$1.string().optional().describe("ID for the cloned agent. If not provided, derived from agent ID."),
-    newName: z$1.string().optional().describe('Name for the cloned agent. Defaults to "{name} (Clone)".'),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    authorId: z$1.string().optional()
+  bodySchema: z.object({
+    newId: z.string().optional().describe("ID for the cloned agent. If not provided, derived from agent ID."),
+    newName: z.string().optional().describe('Name for the cloned agent. Defaults to "{name} (Clone)".'),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    authorId: z.string().optional()
   }),
   responseSchema: createStoredAgentResponseSchema,
   summary: "Clone agent",
@@ -17395,7 +16983,7 @@ var GENERATE_LEGACY_ROUTE = createRoute$1({
       const effectiveThreadId = getEffectiveThreadId(requestContext, threadId);
       validateBody$1({ messages });
       if (effectiveThreadId && !effectiveResourceId || !effectiveThreadId && effectiveResourceId) {
-        throw new HTTPException$2(400, { message: "Both threadId or resourceId must be provided" });
+        throw new HTTPException$1(400, { message: "Both threadId or resourceId must be provided" });
       }
       if (effectiveThreadId) {
         const memory = await agent.getMemory({ requestContext });
@@ -17451,7 +17039,7 @@ var STREAM_GENERATE_LEGACY_ROUTE = createRoute$1({
       const effectiveThreadId = getEffectiveThreadId(requestContext, threadId);
       validateBody$1({ messages });
       if (effectiveThreadId && !effectiveResourceId || !effectiveThreadId && effectiveResourceId) {
-        throw new HTTPException$2(400, { message: "Both threadId or resourceId must be provided" });
+        throw new HTTPException$1(400, { message: "Both threadId or resourceId must be provided" });
       }
       if (effectiveThreadId) {
         const memory = await agent.getMemory({ requestContext });
@@ -17641,14 +17229,14 @@ var STREAM_GENERATE_ROUTE = createRoute$1({
     }
   }
 });
-var sendAgentSignalResponseSchema = z$1.object({
-  accepted: z$1.literal(true),
-  runId: z$1.string(),
-  signal: z$1.any().optional()
+var sendAgentSignalResponseSchema = z.object({
+  accepted: z.literal(true),
+  runId: z.string(),
+  signal: z.any().optional()
 });
 function handleSignalRoutingError(error, defaultMessage) {
   if (error instanceof MastraError$1 && error.category === ErrorCategory.USER && !error.status && !error.details?.status) {
-    throw new HTTPException$2(400, { message: error.message, cause: error });
+    throw new HTTPException$1(400, { message: error.message, cause: error });
   }
   return handleError$2(error, defaultMessage);
 }
@@ -17705,7 +17293,7 @@ var SEND_AGENT_SIGNAL_ROUTE = createRoute$1({
         }
       }
       if (typeof agent.sendSignal !== "function") {
-        throw new HTTPException$2(501, { message: "agent signals are not supported by this Mastra core version" });
+        throw new HTTPException$1(501, { message: "agent signals are not supported by this Mastra core version" });
       }
       const agentSignal = signal;
       if (runId) {
@@ -17720,7 +17308,7 @@ var SEND_AGENT_SIGNAL_ROUTE = createRoute$1({
         return result2.signal === void 0 ? { accepted: true, runId: settledRunId2 } : { accepted: true, runId: settledRunId2, signal: result2.signal };
       }
       if (!effectiveResourceId || !effectiveThreadId) {
-        throw new HTTPException$2(400, { message: "resourceId and threadId are required when runId is not provided" });
+        throw new HTTPException$1(400, { message: "resourceId and threadId are required when runId is not provided" });
       }
       const result = await agent.sendSignal(agentSignal, {
         resourceId: effectiveResourceId,
@@ -17776,7 +17364,7 @@ async function handleAgentMessageRoute({
     }
   }
   if (typeof agent[methodName] !== "function") {
-    throw new HTTPException$2(501, { message: `agent ${methodName} is not supported by this Mastra core version` });
+    throw new HTTPException$1(501, { message: `agent ${methodName} is not supported by this Mastra core version` });
   }
   if (runId) {
     const result2 = await agent[methodName](message, {
@@ -17790,7 +17378,7 @@ async function handleAgentMessageRoute({
     return result2.signal === void 0 ? { accepted: true, runId: settledRunId2 } : { accepted: true, runId: settledRunId2, signal: result2.signal };
   }
   if (!effectiveResourceId || !effectiveThreadId) {
-    throw new HTTPException$2(400, { message: "resourceId and threadId are required when runId is not provided" });
+    throw new HTTPException$1(400, { message: "resourceId and threadId are required when runId is not provided" });
   }
   const result = await agent[methodName](message, {
     resourceId: effectiveResourceId,
@@ -17858,14 +17446,14 @@ var ABORT_AGENT_THREAD_ROUTE = createRoute$1({
     try {
       const agent = await getAgentFromSystem$1({ mastra, agentId, requestContext: serverRequestContext });
       if (typeof agent.abortThreadStream !== "function") {
-        throw new HTTPException$2(501, {
+        throw new HTTPException$1(501, {
           message: "agent thread aborts are not supported by this Mastra core version"
         });
       }
       const effectiveResourceId = getEffectiveResourceId(serverRequestContext, resourceId);
       const effectiveThreadId = getEffectiveThreadId(serverRequestContext, threadId);
       if (!effectiveThreadId) {
-        throw new HTTPException$2(400, { message: "threadId is required" });
+        throw new HTTPException$1(400, { message: "threadId is required" });
       }
       if (effectiveResourceId) {
         const memory = await agent.getMemory({ requestContext: serverRequestContext });
@@ -17899,14 +17487,14 @@ var SUBSCRIBE_AGENT_THREAD_ROUTE = createRoute$1({
     try {
       const agent = await getAgentFromSystem$1({ mastra, agentId, requestContext: serverRequestContext });
       if (typeof agent.subscribeToThread !== "function") {
-        throw new HTTPException$2(501, {
+        throw new HTTPException$1(501, {
           message: "agent thread subscriptions are not supported by this Mastra core version"
         });
       }
       const effectiveResourceId = getEffectiveResourceId(serverRequestContext, resourceId);
       const effectiveThreadId = getEffectiveThreadId(serverRequestContext, threadId);
       if (!effectiveThreadId) {
-        throw new HTTPException$2(400, { message: "threadId is required" });
+        throw new HTTPException$1(400, { message: "threadId is required" });
       }
       if (effectiveResourceId) {
         const memory = await agent.getMemory({ requestContext: serverRequestContext });
@@ -18163,10 +17751,10 @@ var APPROVE_TOOL_CALL_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       if (!params.toolCallId) {
-        throw new HTTPException$2(400, { message: "Tool call id is required" });
+        throw new HTTPException$1(400, { message: "Tool call id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const streamResult = await agent.approveToolCall({
@@ -18189,7 +17777,7 @@ async function validateSubscriptionToolCallThreadAccess({
   const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
   const effectiveThreadId = getEffectiveThreadId(requestContext, threadId);
   if (!effectiveThreadId) {
-    throw new HTTPException$2(400, { message: "threadId is required" });
+    throw new HTTPException$1(400, { message: "threadId is required" });
   }
   if (effectiveResourceId) {
     const memory = await agent.getMemory({ requestContext });
@@ -18223,7 +17811,7 @@ var SEND_TOOL_APPROVAL_ROUTE = createRoute$1({
         requestContext: serverRequestContext
       });
       if (!params.toolCallId) {
-        throw new HTTPException$2(400, { message: "Tool call id is required" });
+        throw new HTTPException$1(400, { message: "Tool call id is required" });
       }
       mergeBodyRequestContext(serverRequestContext, bodyRequestContext);
       sanitizeBody(params, ["tools"]);
@@ -18268,13 +17856,13 @@ var LIST_SUSPENDED_RUNS_ROUTE = createRoute$1({
       if (effectiveThreadId) {
         const memory = await agent.getMemory({ requestContext });
         if (!memory) {
-          throw new HTTPException$2(403, {
+          throw new HTTPException$1(403, {
             message: "Access denied: agent has no memory configured to validate thread ownership"
           });
         }
         const thread = await memory.getThreadById({ threadId: effectiveThreadId });
         if (!thread) {
-          throw new HTTPException$2(403, { message: "Access denied: thread not found" });
+          throw new HTTPException$1(403, { message: "Access denied: thread not found" });
         }
         await enforceThreadAccess({
           mastra,
@@ -18317,10 +17905,10 @@ var DECLINE_TOOL_CALL_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       if (!params.toolCallId) {
-        throw new HTTPException$2(400, { message: "Tool call id is required" });
+        throw new HTTPException$1(400, { message: "Tool call id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const streamResult = await agent.declineToolCall({
@@ -18350,7 +17938,7 @@ var RESUME_STREAM_ROUTE = createRoute$1({
   handler: async ({ mastra, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const {
@@ -18439,7 +18027,7 @@ var RECOVER_ROUTE = createRoute$1({
   handler: async ({ mastra, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       const { runId, versions } = params;
       const bodyRequestContext = params.requestContext;
@@ -18456,7 +18044,7 @@ var RECOVER_ROUTE = createRoute$1({
         versionOptions
       });
       if (typeof agent.recover !== "function") {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Agent does not support recover. Only durable agents (createDurableAgent) can recover runs."
         });
       }
@@ -18491,7 +18079,7 @@ var RESUME_STREAM_UNTIL_IDLE_ROUTE = createRoute$1({
   handler: async ({ mastra, agentId, abortSignal, requestContext: serverRequestContext, ...params }) => {
     try {
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const {
@@ -18586,10 +18174,10 @@ var APPROVE_TOOL_CALL_GENERATE_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       if (!params.toolCallId) {
-        throw new HTTPException$2(400, { message: "Tool call id is required" });
+        throw new HTTPException$1(400, { message: "Tool call id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const result = await agent.approveToolCallGenerate({
@@ -18622,10 +18210,10 @@ var DECLINE_TOOL_CALL_GENERATE_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       if (!params.toolCallId) {
-        throw new HTTPException$2(400, { message: "Tool call id is required" });
+        throw new HTTPException$1(400, { message: "Tool call id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const result = await agent.declineToolCallGenerate({
@@ -18689,7 +18277,7 @@ var APPROVE_NETWORK_TOOL_CALL_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const streamResult = await agent.approveNetworkToolCall({
@@ -18721,7 +18309,7 @@ var DECLINE_NETWORK_TOOL_CALL_ROUTE = createRoute$1({
         versionOptions: extractVersionOptions(requestContext)
       });
       if (!params.runId) {
-        throw new HTTPException$2(400, { message: "Run id is required" });
+        throw new HTTPException$1(400, { message: "Run id is required" });
       }
       sanitizeBody(params, ["tools"]);
       const streamResult = await agent.declineNetworkToolCall({
@@ -18791,7 +18379,7 @@ var REORDER_AGENT_MODEL_LIST_ROUTE = createRoute$1({
       const agent = await getAgentFromSystem$1({ mastra, agentId });
       const modelList = await agent.getModelList();
       if (!modelList || modelList.length === 0) {
-        throw new HTTPException$2(400, { message: "Agent model list is not found or empty" });
+        throw new HTTPException$1(400, { message: "Agent model list is not found or empty" });
       }
       agent.reorderModels(reorderedModelIds);
       return { message: "Model list reordered" };
@@ -18816,11 +18404,11 @@ var UPDATE_AGENT_MODEL_IN_MODEL_LIST_ROUTE = createRoute$1({
       const agent = await getAgentFromSystem$1({ mastra, agentId });
       const modelList = await agent.getModelList();
       if (!modelList || modelList.length === 0) {
-        throw new HTTPException$2(400, { message: "Agent model list is not found or empty" });
+        throw new HTTPException$1(400, { message: "Agent model list is not found or empty" });
       }
       const modelConfig = modelList.find((config) => config.id === modelConfigId);
       if (!modelConfig) {
-        throw new HTTPException$2(404, { message: `Model config with id ${modelConfigId} not found` });
+        throw new HTTPException$1(404, { message: `Model config with id ${modelConfigId} not found` });
       }
       const newModel = bodyModel?.modelId && bodyModel?.provider ? `${bodyModel.provider}/${bodyModel.modelId}` : modelConfig.model;
       const updated = {
@@ -18919,7 +18507,7 @@ var ENHANCE_INSTRUCTIONS_ROUTE = createRoute$1({
       const agent = await getAgentFromSystem$1({ mastra, agentId });
       const model = await findConnectedModel(agent);
       if (!model) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "No model with a configured API key found. Please set the required environment variable for your model provider."
         });
       }
@@ -18958,7 +18546,7 @@ var STREAM_VNEXT_DEPRECATED_ROUTE = createRoute$1({
   requiresAuth: true,
   deprecated: true,
   handler: async () => {
-    throw new HTTPException$2(410, { message: "This endpoint is deprecated. Please use /stream instead." });
+    throw new HTTPException$1(410, { message: "This endpoint is deprecated. Please use /stream instead." });
   }
 });
 var STREAM_UI_MESSAGE_VNEXT_DEPRECATED_ROUTE = createRoute$1({
@@ -19014,12 +18602,12 @@ var GET_AGENT_SKILL_ROUTE = createRoute$1({
     try {
       const agent = agentId ? mastra.getAgentById(agentId) : null;
       if (!agent) {
-        throw new HTTPException$2(404, { message: "Agent not found" });
+        throw new HTTPException$1(404, { message: "Agent not found" });
       }
       const identifier = path ? decodeURIComponent(path) : skillName;
       const skill = await agent.getSkill(identifier, { requestContext });
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Skill "${identifier}" not found` });
+        throw new HTTPException$1(404, { message: `Skill "${identifier}" not found` });
       }
       return {
         name: skill.name,
@@ -19074,7 +18662,7 @@ async function isBuilderFeatureEnabled(mastra, feature) {
 }
 async function requireBuilderFeature(mastra, feature) {
   if (!await isBuilderFeatureEnabled(mastra, feature)) {
-    throw new HTTPException$2(404, { message: "Not Found" });
+    throw new HTTPException$1(404, { message: "Not Found" });
   }
 }
 var GET_EDITOR_BUILDER_SETTINGS_ROUTE = createRoute$1({
@@ -19398,7 +18986,7 @@ function assertReadAccess(args) {
   if (hasScopedPermission({ requestContext, resource, action: "read", resourceId })) {
     return;
   }
-  throw new HTTPException$2(404, { message: "Not found" });
+  throw new HTTPException$1(404, { message: "Not found" });
 }
 function assertWriteAccess(args) {
   const { requestContext, resource, resourceId, action, record } = args;
@@ -19411,7 +18999,7 @@ function assertWriteAccess(args) {
   if (hasScopedPermission({ requestContext, resource, action, resourceId })) {
     return;
   }
-  throw new HTTPException$2(404, { message: "Not found" });
+  throw new HTTPException$1(404, { message: "Not found" });
 }
 
 // src/server/handlers/favorites-enrichment.ts
@@ -19499,11 +19087,11 @@ var LIST_STORED_SKILLS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const filter = resolveAuthorFilter({
         requestContext,
@@ -19524,7 +19112,7 @@ var LIST_STORED_SKILLS_ROUTE = createRoute$1({
         }
         const favoritesStore = await storage.getStore("favorites");
         if (!favoritesStore) {
-          throw new HTTPException$2(500, { message: "Favorites storage domain is not available" });
+          throw new HTTPException$1(500, { message: "Favorites storage domain is not available" });
         }
         const starredIds = await favoritesStore.listFavoritedIds({ userId: favoriteSubjectId, entityType: "skill" });
         if (starredIds.length === 0) {
@@ -19592,15 +19180,15 @@ var GET_STORED_SKILL_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const skill = await skillStore.getByIdResolved(storedSkillId);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       assertStoredResourceScope(skill, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-skills", resourceId: storedSkillId, record: skill });
@@ -19640,21 +19228,21 @@ var CREATE_STORED_SKILL_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive skill ID from name. Please provide an explicit id."
         });
       }
       const existing = await skillStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `Skill with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `Skill with id ${id} already exists` });
       }
       const authorId = getCallerAuthorId(requestContext) ?? void 0;
       const visibility = authorId ? bodyVisibility ?? "private" : "public";
@@ -19679,7 +19267,7 @@ var CREATE_STORED_SKILL_ROUTE = createRoute$1({
       });
       const resolved = await skillStore.getByIdResolved(id);
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created skill" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created skill" });
       }
       return enrichOrStripFavorites(mastra, requestContext, "skill", resolved);
     } catch (error) {
@@ -19721,15 +19309,15 @@ var UPDATE_STORED_SKILL_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const existing = await skillStore.getByIdResolved(storedSkillId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -19765,7 +19353,7 @@ var UPDATE_STORED_SKILL_ROUTE = createRoute$1({
       await skillStore.update(update);
       const resolved = await skillStore.getByIdResolved(storedSkillId);
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated skill" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated skill" });
       }
       return enrichOrStripFavorites(mastra, requestContext, "skill", resolved);
     } catch (error) {
@@ -19787,15 +19375,15 @@ var DELETE_STORED_SKILL_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const existing = await skillStore.getByIdResolved(storedSkillId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       assertWriteAccess({
@@ -19836,19 +19424,19 @@ var PUBLISH_STORED_SKILL_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const blobStore = await storage.getStore("blobs");
       if (!blobStore) {
-        throw new HTTPException$2(500, { message: "Blob storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Blob storage domain is not available" });
       }
       const existing = await skillStore.getByIdResolved(storedSkillId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       assertWriteAccess({
@@ -19863,19 +19451,19 @@ var PUBLISH_STORED_SKILL_ROUTE = createRoute$1({
       const resolvedPath = path.default.resolve(skillPath);
       const allowedBase = path.default.resolve(process.env.SKILLS_BASE_DIR || process.cwd());
       if (!resolvedPath.startsWith(allowedBase + path.default.sep) && resolvedPath !== allowedBase) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `skillPath must be within the allowed directory: ${allowedBase}`
         });
       }
       try {
         const stat = await fs.stat(resolvedPath);
         if (!stat.isDirectory()) {
-          throw new HTTPException$2(400, { message: `skillPath is not a directory: ${resolvedPath}` });
+          throw new HTTPException$1(400, { message: `skillPath is not a directory: ${resolvedPath}` });
         }
       } catch (err) {
-        if (err instanceof HTTPException$2) throw err;
+        if (err instanceof HTTPException$1) throw err;
         if (err?.code === "ENOENT") {
-          throw new HTTPException$2(400, {
+          throw new HTTPException$1(400, {
             message: `skillPath does not exist on the server filesystem: ${resolvedPath}. Create the skill directory (with a SKILL.md) before publishing, or use a skill that was materialized to disk.`
           });
         }
@@ -19885,7 +19473,7 @@ var PUBLISH_STORED_SKILL_ROUTE = createRoute$1({
         await fs.stat(path.default.join(resolvedPath, "SKILL.md"));
       } catch (err) {
         if (err?.code === "ENOENT") {
-          throw new HTTPException$2(400, {
+          throw new HTTPException$1(400, {
             message: `skillPath is missing SKILL.md: ${resolvedPath}`
           });
         }
@@ -19914,7 +19502,7 @@ var PUBLISH_STORED_SKILL_ROUTE = createRoute$1({
       }
       const resolved = await skillStore.getByIdResolved(storedSkillId);
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve skill after publish" });
+        throw new HTTPException$1(500, { message: "Failed to resolve skill after publish" });
       }
       return enrichOrStripFavorites(mastra, requestContext, "skill", resolved);
     } catch (error) {
@@ -19938,11 +19526,11 @@ var LIST_STORED_WORKSPACES_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const workspaceStore = await storage.getStore("workspaces");
       if (!workspaceStore) {
-        throw new HTTPException$2(500, { message: "Workspaces storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Workspaces storage domain is not available" });
       }
       const filter = resolveAuthorFilter({
         requestContext,
@@ -19983,15 +19571,15 @@ var GET_STORED_WORKSPACE_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const workspaceStore = await storage.getStore("workspaces");
       if (!workspaceStore) {
-        throw new HTTPException$2(500, { message: "Workspaces storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Workspaces storage domain is not available" });
       }
       const workspace = await workspaceStore.getByIdResolved(storedWorkspaceId);
       if (!workspace) {
-        throw new HTTPException$2(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
+        throw new HTTPException$1(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
       }
       assertStoredResourceScope(workspace, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({
@@ -20035,21 +19623,21 @@ var CREATE_STORED_WORKSPACE_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const workspaceStore = await storage.getStore("workspaces");
       if (!workspaceStore) {
-        throw new HTTPException$2(500, { message: "Workspaces storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Workspaces storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive workspace ID from name. Please provide an explicit id."
         });
       }
       const existing = await workspaceStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `Workspace with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `Workspace with id ${id} already exists` });
       }
       const authorId = getCallerAuthorId(requestContext) ?? void 0;
       await workspaceStore.create({
@@ -20071,7 +19659,7 @@ var CREATE_STORED_WORKSPACE_ROUTE = createRoute$1({
       });
       const resolved = await workspaceStore.getByIdResolved(id);
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created workspace" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created workspace" });
       }
       return resolved;
     } catch (error) {
@@ -20111,15 +19699,15 @@ var UPDATE_STORED_WORKSPACE_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const workspaceStore = await storage.getStore("workspaces");
       if (!workspaceStore) {
-        throw new HTTPException$2(500, { message: "Workspaces storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Workspaces storage domain is not available" });
       }
       const existing = await workspaceStore.getById(storedWorkspaceId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
+        throw new HTTPException$1(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -20151,7 +19739,7 @@ var UPDATE_STORED_WORKSPACE_ROUTE = createRoute$1({
       await workspaceStore.update(updateInput);
       const resolved = await workspaceStore.getByIdResolved(storedWorkspaceId);
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated workspace" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated workspace" });
       }
       return resolved;
     } catch (error) {
@@ -20173,15 +19761,15 @@ var DELETE_STORED_WORKSPACE_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const workspaceStore = await storage.getStore("workspaces");
       if (!workspaceStore) {
-        throw new HTTPException$2(500, { message: "Workspaces storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Workspaces storage domain is not available" });
       }
       const existing = await workspaceStore.getById(storedWorkspaceId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
+        throw new HTTPException$1(404, { message: `Stored workspace with id ${storedWorkspaceId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       assertWriteAccess({
@@ -20203,32 +19791,32 @@ var DELETE_STORED_WORKSPACE_ROUTE = createRoute$1({
 });
 
 // src/server/schemas/system.ts
-var mastraPackageSchema = z$1.object({
-  name: z$1.string(),
-  version: z$1.string()
+var mastraPackageSchema = z.object({
+  name: z.string(),
+  version: z.string()
 });
-var observabilityRuntimeStrategySchema = z$1.enum([
+var observabilityRuntimeStrategySchema = z.enum([
   "realtime",
   "batch-with-updates",
   "insert-only",
   "event-sourced"
 ]);
-var editorSourceSchema = z$1.enum(["code", "db"]);
-var editorSourceCapabilitiesSchema = z$1.object({
+var editorSourceSchema = z.enum(["code", "db"]);
+var editorSourceCapabilitiesSchema = z.object({
   source: editorSourceSchema,
-  storage: z$1.enum(["database", "filesystem", "source-provider", "unavailable"]),
-  provider: z$1.object({
-    id: z$1.string(),
-    displayName: z$1.string()
+  storage: z.enum(["database", "filesystem", "source-provider", "unavailable"]),
+  provider: z.object({
+    id: z.string(),
+    displayName: z.string()
   }).optional(),
-  canSave: z$1.boolean(),
-  canOpenChangeRequest: z$1.boolean(),
-  unavailableReason: z$1.string().optional()
+  canSave: z.boolean(),
+  canOpenChangeRequest: z.boolean(),
+  unavailableReason: z.string().optional()
 });
-var systemPackagesResponseSchema = z$1.object({
-  packages: z$1.array(mastraPackageSchema),
-  isDev: z$1.boolean(),
-  cmsEnabled: z$1.boolean(),
+var systemPackagesResponseSchema = z.object({
+  packages: z.array(mastraPackageSchema),
+  isDev: z.boolean(),
+  cmsEnabled: z.boolean(),
   /**
    * The editor's configured source, when set. `'code'` swaps Studio's
    * Save/Publish UI for Download JSON + Open PR. `'db'` keeps the standard
@@ -20236,30 +19824,30 @@ var systemPackagesResponseSchema = z$1.object({
    */
   editorSource: editorSourceSchema.optional(),
   editorSourceCapabilities: editorSourceCapabilitiesSchema.optional(),
-  observabilityEnabled: z$1.boolean(),
-  storageType: z$1.string().optional(),
-  observabilityStorageType: z$1.string().optional(),
+  observabilityEnabled: z.boolean(),
+  storageType: z.string().optional(),
+  observabilityStorageType: z.string().optional(),
   observabilityRuntimeStrategy: observabilityRuntimeStrategySchema.optional()
 });
-var jsonSchemaRecordSchema = z$1.record(z$1.string(), z$1.unknown());
-var apiSchemaResponseShapeSchema = z$1.object({
-  kind: z$1.enum(["array", "record", "object-property", "single", "unknown"]),
-  listProperty: z$1.string().optional(),
-  paginationProperty: z$1.string().optional()
+var jsonSchemaRecordSchema = z.record(z.string(), z.unknown());
+var apiSchemaResponseShapeSchema = z.object({
+  kind: z.enum(["array", "record", "object-property", "single", "unknown"]),
+  listProperty: z.string().optional(),
+  paginationProperty: z.string().optional()
 });
-var apiSchemaManifestRouteSchema = z$1.object({
-  method: z$1.string(),
-  path: z$1.string(),
-  responseType: z$1.string(),
+var apiSchemaManifestRouteSchema = z.object({
+  method: z.string(),
+  path: z.string(),
+  responseType: z.string(),
   pathParamSchema: jsonSchemaRecordSchema.optional(),
   queryParamSchema: jsonSchemaRecordSchema.optional(),
   bodySchema: jsonSchemaRecordSchema.optional(),
   responseSchema: jsonSchemaRecordSchema.optional(),
   responseShape: apiSchemaResponseShapeSchema
 });
-var apiSchemaManifestResponseSchema = z$1.object({
-  version: z$1.literal(1),
-  routes: z$1.array(apiSchemaManifestRouteSchema)
+var apiSchemaManifestResponseSchema = z.object({
+  version: z.literal(1),
+  routes: z.array(apiSchemaManifestRouteSchema)
 });
 
 var SOURCE_PROVIDER_CAPABILITIES_TIMEOUT_MS = 3e3;
@@ -20419,7 +20007,7 @@ async function loadToolProviderModule() {
 }
 function requireEditor(editor) {
   if (!editor) {
-    throw new HTTPException$2(500, { message: "Editor is not configured" });
+    throw new HTTPException$1(500, { message: "Editor is not configured" });
   }
   return editor;
 }
@@ -20429,7 +20017,7 @@ async function resolveProvider(editor, providerId) {
   } catch (error) {
     const { UnknownToolProviderError } = await loadToolProviderModule();
     if (error instanceof UnknownToolProviderError) {
-      throw new HTTPException$2(404, { message: error.message });
+      throw new HTTPException$1(404, { message: error.message });
     }
     throw error;
   }
@@ -20552,11 +20140,11 @@ var GET_TOOL_PROVIDER_TOOL_SCHEMA_ROUTE = createRoute$1({
       const editor = requireEditor(mastra.getEditor());
       const provider = await resolveProvider(editor, providerId);
       if (!provider.getToolSchema) {
-        throw new HTTPException$2(404, { message: `Tool provider ${providerId} does not support getToolSchema` });
+        throw new HTTPException$1(404, { message: `Tool provider ${providerId} does not support getToolSchema` });
       }
       const schema = await provider.getToolSchema(toolSlug);
       if (!schema) {
-        throw new HTTPException$2(404, { message: `Schema for tool ${toolSlug} not found in provider ${providerId}` });
+        throw new HTTPException$1(404, { message: `Schema for tool ${toolSlug} not found in provider ${providerId}` });
       }
       return schema;
     } catch (error) {
@@ -20580,14 +20168,14 @@ var AUTHORIZE_TOOL_PROVIDER_ROUTE = createRoute$1({
       const editor = requireEditor(mastra.getEditor());
       const provider = await resolveProvider(editor, providerId);
       if (!provider.authorize) {
-        throw new HTTPException$2(400, { message: `Tool provider ${providerId} does not support authorize` });
+        throw new HTTPException$1(400, { message: `Tool provider ${providerId} does not support authorize` });
       }
       const requestedScope = scope ?? provider.defaultScope;
       const effectiveScope = requestedScope === "shared" || requestedScope === "caller-supplied" ? requestedScope : "per-author";
       const callerResourceId = requestContext?.get(MASTRA_RESOURCE_ID_KEY$1);
       if (effectiveScope === "caller-supplied") {
         if (typeof callerResourceId !== "string" || callerResourceId.length === 0) {
-          throw new HTTPException$2(400, {
+          throw new HTTPException$1(400, {
             message: `Cannot authorize caller-supplied connection: request context has no '${MASTRA_RESOURCE_ID_KEY$1}'. Set requestContext.set('${MASTRA_RESOURCE_ID_KEY$1}', <userId>) before calling /authorize.`
           });
         }
@@ -20639,7 +20227,7 @@ var GET_TOOL_PROVIDER_AUTH_STATUS_ROUTE = createRoute$1({
       const editor = requireEditor(mastra.getEditor());
       const provider = await resolveProvider(editor, providerId);
       if (!provider.getAuthStatus) {
-        throw new HTTPException$2(400, { message: `Tool provider ${providerId} does not support getAuthStatus` });
+        throw new HTTPException$1(400, { message: `Tool provider ${providerId} does not support getAuthStatus` });
       }
       const status = await provider.getAuthStatus(authId);
       return { status };
@@ -20664,7 +20252,7 @@ var TOOL_PROVIDER_CONNECTION_STATUS_ROUTE = createRoute$1({
       const editor = requireEditor(mastra.getEditor());
       const provider = await resolveProvider(editor, providerId);
       if (!provider.getConnectionStatus) {
-        throw new HTTPException$2(400, { message: `Tool provider ${providerId} does not support getConnectionStatus` });
+        throw new HTTPException$1(400, { message: `Tool provider ${providerId} does not support getConnectionStatus` });
       }
       const result = await provider.getConnectionStatus({ items });
       return { items: result };
@@ -20698,7 +20286,7 @@ var LIST_TOOL_PROVIDER_CONNECTIONS_ROUTE = createRoute$1({
       const editor = requireEditor(mastra.getEditor());
       const provider = await resolveProvider(editor, providerId);
       if (!provider.listConnections) {
-        throw new HTTPException$2(400, { message: `Tool provider ${providerId} does not support listConnections` });
+        throw new HTTPException$1(400, { message: `Tool provider ${providerId} does not support listConnections` });
       }
       const callerAuthorId = resolveOwnerId(requestContext, mastra.getLogger());
       const isAdmin = requestContext ? hasAdminBypass(requestContext, TOOL_PROVIDERS_RESOURCE) : false;
@@ -20838,21 +20426,21 @@ var DISCONNECT_TOOL_PROVIDER_CONNECTION_ROUTE = createRoute$1({
         }
       }
       if (store && !matched && !isAdmin) {
-        throw new HTTPException$2(403, {
+        throw new HTTPException$1(403, {
           message: "You do not have permission to disconnect this connection"
         });
       }
       const effectiveOwner = ownerAuthorId ?? callerAuthorId;
       const isShared = ownerScope === "shared";
       if (!isShared && effectiveOwner !== callerAuthorId && !isAdmin) {
-        throw new HTTPException$2(403, {
+        throw new HTTPException$1(403, {
           message: "You do not have permission to disconnect this connection"
         });
       }
       if (!isForce) {
         const usage = await countConnectionUsage(mastra, connectionId);
         if (usage > 0) {
-          throw new HTTPException$2(409, {
+          throw new HTTPException$1(409, {
             message: `Connection ${connectionId} is still pinned by ${usage} agent(s). Pass ?force=true to disconnect anyway.`
           });
         }
@@ -20895,20 +20483,20 @@ var UPDATE_TOOL_PROVIDER_CONNECTION_ROUTE = createRoute$1({
       const storage = mastra.getStorage();
       const store = await storage?.getStore("toolProviderConnections");
       if (!store) {
-        throw new HTTPException$2(500, {
+        throw new HTTPException$1(500, {
           message: "Tool provider connections storage is not configured"
         });
       }
       const rows = await store.listConnectionsByAuthor({ providerId: provider.info.id });
       const match = rows.find((r) => r.connectionId === connectionId);
       if (!match) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Connection ${connectionId} not found for provider ${providerId}`
         });
       }
       const isShared = match.scope === "shared";
       if (!isShared && match.authorId !== callerAuthorId && !isAdmin) {
-        throw new HTTPException$2(403, {
+        throw new HTTPException$1(403, {
           message: "You do not have permission to update this connection"
         });
       }
@@ -20959,14 +20547,14 @@ var GET_TOOL_PROVIDER_CONNECTION_USAGE_ROUTE = createRoute$1({
         }
       }
       if (store && !matched && !isAdmin) {
-        throw new HTTPException$2(403, {
+        throw new HTTPException$1(403, {
           message: "You do not have permission to view usage for this connection"
         });
       }
       const effectiveOwner = ownerAuthorId ?? callerAuthorId;
       const isShared = ownerScope === "shared";
       if (!isShared && effectiveOwner !== callerAuthorId && !isAdmin) {
-        throw new HTTPException$2(403, {
+        throw new HTTPException$1(403, {
           message: "You do not have permission to view usage for this connection"
         });
       }
@@ -21043,24 +20631,24 @@ async function countConnectionUsage(mastra, connectionId) {
 }
 
 // src/server/schemas/favorites.ts
-var favoriteToggleResponseSchema = z$1.object({
-  favorited: z$1.boolean().describe("Whether the entity is currently favorited by the caller"),
-  favoriteCount: z$1.number().int().nonnegative().describe("Total number of users who have favorited this entity")
+var favoriteToggleResponseSchema = z.object({
+  favorited: z.boolean().describe("Whether the entity is currently favorited by the caller"),
+  favoriteCount: z.number().int().nonnegative().describe("Total number of users who have favorited this entity")
 });
 
 // src/server/handlers/stored-agent-favorites.ts
 async function getFavoritesContext$1(mastra) {
   const storage = mastra.getStorage();
   if (!storage) {
-    throw new HTTPException$2(500, { message: "Storage is not configured" });
+    throw new HTTPException$1(500, { message: "Storage is not configured" });
   }
   const agentStore = await storage.getStore("agents");
   if (!agentStore) {
-    throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
   }
   const favoritesStore = await storage.getStore("favorites");
   if (!favoritesStore) {
-    throw new HTTPException$2(500, { message: "Favorites storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Favorites storage domain is not available" });
   }
   return { agentStore, favoritesStore };
 }
@@ -21080,12 +20668,12 @@ var FAVORITE_STORED_AGENT_ROUTE = createRoute$1({
       await requireBuilderFeature(mastra, "favorites");
       const callerId = getCallerAuthorId(requestContext);
       if (!callerId) {
-        throw new HTTPException$2(401, { message: "Authentication required" });
+        throw new HTTPException$1(401, { message: "Authentication required" });
       }
       const { agentStore, favoritesStore } = await getFavoritesContext$1(mastra);
       const agent = await agentStore.getById(storedAgentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-agents", resourceId: storedAgentId, record: agent });
@@ -21116,12 +20704,12 @@ var UNFAVORITE_STORED_AGENT_ROUTE = createRoute$1({
       await requireBuilderFeature(mastra, "favorites");
       const callerId = getCallerAuthorId(requestContext);
       if (!callerId) {
-        throw new HTTPException$2(401, { message: "Authentication required" });
+        throw new HTTPException$1(401, { message: "Authentication required" });
       }
       const { agentStore, favoritesStore } = await getFavoritesContext$1(mastra);
       const agent = await agentStore.getById(storedAgentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-agents", resourceId: storedAgentId, record: agent });
@@ -21143,26 +20731,26 @@ function validateMetadataAvatarUrl(metadata) {
   if (!metadata || !("avatarUrl" in metadata) || metadata.avatarUrl === null || metadata.avatarUrl === void 0)
     return;
   if (typeof metadata.avatarUrl !== "string") {
-    throw new HTTPException$2(400, { message: "metadata.avatarUrl must be a string" });
+    throw new HTTPException$1(400, { message: "metadata.avatarUrl must be a string" });
   }
   const dataUrl = metadata.avatarUrl;
   const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
   if (!match) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: "metadata.avatarUrl must be a valid data URL (data:<mime>;base64,<data>)"
     });
   }
   const base64Payload = match[2];
   const isStrictBase64 = base64Payload.length > 0 && base64Payload.length % 4 === 0 && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(base64Payload);
   if (!isStrictBase64) {
-    throw new HTTPException$2(400, { message: "metadata.avatarUrl contains invalid base64" });
+    throw new HTTPException$1(400, { message: "metadata.avatarUrl contains invalid base64" });
   }
   const byteLength = Buffer.from(base64Payload, "base64").byteLength;
   if (byteLength === 0) {
-    throw new HTTPException$2(400, { message: "metadata.avatarUrl is empty" });
+    throw new HTTPException$1(400, { message: "metadata.avatarUrl is empty" });
   }
   if (byteLength > AVATAR_MAX_BYTES) {
-    throw new HTTPException$2(413, {
+    throw new HTTPException$1(413, {
       message: `metadata.avatarUrl exceeds ${AVATAR_MAX_BYTES}-byte limit (got ${byteLength})`
     });
   }
@@ -21465,7 +21053,7 @@ function hasNonEmptyInstructions(value) {
 }
 function assertOwnedInstructionsNotEmpty(instructions) {
   if (!hasNonEmptyInstructions(instructions)) {
-    throw new HTTPException$2(400, { message: "Instructions are required" });
+    throw new HTTPException$1(400, { message: "Instructions are required" });
   }
 }
 function sortForStableJson(value) {
@@ -21536,11 +21124,11 @@ var LIST_STORED_AGENTS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const filter = resolveAuthorFilter({
         requestContext,
@@ -21561,7 +21149,7 @@ var LIST_STORED_AGENTS_ROUTE = createRoute$1({
         }
         const favoritesStore = await storage.getStore("favorites");
         if (!favoritesStore) {
-          throw new HTTPException$2(500, { message: "Favorites storage domain is not available" });
+          throw new HTTPException$1(500, { message: "Favorites storage domain is not available" });
         }
         const starredIds = await favoritesStore.listFavoritedIds({ userId: favoriteSubjectId, entityType: "agent" });
         if (starredIds.length === 0) {
@@ -21643,7 +21231,7 @@ async function buildStoredAgentExport({
     codeAgent = void 0;
   }
   if (!storedAgent && !codeAgent) {
-    throw new HTTPException$2(404, { message: `Agent with id ${storedAgentId} not found` });
+    throw new HTTPException$1(404, { message: `Agent with id ${storedAgentId} not found` });
   }
   const config = buildExportConfig(body, codeAgent);
   const content = `${JSON.stringify(config, null, 2)}
@@ -21689,7 +21277,7 @@ var OPEN_STORED_AGENT_CHANGE_REQUEST_ROUTE = createRoute$1({
     try {
       const provider = mastra.getEditor?.()?.getSourceControlProvider?.();
       if (!provider?.openChangeRequest) {
-        throw new HTTPException$2(400, { message: "Source control provider cannot open change requests" });
+        throw new HTTPException$1(400, { message: "Source control provider cannot open change requests" });
       }
       const openChangeRequest = provider.openChangeRequest.bind(provider);
       const { changeMessage, userName, inspectOnly, ...exportBody } = body;
@@ -21740,15 +21328,15 @@ var GET_STORED_AGENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getByIdResolved(storedAgentId, { status });
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-agents", resourceId: storedAgentId, record: agent });
@@ -21799,21 +21387,21 @@ var CREATE_STORED_AGENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive agent ID from name. Please provide an explicit id."
         });
       }
       const existing = await agentsStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `Agent with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `Agent with id ${id} already exists` });
       }
       const authorId = getCallerAuthorId(requestContext) ?? void 0;
       const visibility = authorId ? bodyVisibility ?? "private" : "public";
@@ -21885,7 +21473,7 @@ var CREATE_STORED_AGENT_ROUTE = createRoute$1({
       }
       const resolved = await agentsStore.getByIdResolved(id, { status: "published" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created agent" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created agent" });
       }
       return enrichOrStripFavorites(mastra, requestContext, "agent", resolved);
     } catch (error) {
@@ -21938,15 +21526,15 @@ var UPDATE_STORED_AGENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const existing = await agentsStore.getById(storedAgentId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -22068,7 +21656,7 @@ var UPDATE_STORED_AGENT_ROUTE = createRoute$1({
       }
       const resolved = await agentsStore.getByIdResolved(storedAgentId, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated agent" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated agent" });
       }
       return enrichOrStripFavorites(mastra, requestContext, "agent", resolved);
     } catch (error) {
@@ -22090,15 +21678,15 @@ var DELETE_STORED_AGENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const existing = await agentsStore.getById(storedAgentId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       assertWriteAccess({
@@ -22136,15 +21724,15 @@ var GET_STORED_AGENT_DEPENDENTS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const target = await agentsStore.getById(storedAgentId);
       if (!target) {
-        throw new HTTPException$2(404, { message: `Stored agent with id ${storedAgentId} not found` });
+        throw new HTTPException$1(404, { message: `Stored agent with id ${storedAgentId} not found` });
       }
       assertStoredResourceScope(target, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-agents", resourceId: storedAgentId, record: target });
@@ -22201,7 +21789,7 @@ var PREVIEW_INSTRUCTIONS_ROUTE = createRoute$1({
     try {
       const editor = mastra.getEditor();
       if (!editor) {
-        throw new HTTPException$2(500, { message: "Editor is not configured" });
+        throw new HTTPException$1(500, { message: "Editor is not configured" });
       }
       const result = await editor.prompt.preview(blocks, context ?? {});
       return { result };
@@ -22211,73 +21799,73 @@ var PREVIEW_INSTRUCTIONS_ROUTE = createRoute$1({
   }
 });
 
-var storedMCPClientIdPathParams = z$1.object({
-  storedMCPClientId: z$1.string().describe("Unique identifier for the stored MCP client")
+var storedMCPClientIdPathParams = z.object({
+  storedMCPClientId: z.string().describe("Unique identifier for the stored MCP client")
 });
-var storageOrderBySchema$3 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$3 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredMCPClientsQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$3.optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter MCP clients by status (defaults to published)"),
-  authorId: z$1.string().optional().describe("Filter MCP clients by author identifier"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter MCP clients by metadata key-value pairs")
+  status: z.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter MCP clients by status (defaults to published)"),
+  authorId: z.string().optional().describe("Filter MCP clients by author identifier"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter MCP clients by metadata key-value pairs")
 });
-var mcpServerConfigSchema$1 = z$1.object({
-  type: z$1.enum(["stdio", "http"]).describe("Transport type: stdio for local processes, http for remote servers"),
-  command: z$1.string().optional().describe("Command to run (stdio only)"),
-  args: z$1.array(z$1.string()).optional().describe("Command arguments (stdio only)"),
-  env: z$1.record(z$1.string(), z$1.string()).optional().describe("Environment variables (stdio only)"),
-  url: z$1.string().optional().describe("Server URL (http only)"),
-  timeout: z$1.number().optional().describe("Connection timeout in milliseconds")
+var mcpServerConfigSchema$1 = z.object({
+  type: z.enum(["stdio", "http"]).describe("Transport type: stdio for local processes, http for remote servers"),
+  command: z.string().optional().describe("Command to run (stdio only)"),
+  args: z.array(z.string()).optional().describe("Command arguments (stdio only)"),
+  env: z.record(z.string(), z.string()).optional().describe("Environment variables (stdio only)"),
+  url: z.string().optional().describe("Server URL (http only)"),
+  timeout: z.number().optional().describe("Connection timeout in milliseconds")
 });
-var snapshotConfigSchema$2 = z$1.object({
-  name: z$1.string().describe("Name of the MCP client"),
-  description: z$1.string().optional().describe("Description of the MCP client"),
-  servers: z$1.record(z$1.string(), mcpServerConfigSchema$1).describe("Map of server name to server configuration")
+var snapshotConfigSchema$2 = z.object({
+  name: z.string().describe("Name of the MCP client"),
+  description: z.string().optional().describe("Description of the MCP client"),
+  servers: z.record(z.string(), mcpServerConfigSchema$1).describe("Map of server name to server configuration")
 });
-var createStoredMCPClientBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the MCP client")
+var createStoredMCPClientBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the MCP client")
 }).merge(snapshotConfigSchema$2);
-var updateStoredMCPClientBodySchema = z$1.object({
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var updateStoredMCPClientBodySchema = z.object({
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 }).partial().merge(snapshotConfigSchema$2.partial());
-var storedMCPClientSchema = z$1.object({
-  id: z$1.string(),
-  status: z$1.string().describe("MCP client status: draft, published, or archived"),
-  activeVersionId: z$1.string().optional(),
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
-  name: z$1.string().describe("Name of the MCP client"),
-  description: z$1.string().optional().describe("Description of the MCP client"),
-  servers: z$1.record(z$1.string(), mcpServerConfigSchema$1).describe("Map of server name to server configuration")
+var storedMCPClientSchema = z.object({
+  id: z.string(),
+  status: z.string().describe("MCP client status: draft, published, or archived"),
+  activeVersionId: z.string().optional(),
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  name: z.string().describe("Name of the MCP client"),
+  description: z.string().optional().describe("Description of the MCP client"),
+  servers: z.record(z.string(), mcpServerConfigSchema$1).describe("Map of server name to server configuration")
 });
 var listStoredMCPClientsResponseSchema = paginationInfoSchema$1.extend({
-  mcpClients: z$1.array(storedMCPClientSchema)
+  mcpClients: z.array(storedMCPClientSchema)
 });
 var getStoredMCPClientResponseSchema = storedMCPClientSchema;
 var createStoredMCPClientResponseSchema = storedMCPClientSchema;
-var updateStoredMCPClientResponseSchema = z$1.union([
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+var updateStoredMCPClientResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   storedMCPClientSchema
 ]);
-var deleteStoredMCPClientResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredMCPClientResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
 
 // src/server/handlers/stored-mcp-clients.ts
@@ -22295,11 +21883,11 @@ var LIST_STORED_MCP_CLIENTS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       const result = await mcpClientStore.listResolved({
@@ -22331,15 +21919,15 @@ var GET_STORED_MCP_CLIENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getByIdResolved(storedMCPClientId, { status });
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
+        throw new HTTPException$1(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       return mcpClient;
@@ -22362,21 +21950,21 @@ var CREATE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive MCP client ID from name. Please provide an explicit id."
         });
       }
       const existing = await mcpClientStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `MCP client with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `MCP client with id ${id} already exists` });
       }
       await mcpClientStore.create({
         mcpClient: {
@@ -22390,7 +21978,7 @@ var CREATE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
       });
       const resolved = await mcpClientStore.getByIdResolved(id, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created MCP client" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created MCP client" });
       }
       return resolved;
     } catch (error) {
@@ -22424,15 +22012,15 @@ var UPDATE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const existing = await mcpClientStore.getById(storedMCPClientId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
+        throw new HTTPException$1(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -22458,7 +22046,7 @@ var UPDATE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
       );
       const resolved = await mcpClientStore.getByIdResolved(storedMCPClientId, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated MCP client" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated MCP client" });
       }
       return resolved;
     } catch (error) {
@@ -22480,15 +22068,15 @@ var DELETE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const existing = await mcpClientStore.getById(storedMCPClientId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
+        throw new HTTPException$1(404, { message: `Stored MCP client with id ${storedMCPClientId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       await mcpClientStore.delete(storedMCPClientId);
@@ -22502,70 +22090,70 @@ var DELETE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
   }
 });
 
-var storedPromptBlockIdPathParams = z$1.object({
-  storedPromptBlockId: z$1.string().describe("Unique identifier for the stored prompt block")
+var storedPromptBlockIdPathParams = z.object({
+  storedPromptBlockId: z.string().describe("Unique identifier for the stored prompt block")
 });
-var storageOrderBySchema$2 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$2 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredPromptBlocksQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$2.optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional().describe("Filter prompt blocks by status. When omitted, returns all prompt blocks regardless of status"),
-  authorId: z$1.string().optional().describe("Filter prompt blocks by author identifier"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter prompt blocks by metadata key-value pairs")
+  status: z.enum(["draft", "published", "archived"]).optional().describe("Filter prompt blocks by status. When omitted, returns all prompt blocks regardless of status"),
+  authorId: z.string().optional().describe("Filter prompt blocks by author identifier"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter prompt blocks by metadata key-value pairs")
 });
-var snapshotConfigSchema$1 = z$1.object({
-  name: z$1.string().describe("Display name of the prompt block"),
-  description: z$1.string().optional().describe("Purpose description"),
-  content: z$1.string().describe("Template content with {{variable}} interpolation"),
+var snapshotConfigSchema$1 = z.object({
+  name: z.string().describe("Display name of the prompt block"),
+  description: z.string().optional().describe("Purpose description"),
+  content: z.string().describe("Template content with {{variable}} interpolation"),
   rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
 });
-var createStoredPromptBlockBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the prompt block")
+var createStoredPromptBlockBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the prompt block")
 }).merge(snapshotConfigSchema$1);
-var updateStoredPromptBlockBodySchema = z$1.object({
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var updateStoredPromptBlockBodySchema = z.object({
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 }).merge(snapshotConfigSchema$1.partial());
-var storedPromptBlockSchema = z$1.object({
-  id: z$1.string(),
-  status: z$1.string().describe("Prompt block status: draft, published, or archived"),
-  activeVersionId: z$1.string().optional(),
-  hasDraft: z$1.boolean().optional().describe("Whether the prompt block has unpublished draft changes"),
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
-  name: z$1.string().describe("Display name of the prompt block"),
-  description: z$1.string().optional().describe("Purpose description"),
-  content: z$1.string().describe("Template content with {{variable}} interpolation"),
+var storedPromptBlockSchema = z.object({
+  id: z.string(),
+  status: z.string().describe("Prompt block status: draft, published, or archived"),
+  activeVersionId: z.string().optional(),
+  hasDraft: z.boolean().optional().describe("Whether the prompt block has unpublished draft changes"),
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  name: z.string().describe("Display name of the prompt block"),
+  description: z.string().optional().describe("Purpose description"),
+  content: z.string().describe("Template content with {{variable}} interpolation"),
   rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
 });
 var listStoredPromptBlocksResponseSchema = paginationInfoSchema$1.extend({
-  promptBlocks: z$1.array(storedPromptBlockSchema)
+  promptBlocks: z.array(storedPromptBlockSchema)
 });
 var getStoredPromptBlockResponseSchema = storedPromptBlockSchema;
 var createStoredPromptBlockResponseSchema = storedPromptBlockSchema;
-var updateStoredPromptBlockResponseSchema = z$1.union([
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+var updateStoredPromptBlockResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   storedPromptBlockSchema
 ]);
-var deleteStoredPromptBlockResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredPromptBlockResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
 
 // src/server/handlers/stored-prompt-blocks.ts
@@ -22593,11 +22181,11 @@ var LIST_STORED_PROMPT_BLOCKS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       const result = await promptBlockStore.listResolved({
@@ -22635,15 +22223,15 @@ var GET_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getByIdResolved(storedPromptBlockId, { status });
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const latestVersion = await promptBlockStore.getLatestVersion(storedPromptBlockId);
@@ -22678,21 +22266,21 @@ var CREATE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive prompt block ID from name. Please provide an explicit id."
         });
       }
       const existing = await promptBlockStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `Prompt block with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `Prompt block with id ${id} already exists` });
       }
       await promptBlockStore.create({
         promptBlock: {
@@ -22708,7 +22296,7 @@ var CREATE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
       });
       const resolved = await promptBlockStore.getByIdResolved(id, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created prompt block" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created prompt block" });
       }
       const latestVersion = await promptBlockStore.getLatestVersion(id);
       const hasDraft = !!(latestVersion && (!resolved.activeVersionId || latestVersion.id !== resolved.activeVersionId));
@@ -22746,15 +22334,15 @@ var UPDATE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const existing = await promptBlockStore.getById(storedPromptBlockId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -22782,7 +22370,7 @@ var UPDATE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
       );
       const resolved = await promptBlockStore.getByIdResolved(storedPromptBlockId, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated prompt block" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated prompt block" });
       }
       const latestVersion = await promptBlockStore.getLatestVersion(storedPromptBlockId);
       const hasDraft = !!(latestVersion && (!resolved.activeVersionId || latestVersion.id !== resolved.activeVersionId));
@@ -22806,15 +22394,15 @@ var DELETE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const existing = await promptBlockStore.getById(storedPromptBlockId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Stored prompt block with id ${storedPromptBlockId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       await promptBlockStore.delete(storedPromptBlockId);
@@ -22828,24 +22416,24 @@ var DELETE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
   }
 });
 
-var storedScorerIdPathParams = z$1.object({
-  storedScorerId: z$1.string().describe("Unique identifier for the stored scorer definition")
+var storedScorerIdPathParams = z.object({
+  storedScorerId: z.string().describe("Unique identifier for the stored scorer definition")
 });
-var storageOrderBySchema$1 = z$1.object({
-  field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var storageOrderBySchema$1 = z.object({
+  field: z.enum(["createdAt", "updatedAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listStoredScorersQuerySchema = createPagePaginationSchema(100).extend({
   orderBy: storageOrderBySchema$1.optional(),
-  status: z$1.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter scorers by status (defaults to published)"),
-  authorId: z$1.string().optional().describe("Filter scorers by author identifier"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter scorers by metadata key-value pairs")
+  status: z.enum(["draft", "published", "archived"]).optional().default("published").describe("Filter scorers by status (defaults to published)"),
+  authorId: z.string().optional().describe("Filter scorers by author identifier"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Filter scorers by metadata key-value pairs")
 });
-var samplingConfigSchema$1 = z$1.union([
-  z$1.object({ type: z$1.literal("none") }),
-  z$1.object({ type: z$1.literal("ratio"), rate: z$1.number().min(0).max(1) })
+var samplingConfigSchema$1 = z.union([
+  z.object({ type: z.literal("none") }),
+  z.object({ type: z.literal("ratio"), rate: z.number().min(0).max(1) })
 ]);
-var scorerTypeEnum$1 = z$1.enum([
+var scorerTypeEnum$1 = z.enum([
   "llm-judge",
   "answer-relevancy",
   "answer-similarity",
@@ -22859,68 +22447,68 @@ var scorerTypeEnum$1 = z$1.enum([
   "tool-call-accuracy",
   "toxicity"
 ]).describe("Scorer type: llm-judge for custom, or a preset type name");
-var snapshotConfigSchema = z$1.object({
-  name: z$1.string().describe("Name of the scorer"),
-  description: z$1.string().optional().describe("Description of the scorer"),
+var snapshotConfigSchema = z.object({
+  name: z.string().describe("Name of the scorer"),
+  description: z.string().optional().describe("Description of the scorer"),
   type: scorerTypeEnum$1,
   model: modelConfigSchema.optional().describe("Model configuration for LLM judge"),
-  instructions: z$1.string().optional().describe("System instructions for the judge LLM (used when type is llm-judge)"),
-  scoreRange: z$1.object({
-    min: z$1.number().optional().describe("Minimum score value (default: 0)"),
-    max: z$1.number().optional().describe("Maximum score value (default: 1)")
+  instructions: z.string().optional().describe("System instructions for the judge LLM (used when type is llm-judge)"),
+  scoreRange: z.object({
+    min: z.number().optional().describe("Minimum score value (default: 0)"),
+    max: z.number().optional().describe("Maximum score value (default: 1)")
   }).optional().describe("Score range configuration (used when type is llm-judge)"),
-  presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Serializable config options for preset scorers"),
+  presetConfig: z.record(z.string(), z.unknown()).optional().describe("Serializable config options for preset scorers"),
   defaultSampling: samplingConfigSchema$1.optional().describe("Default sampling configuration")
 });
-var createStoredScorerBodySchema = z$1.object({
-  id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-  authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the scorer")
+var createStoredScorerBodySchema = z.object({
+  id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+  authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the scorer")
 }).merge(snapshotConfigSchema);
-var updateStoredScorerBodySchema = z$1.object({
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var updateStoredScorerBodySchema = z.object({
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 }).partial().merge(snapshotConfigSchema.partial());
-var storedScorerSchema = z$1.object({
-  id: z$1.string(),
-  status: z$1.string().describe("Scorer status: draft, published, or archived"),
-  activeVersionId: z$1.string().optional(),
-  authorId: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date(),
-  name: z$1.string().describe("Name of the scorer"),
-  description: z$1.string().optional().describe("Description of the scorer"),
+var storedScorerSchema = z.object({
+  id: z.string(),
+  status: z.string().describe("Scorer status: draft, published, or archived"),
+  activeVersionId: z.string().optional(),
+  authorId: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date(),
+  name: z.string().describe("Name of the scorer"),
+  description: z.string().optional().describe("Description of the scorer"),
   type: scorerTypeEnum$1,
   model: modelConfigSchema.optional(),
-  instructions: z$1.string().optional().describe("System instructions for the judge LLM"),
-  scoreRange: z$1.object({
-    min: z$1.number().optional(),
-    max: z$1.number().optional()
+  instructions: z.string().optional().describe("System instructions for the judge LLM"),
+  scoreRange: z.object({
+    min: z.number().optional(),
+    max: z.number().optional()
   }).optional(),
-  presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  presetConfig: z.record(z.string(), z.unknown()).optional(),
   defaultSampling: samplingConfigSchema$1.optional()
 });
 var listStoredScorersResponseSchema = paginationInfoSchema$1.extend({
-  scorerDefinitions: z$1.array(storedScorerSchema)
+  scorerDefinitions: z.array(storedScorerSchema)
 });
 var getStoredScorerResponseSchema = storedScorerSchema;
 var createStoredScorerResponseSchema = storedScorerSchema;
-var updateStoredScorerResponseSchema = z$1.union([
-  z$1.object({
-    id: z$1.string(),
-    status: z$1.string(),
-    activeVersionId: z$1.string().optional(),
-    authorId: z$1.string().optional(),
-    metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-    createdAt: z$1.coerce.date(),
-    updatedAt: z$1.coerce.date()
+var updateStoredScorerResponseSchema = z.union([
+  z.object({
+    id: z.string(),
+    status: z.string(),
+    activeVersionId: z.string().optional(),
+    authorId: z.string().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    createdAt: z.coerce.date(),
+    updatedAt: z.coerce.date()
   }),
   storedScorerSchema
 ]);
-var deleteStoredScorerResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteStoredScorerResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
 
 // src/server/handlers/stored-scorers.ts
@@ -22948,11 +22536,11 @@ var LIST_STORED_SCORERS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       const result = await scorerStore.listResolved({
@@ -22984,15 +22572,15 @@ var GET_STORED_SCORER_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getByIdResolved(storedScorerId, { status });
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
+        throw new HTTPException$1(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       return scorer;
@@ -23029,21 +22617,21 @@ var CREATE_STORED_SCORER_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const id = providedId || toSlug(name);
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive scorer definition ID from name. Please provide an explicit id."
         });
       }
       const existing = await scorerStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, { message: `Scorer definition with id ${id} already exists` });
+        throw new HTTPException$1(409, { message: `Scorer definition with id ${id} already exists` });
       }
       await scorerStore.create({
         scorerDefinition: {
@@ -23062,7 +22650,7 @@ var CREATE_STORED_SCORER_ROUTE = createRoute$1({
       });
       const resolved = await scorerStore.getByIdResolved(id, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve created scorer definition" });
+        throw new HTTPException$1(500, { message: "Failed to resolve created scorer definition" });
       }
       return resolved;
     } catch (error) {
@@ -23101,15 +22689,15 @@ var UPDATE_STORED_SCORER_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const existing = await scorerStore.getById(storedScorerId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
+        throw new HTTPException$1(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
       }
       const scope = await getStoredResourceScope(mastra, requestContext);
       assertStoredResourceScope(existing, scope);
@@ -23153,7 +22741,7 @@ var UPDATE_STORED_SCORER_ROUTE = createRoute$1({
       }
       const resolved = await scorerStore.getByIdResolved(storedScorerId, { status: "draft" });
       if (!resolved) {
-        throw new HTTPException$2(500, { message: "Failed to resolve updated scorer definition" });
+        throw new HTTPException$1(500, { message: "Failed to resolve updated scorer definition" });
       }
       return resolved;
     } catch (error) {
@@ -23175,15 +22763,15 @@ var DELETE_STORED_SCORER_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const existing = await scorerStore.getById(storedScorerId);
       if (!existing) {
-        throw new HTTPException$2(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
+        throw new HTTPException$1(404, { message: `Stored scorer definition with id ${storedScorerId} not found` });
       }
       assertStoredResourceScope(existing, await getStoredResourceScope(mastra, requestContext));
       await scorerStore.delete(storedScorerId);
@@ -23199,15 +22787,15 @@ var DELETE_STORED_SCORER_ROUTE = createRoute$1({
 async function getFavoritesContext(mastra) {
   const storage = mastra.getStorage();
   if (!storage) {
-    throw new HTTPException$2(500, { message: "Storage is not configured" });
+    throw new HTTPException$1(500, { message: "Storage is not configured" });
   }
   const skillStore = await storage.getStore("skills");
   if (!skillStore) {
-    throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
   }
   const favoritesStore = await storage.getStore("favorites");
   if (!favoritesStore) {
-    throw new HTTPException$2(500, { message: "Favorites storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Favorites storage domain is not available" });
   }
   return { skillStore, favoritesStore };
 }
@@ -23227,12 +22815,12 @@ var FAVORITE_STORED_SKILL_ROUTE = createRoute$1({
       await requireBuilderFeature(mastra, "favorites");
       const callerId = getCallerAuthorId(requestContext);
       if (!callerId) {
-        throw new HTTPException$2(401, { message: "Authentication required" });
+        throw new HTTPException$1(401, { message: "Authentication required" });
       }
       const { skillStore, favoritesStore } = await getFavoritesContext(mastra);
       const skill = await skillStore.getByIdResolved(storedSkillId);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       assertStoredResourceScope(skill, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-skills", resourceId: storedSkillId, record: skill });
@@ -23263,12 +22851,12 @@ var UNFAVORITE_STORED_SKILL_ROUTE = createRoute$1({
       await requireBuilderFeature(mastra, "favorites");
       const callerId = getCallerAuthorId(requestContext);
       if (!callerId) {
-        throw new HTTPException$2(401, { message: "Authentication required" });
+        throw new HTTPException$1(401, { message: "Authentication required" });
       }
       const { skillStore, favoritesStore } = await getFavoritesContext(mastra);
       const skill = await skillStore.getByIdResolved(storedSkillId);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Stored skill with id ${storedSkillId} not found` });
+        throw new HTTPException$1(404, { message: `Stored skill with id ${storedSkillId} not found` });
       }
       assertStoredResourceScope(skill, await getStoredResourceScope(mastra, requestContext));
       assertReadAccess({ requestContext, resource: "stored-skills", resourceId: storedSkillId, record: skill });
@@ -23285,67 +22873,67 @@ var UNFAVORITE_STORED_SKILL_ROUTE = createRoute$1({
 });
 
 // src/server/schemas/processors.ts
-var processorIdPathParams = z$1.object({
-  processorId: z$1.string().describe("Unique identifier for the processor")
+var processorIdPathParams = z.object({
+  processorId: z.string().describe("Unique identifier for the processor")
 });
-var processorConfigurationSchema = z$1.object({
-  agentId: z$1.string(),
-  agentName: z$1.string(),
-  type: z$1.enum(["input", "output"])
+var processorConfigurationSchema = z.object({
+  agentId: z.string(),
+  agentName: z.string(),
+  type: z.enum(["input", "output"])
 });
-var processorListConfigurationSchema = z$1.object({
-  agentId: z$1.string(),
-  type: z$1.enum(["input", "output"])
+var processorListConfigurationSchema = z.object({
+  agentId: z.string(),
+  type: z.enum(["input", "output"])
 });
-var serializedProcessorSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string().optional(),
-  description: z$1.string().optional(),
-  phases: z$1.array(z$1.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"])),
-  agentIds: z$1.array(z$1.string()),
-  configurations: z$1.array(processorListConfigurationSchema),
-  isWorkflow: z$1.boolean()
+var serializedProcessorSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  phases: z.array(z.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"])),
+  agentIds: z.array(z.string()),
+  configurations: z.array(processorListConfigurationSchema),
+  isWorkflow: z.boolean()
 });
-var serializedProcessorDetailSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string().optional(),
-  description: z$1.string().optional(),
-  phases: z$1.array(z$1.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"])),
-  configurations: z$1.array(processorConfigurationSchema),
-  isWorkflow: z$1.boolean()
+var serializedProcessorDetailSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  phases: z.array(z.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"])),
+  configurations: z.array(processorConfigurationSchema),
+  isWorkflow: z.boolean()
 });
-var listProcessorsResponseSchema = z$1.record(z$1.string(), serializedProcessorSchema);
-var messageContentSchema$1 = z$1.object({
-  format: z$1.literal(2).optional(),
-  parts: z$1.array(z$1.any()).optional(),
-  content: z$1.string().optional()
+var listProcessorsResponseSchema = z.record(z.string(), serializedProcessorSchema);
+var messageContentSchema$1 = z.object({
+  format: z.literal(2).optional(),
+  parts: z.array(z.any()).optional(),
+  content: z.string().optional()
 }).passthrough();
-var processorMessageSchema = z$1.object({
-  id: z$1.string(),
-  role: z$1.enum(["user", "assistant", "system", "tool", "signal"]),
-  createdAt: z$1.coerce.date().optional(),
-  content: z$1.union([messageContentSchema$1, z$1.string()])
+var processorMessageSchema = z.object({
+  id: z.string(),
+  role: z.enum(["user", "assistant", "system", "tool", "signal"]),
+  createdAt: z.coerce.date().optional(),
+  content: z.union([messageContentSchema$1, z.string()])
 }).passthrough();
-var executeProcessorBodySchema = z$1.object({
-  phase: z$1.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"]),
-  messages: z$1.array(processorMessageSchema),
-  agentId: z$1.string().optional(),
-  requestContext: z$1.record(z$1.string(), z$1.any()).optional()
+var executeProcessorBodySchema = z.object({
+  phase: z.enum(["input", "inputStep", "outputStream", "outputResult", "outputStep"]),
+  messages: z.array(processorMessageSchema),
+  agentId: z.string().optional(),
+  requestContext: z.record(z.string(), z.any()).optional()
 });
-var tripwireSchema = z$1.object({
-  triggered: z$1.boolean(),
-  reason: z$1.string().optional(),
-  metadata: z$1.any().optional()
+var tripwireSchema = z.object({
+  triggered: z.boolean(),
+  reason: z.string().optional(),
+  metadata: z.any().optional()
 });
-var executeProcessorResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  phase: z$1.string(),
-  messages: z$1.array(processorMessageSchema).optional(),
-  messageList: z$1.object({
-    messages: z$1.array(processorMessageSchema)
+var executeProcessorResponseSchema = z.object({
+  success: z.boolean(),
+  phase: z.string(),
+  messages: z.array(processorMessageSchema).optional(),
+  messageList: z.object({
+    messages: z.array(processorMessageSchema)
   }).optional(),
   tripwire: tripwireSchema.optional(),
-  error: z$1.string().optional()
+  error: z.string().optional()
 });
 
 function extractTextFromMessages(messages) {
@@ -23439,7 +23027,7 @@ var GET_PROCESSOR_BY_ID_ROUTE = createRoute$1({
         processorEntry = processors[processorId];
       }
       if (!processorEntry) {
-        throw new HTTPException$2(404, { message: "Processor not found" });
+        throw new HTTPException$1(404, { message: "Processor not found" });
       }
       const isWorkflow = isProcessorWorkflow(processorEntry);
       const phases = detectProcessorPhases(processorEntry);
@@ -23478,13 +23066,13 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
     try {
       const { phase, messages } = bodyParams;
       if (!processorId) {
-        throw new HTTPException$2(400, { message: "Processor ID is required" });
+        throw new HTTPException$1(400, { message: "Processor ID is required" });
       }
       if (!phase) {
-        throw new HTTPException$2(400, { message: "Phase is required" });
+        throw new HTTPException$1(400, { message: "Phase is required" });
       }
       if (!messages || !Array.isArray(messages)) {
-        throw new HTTPException$2(400, { message: "Messages array is required" });
+        throw new HTTPException$1(400, { message: "Messages array is required" });
       }
       let processor;
       try {
@@ -23494,7 +23082,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
         processor = processors[processorId];
       }
       if (!processor) {
-        throw new HTTPException$2(404, { message: "Processor not found" });
+        throw new HTTPException$1(404, { message: "Processor not found" });
       }
       const messageList = new MessageList();
       messageList.add(messages, "input");
@@ -23581,7 +23169,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             };
           }
           if (result.status !== "success") {
-            throw new HTTPException$2(500, {
+            throw new HTTPException$1(500, {
               message: `Processor workflow ${processor.id} failed with status: ${result.status}`
             });
           }
@@ -23603,10 +23191,10 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             }
           };
         } catch (error) {
-          if (error instanceof HTTPException$2) {
+          if (error instanceof HTTPException$1) {
             throw error;
           }
-          throw new HTTPException$2(500, {
+          throw new HTTPException$1(500, {
             message: `Error executing processor workflow: ${error.message}`
           });
         }
@@ -23632,7 +23220,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
         switch (phase) {
           case "input":
             if (!processor.processInput) {
-              throw new HTTPException$2(400, { message: "Processor does not support input phase" });
+              throw new HTTPException$1(400, { message: "Processor does not support input phase" });
             }
             result = await processor.processInput({
               ...baseContext,
@@ -23641,7 +23229,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             break;
           case "inputStep":
             if (!processor.processInputStep) {
-              throw new HTTPException$2(400, { message: "Processor does not support inputStep phase" });
+              throw new HTTPException$1(400, { message: "Processor does not support inputStep phase" });
             }
             result = await processor.processInputStep({
               ...baseContext,
@@ -23660,7 +23248,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             break;
           case "outputResult":
             if (!processor.processOutputResult) {
-              throw new HTTPException$2(400, { message: "Processor does not support outputResult phase" });
+              throw new HTTPException$1(400, { message: "Processor does not support outputResult phase" });
             }
             result = await processor.processOutputResult({
               ...baseContext,
@@ -23675,7 +23263,7 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             break;
           case "outputStep":
             if (!processor.processOutputStep) {
-              throw new HTTPException$2(400, { message: "Processor does not support outputStep phase" });
+              throw new HTTPException$1(400, { message: "Processor does not support outputStep phase" });
             }
             result = await processor.processOutputStep({
               ...baseContext,
@@ -23689,11 +23277,11 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
             });
             break;
           case "outputStream":
-            throw new HTTPException$2(400, {
+            throw new HTTPException$1(400, {
               message: "outputStream phase cannot be executed directly. Use streaming instead."
             });
           default:
-            throw new HTTPException$2(400, { message: `Unknown phase: ${phase}` });
+            throw new HTTPException$1(400, { message: `Unknown phase: ${phase}` });
         }
         let outputMessages = messages;
         if (result) {
@@ -23737,42 +23325,42 @@ var EXECUTE_PROCESSOR_ROUTE = createRoute$1({
   }
 });
 
-var versionOrderBySchema = z$1.object({
-  field: z$1.enum(["versionNumber", "createdAt"]).optional(),
-  direction: z$1.enum(["ASC", "DESC"]).optional()
+var versionOrderBySchema = z.object({
+  field: z.enum(["versionNumber", "createdAt"]).optional(),
+  direction: z.enum(["ASC", "DESC"]).optional()
 });
 var listVersionsQuerySchema = createPagePaginationSchema(20).extend({
   orderBy: versionOrderBySchema.optional()
 });
-var compareVersionsQuerySchema = z$1.object({
-  from: z$1.string().describe("Version ID (UUID) to compare from"),
-  to: z$1.string().describe("Version ID (UUID) to compare to")
+var compareVersionsQuerySchema = z.object({
+  from: z.string().describe("Version ID (UUID) to compare from"),
+  to: z.string().describe("Version ID (UUID) to compare to")
 });
-var createVersionBodySchema = z$1.object({
-  changeMessage: z$1.string().max(500).optional().describe("Optional message describing the changes")
+var createVersionBodySchema = z.object({
+  changeMessage: z.string().max(500).optional().describe("Optional message describing the changes")
 });
-var activateVersionResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string(),
-  activeVersionId: z$1.string()
+var activateVersionResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+  activeVersionId: z.string()
 });
-var deleteVersionResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  message: z$1.string()
+var deleteVersionResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string()
 });
-var versionDiffEntrySchema = z$1.object({
-  field: z$1.string().describe("The field path that changed"),
-  previousValue: z$1.unknown().describe('The value in the "from" version'),
-  currentValue: z$1.unknown().describe('The value in the "to" version')
+var versionDiffEntrySchema = z.object({
+  field: z.string().describe("The field path that changed"),
+  previousValue: z.unknown().describe('The value in the "from" version'),
+  currentValue: z.unknown().describe('The value in the "to" version')
 });
 function createListVersionsResponseSchema(versionSchema) {
   return paginationInfoSchema$1.extend({
-    versions: z$1.array(versionSchema)
+    versions: z.array(versionSchema)
   });
 }
 function createCompareVersionsResponseSchema(versionSchema) {
-  return z$1.object({
-    diffs: z$1.array(versionDiffEntrySchema).describe("List of differences between versions"),
+  return z.object({
+    diffs: z.array(versionDiffEntrySchema).describe("List of differences between versions"),
     fromVersion: versionSchema.describe("The source version"),
     toVersion: versionSchema.describe("The target version")
   });
@@ -23781,36 +23369,36 @@ function createCompareVersionsResponseSchema(versionSchema) {
 var listPromptBlockVersionsQuerySchema = listVersionsQuerySchema;
 var comparePromptBlockVersionsQuerySchema = compareVersionsQuerySchema;
 var createPromptBlockVersionBodySchema = createVersionBodySchema;
-var promptBlockVersionPathParams = z$1.object({
-  promptBlockId: z$1.string().describe("Unique identifier for the stored prompt block")
+var promptBlockVersionPathParams = z.object({
+  promptBlockId: z.string().describe("Unique identifier for the stored prompt block")
 });
-var promptBlockVersionIdPathParams = z$1.object({
-  promptBlockId: z$1.string().describe("Unique identifier for the stored prompt block"),
-  versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+var promptBlockVersionIdPathParams = z.object({
+  promptBlockId: z.string().describe("Unique identifier for the stored prompt block"),
+  versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-var promptBlockVersionSchema = z$1.object({
-  id: z$1.string().describe("Unique identifier for the version (UUID)"),
-  blockId: z$1.string().describe("ID of the prompt block this version belongs to"),
-  versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
+var promptBlockVersionSchema = z.object({
+  id: z.string().describe("Unique identifier for the version (UUID)"),
+  blockId: z.string().describe("ID of the prompt block this version belongs to"),
+  versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
   // Snapshot config fields
-  name: z$1.string().describe("Display name of the prompt block"),
-  description: z$1.string().optional().describe("Purpose description"),
-  content: z$1.string().describe("Template content with {{variable}} interpolation"),
+  name: z.string().describe("Display name of the prompt block"),
+  description: z.string().optional().describe("Purpose description"),
+  content: z.string().describe("Template content with {{variable}} interpolation"),
   rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions"),
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions"),
   // Version metadata
-  changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-  changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-  createdAt: z$1.coerce.date().describe("When this version was created")
+  changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+  changeMessage: z.string().optional().describe("Optional message describing the changes"),
+  createdAt: z.coerce.date().describe("When this version was created")
 });
 var listPromptBlockVersionsResponseSchema = createListVersionsResponseSchema(promptBlockVersionSchema);
 var getPromptBlockVersionResponseSchema = promptBlockVersionSchema;
 var createPromptBlockVersionResponseSchema = promptBlockVersionSchema.partial().merge(
-  z$1.object({
-    id: z$1.string(),
-    blockId: z$1.string(),
-    versionNumber: z$1.number(),
-    createdAt: z$1.coerce.date()
+  z.object({
+    id: z.string(),
+    blockId: z.string(),
+    versionNumber: z.number(),
+    createdAt: z.coerce.date()
   })
 );
 var activatePromptBlockVersionResponseSchema = activateVersionResponseSchema;
@@ -23835,15 +23423,15 @@ var LIST_PROMPT_BLOCK_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Prompt block with id ${promptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Prompt block with id ${promptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const result = await promptBlockStore.listVersions({
@@ -23873,15 +23461,15 @@ var CREATE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Prompt block with id ${promptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Prompt block with id ${promptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       let currentConfig = {};
@@ -23913,7 +23501,7 @@ var CREATE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
       );
       const version = await promptBlockStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         promptBlockStore,
@@ -23941,18 +23529,18 @@ var GET_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const version = await promptBlockStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for prompt block ${promptBlockId}`
         });
       }
@@ -23978,23 +23566,23 @@ var ACTIVATE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Prompt block with id ${promptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Prompt block with id ${promptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const version = await promptBlockStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for prompt block ${promptBlockId}`
         });
       }
@@ -24028,23 +23616,23 @@ var RESTORE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Prompt block with id ${promptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Prompt block with id ${promptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const versionToRestore = await promptBlockStore.getVersion(versionId);
       if (!versionToRestore) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (versionToRestore.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for prompt block ${promptBlockId}`
         });
       }
@@ -24071,7 +23659,7 @@ var RESTORE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
       );
       const newVersion = await promptBlockStore.getVersion(newVersionId);
       if (!newVersion) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         promptBlockStore,
@@ -24100,28 +23688,28 @@ var DELETE_PROMPT_BLOCK_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       if (!promptBlock) {
-        throw new HTTPException$2(404, { message: `Prompt block with id ${promptBlockId} not found` });
+        throw new HTTPException$1(404, { message: `Prompt block with id ${promptBlockId} not found` });
       }
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const version = await promptBlockStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for prompt block ${promptBlockId}`
         });
       }
       if (promptBlock.activeVersionId === versionId) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Cannot delete the active version. Activate a different version first."
         });
       }
@@ -24151,29 +23739,29 @@ var COMPARE_PROMPT_BLOCK_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const promptBlockStore = await storage.getStore("promptBlocks");
       if (!promptBlockStore) {
-        throw new HTTPException$2(500, { message: "Prompt blocks storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Prompt blocks storage domain is not available" });
       }
       const promptBlock = await promptBlockStore.getById(promptBlockId);
       assertStoredResourceScope(promptBlock, await getStoredResourceScope(mastra, requestContext));
       const fromVersion = await promptBlockStore.getVersion(from);
       if (!fromVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${from} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${from} not found` });
       }
       if (fromVersion.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${from} not found for prompt block ${promptBlockId}`
         });
       }
       const toVersion = await promptBlockStore.getVersion(to);
       if (!toVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${to} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${to} not found` });
       }
       if (toVersion.blockId !== promptBlockId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${to} not found for prompt block ${promptBlockId}`
         });
       }
@@ -24197,24 +23785,24 @@ var COMPARE_PROMPT_BLOCK_VERSIONS_ROUTE = createRoute$1({
   }
 });
 
-var scheduleStatusSchema = z.enum(["active", "paused"]);
-var signalTypeSchema = z.enum(["user", "state", "reactive", "notification", "user-message", "system-reminder"]);
-var signalAttributesSchema = z.record(
-  z.string(),
-  z.union([z.string(), z.number(), z.boolean(), z.null()]).optional()
+var scheduleStatusSchema = z$1.enum(["active", "paused"]);
+var signalTypeSchema = z$1.enum(["user", "state", "reactive", "notification", "user-message", "system-reminder"]);
+var signalAttributesSchema = z$1.record(
+  z$1.string(),
+  z$1.union([z$1.string(), z$1.number(), z$1.boolean(), z$1.null()]).optional()
 );
-var ifActiveSchema = z.object({
-  behavior: z.enum(["deliver", "persist", "discard"]).optional(),
+var ifActiveSchema = z$1.object({
+  behavior: z$1.enum(["deliver", "persist", "discard"]).optional(),
   attributes: signalAttributesSchema.optional()
 });
-var ifIdleSchema = z.object({
-  behavior: z.enum(["wake", "persist", "discard"]).optional(),
+var ifIdleSchema = z$1.object({
+  behavior: z$1.enum(["wake", "persist", "discard"]).optional(),
   attributes: signalAttributesSchema.optional(),
-  streamOptions: z.object({
-    requestContext: z.record(z.string(), z.unknown()).optional()
+  streamOptions: z$1.object({
+    requestContext: z$1.record(z$1.string(), z$1.unknown()).optional()
   }).optional()
 });
-var workflowRunStatusSchema$1 = z.enum([
+var workflowRunStatusSchema$1 = z$1.enum([
   "running",
   "success",
   "failed",
@@ -24227,61 +23815,61 @@ var workflowRunStatusSchema$1 = z.enum([
   "paused",
   "skipped"
 ]);
-var scheduleRunSummarySchema = z.object({
+var scheduleRunSummarySchema = z$1.object({
   status: workflowRunStatusSchema$1,
-  startedAt: z.number().optional(),
-  completedAt: z.number().optional(),
-  durationMs: z.number().optional(),
-  error: z.string().optional()
+  startedAt: z$1.number().optional(),
+  completedAt: z$1.number().optional(),
+  durationMs: z$1.number().optional(),
+  error: z$1.string().optional()
 });
-var agentScheduleSchema = z.object({
-  id: z.string(),
-  agentId: z.string(),
+var agentScheduleSchema = z$1.object({
+  id: z$1.string(),
+  agentId: z$1.string(),
   /** Mirror of the workflow-schedule discriminator — always absent on agent schedules. */
-  workflowId: z.undefined().optional(),
+  workflowId: z$1.undefined().optional(),
   /** Workflow-run summary — never hydrated for agent schedules. */
-  lastRun: z.undefined().optional(),
-  name: z.string().optional(),
-  threadId: z.string().optional(),
-  resourceId: z.string().optional(),
-  prompt: z.string(),
-  cron: z.string(),
-  timezone: z.string().optional(),
+  lastRun: z$1.undefined().optional(),
+  name: z$1.string().optional(),
+  threadId: z$1.string().optional(),
+  resourceId: z$1.string().optional(),
+  prompt: z$1.string(),
+  cron: z$1.string(),
+  timezone: z$1.string().optional(),
   status: scheduleStatusSchema,
-  nextFireAt: z.number(),
-  lastFireAt: z.number().optional(),
-  lastRunId: z.string().optional(),
+  nextFireAt: z$1.number(),
+  lastFireAt: z$1.number().optional(),
+  lastRunId: z$1.string().optional(),
   signalType: signalTypeSchema.optional(),
-  tagName: z.string().optional(),
+  tagName: z$1.string().optional(),
   attributes: signalAttributesSchema.optional(),
   ifActive: ifActiveSchema.optional(),
   ifIdle: ifIdleSchema.optional(),
-  providerOptions: z.record(z.string(), z.unknown()).optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
-  createdAt: z.number(),
-  updatedAt: z.number()
+  providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  createdAt: z$1.number(),
+  updatedAt: z$1.number()
 });
-var workflowScheduleSchema = z.object({
-  id: z.string(),
-  workflowId: z.string(),
+var workflowScheduleSchema = z$1.object({
+  id: z$1.string(),
+  workflowId: z$1.string(),
   /** Mirror of the agent-schedule discriminator — always absent on workflow schedules. */
-  agentId: z.undefined().optional(),
-  cron: z.string(),
-  timezone: z.string().optional(),
+  agentId: z$1.undefined().optional(),
+  cron: z$1.string(),
+  timezone: z$1.string().optional(),
   status: scheduleStatusSchema,
-  nextFireAt: z.number(),
-  lastFireAt: z.number().optional(),
-  lastRunId: z.string().optional(),
+  nextFireAt: z$1.number(),
+  lastFireAt: z$1.number().optional(),
+  lastRunId: z$1.string().optional(),
   lastRun: scheduleRunSummarySchema.optional(),
-  inputData: z.unknown().optional(),
-  initialState: z.unknown().optional(),
-  requestContext: z.record(z.string(), z.unknown()).optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
-  createdAt: z.number(),
-  updatedAt: z.number()
+  inputData: z$1.unknown().optional(),
+  initialState: z$1.unknown().optional(),
+  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  createdAt: z$1.number(),
+  updatedAt: z$1.number()
 });
-var scheduleSchema = z.union([agentScheduleSchema, workflowScheduleSchema]);
-var scheduleTriggerOutcomeSchema = z.enum([
+var scheduleSchema = z$1.union([agentScheduleSchema, workflowScheduleSchema]);
+var scheduleTriggerOutcomeSchema = z$1.enum([
   "published",
   "succeeded",
   "delivered",
@@ -24302,101 +23890,101 @@ var scheduleTriggerOutcomeSchema = z.enum([
   "dropped-superseded",
   "dropped-busy"
 ]);
-var scheduleTriggerKindSchema = z.enum(["schedule-fire", "queue-drain", "manual"]);
-var scheduleTriggerResponseSchema = z.object({
-  id: z.string().optional(),
-  scheduleId: z.string(),
-  runId: z.string().nullable(),
-  scheduledFireAt: z.number(),
-  actualFireAt: z.number(),
+var scheduleTriggerKindSchema = z$1.enum(["schedule-fire", "queue-drain", "manual"]);
+var scheduleTriggerResponseSchema = z$1.object({
+  id: z$1.string().optional(),
+  scheduleId: z$1.string(),
+  runId: z$1.string().nullable(),
+  scheduledFireAt: z$1.number(),
+  actualFireAt: z$1.number(),
   outcome: scheduleTriggerOutcomeSchema,
-  error: z.string().optional(),
+  error: z$1.string().optional(),
   triggerKind: scheduleTriggerKindSchema.optional(),
-  parentTriggerId: z.string().optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  parentTriggerId: z$1.string().optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
   run: scheduleRunSummarySchema.optional()
 });
-var listSchedulesQuerySchema = z.object({
-  agentId: z.string().optional(),
-  workflowId: z.string().optional(),
+var listSchedulesQuerySchema = z$1.object({
+  agentId: z$1.string().optional(),
+  workflowId: z$1.string().optional(),
   status: scheduleStatusSchema.optional(),
   /** Agent-schedule only: match the target threadId. */
-  threadId: z.string().optional(),
+  threadId: z$1.string().optional(),
   /** Agent-schedule only: match the target resourceId. */
-  resourceId: z.string().optional(),
+  resourceId: z$1.string().optional(),
   /** Agent-schedule only: match the free-form target name. */
-  name: z.string().optional()
+  name: z$1.string().optional()
 });
-var listSchedulesResponseSchema = z.object({
-  schedules: z.array(scheduleSchema)
+var listSchedulesResponseSchema = z$1.object({
+  schedules: z$1.array(scheduleSchema)
 });
-var scheduleIdPathParams = z.object({
-  scheduleId: z.string()
+var scheduleIdPathParams = z$1.object({
+  scheduleId: z$1.string()
 });
-var createAgentScheduleBodySchema = z.strictObject({
+var createAgentScheduleBodySchema = z$1.strictObject({
   /** Optional stable id; normalized to `agent_<slug>`. A random id is generated when omitted. */
-  id: z.string().optional(),
-  agentId: z.string().min(1),
-  cron: z.string(),
-  timezone: z.string().optional(),
-  prompt: z.string(),
-  name: z.string().optional(),
-  threadId: z.string().optional(),
-  resourceId: z.string().optional(),
+  id: z$1.string().optional(),
+  agentId: z$1.string().min(1),
+  cron: z$1.string(),
+  timezone: z$1.string().optional(),
+  prompt: z$1.string(),
+  name: z$1.string().optional(),
+  threadId: z$1.string().optional(),
+  resourceId: z$1.string().optional(),
   signalType: signalTypeSchema.optional(),
-  tagName: z.string().optional(),
+  tagName: z$1.string().optional(),
   attributes: signalAttributesSchema.optional(),
   ifActive: ifActiveSchema.optional(),
   ifIdle: ifIdleSchema.optional(),
-  providerOptions: z.record(z.string(), z.unknown()).optional(),
-  metadata: z.record(z.string(), z.unknown()).optional()
+  providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
-var createWorkflowScheduleBodySchema = z.strictObject({
+var createWorkflowScheduleBodySchema = z$1.strictObject({
   /** Optional stable id; normalized to `schedule_<slug>`. A random id is generated when omitted. */
-  id: z.string().optional(),
-  workflowId: z.string().min(1),
-  cron: z.string(),
-  timezone: z.string().optional(),
-  inputData: z.unknown().optional(),
-  initialState: z.unknown().optional(),
-  requestContext: z.record(z.string(), z.unknown()).optional(),
-  metadata: z.record(z.string(), z.unknown()).optional()
+  id: z$1.string().optional(),
+  workflowId: z$1.string().min(1),
+  cron: z$1.string(),
+  timezone: z$1.string().optional(),
+  inputData: z$1.unknown().optional(),
+  initialState: z$1.unknown().optional(),
+  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
-var createScheduleBodySchema = z.union([createAgentScheduleBodySchema, createWorkflowScheduleBodySchema]);
-var updateScheduleBodySchema = z.object({
-  cron: z.string().optional(),
-  timezone: z.string().optional(),
+var createScheduleBodySchema = z$1.union([createAgentScheduleBodySchema, createWorkflowScheduleBodySchema]);
+var updateScheduleBodySchema = z$1.object({
+  cron: z$1.string().optional(),
+  timezone: z$1.string().optional(),
   status: scheduleStatusSchema.optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
   // Agent-schedule fields
-  prompt: z.string().optional(),
-  name: z.string().optional(),
+  prompt: z$1.string().optional(),
+  name: z$1.string().optional(),
   signalType: signalTypeSchema.optional(),
-  tagName: z.string().optional(),
+  tagName: z$1.string().optional(),
   attributes: signalAttributesSchema.optional(),
   ifActive: ifActiveSchema.optional(),
   ifIdle: ifIdleSchema.optional(),
-  providerOptions: z.record(z.string(), z.unknown()).optional(),
+  providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
   // Workflow-schedule fields
-  inputData: z.unknown().optional(),
-  initialState: z.unknown().optional(),
-  requestContext: z.record(z.string(), z.unknown()).optional()
+  inputData: z$1.unknown().optional(),
+  initialState: z$1.unknown().optional(),
+  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
-var deleteScheduleResponseSchema = z.object({
-  message: z.string()
+var deleteScheduleResponseSchema = z$1.object({
+  message: z$1.string()
 });
-var runScheduleResponseSchema = z.object({
-  scheduleId: z.string(),
-  claimId: z.string(),
-  scheduledFireAt: z.number()
+var runScheduleResponseSchema = z$1.object({
+  scheduleId: z$1.string(),
+  claimId: z$1.string(),
+  scheduledFireAt: z$1.number()
 });
-var listScheduleTriggersQuerySchema = z.object({
-  limit: z.coerce.number().int().positive().optional(),
-  fromActualFireAt: z.coerce.number().int().nonnegative().optional(),
-  toActualFireAt: z.coerce.number().int().nonnegative().optional()
+var listScheduleTriggersQuerySchema = z$1.object({
+  limit: z$1.coerce.number().int().positive().optional(),
+  fromActualFireAt: z$1.coerce.number().int().nonnegative().optional(),
+  toActualFireAt: z$1.coerce.number().int().nonnegative().optional()
 });
-var listScheduleTriggersResponseSchema = z.object({
-  triggers: z.array(scheduleTriggerResponseSchema)
+var listScheduleTriggersResponseSchema = z$1.object({
+  triggers: z$1.array(scheduleTriggerResponseSchema)
 });
 
 // src/server/handlers/schedules.ts
@@ -24435,7 +24023,7 @@ async function hydrateScheduleResponse(mastra, schedule) {
 async function loadSchedule(mastra, scheduleId) {
   const schedule = await mastra.schedules.get(scheduleId);
   if (!schedule) {
-    throw new HTTPException$2(404, { message: "Schedule not found" });
+    throw new HTTPException$1(404, { message: "Schedule not found" });
   }
   return schedule;
 }
@@ -24489,7 +24077,7 @@ var CREATE_SCHEDULE_ROUTE = createRoute$1({
       try {
         mastra.getWorkflowById(body.workflowId);
       } catch {
-        throw new HTTPException$2(404, { message: `Workflow "${body.workflowId}" not found` });
+        throw new HTTPException$1(404, { message: `Workflow "${body.workflowId}" not found` });
       }
       return await mastra.schedules.create({
         workflowId: body.workflowId,
@@ -24506,7 +24094,7 @@ var CREATE_SCHEDULE_ROUTE = createRoute$1({
     try {
       mastra.getAgentById(agentBody.agentId);
     } catch {
-      throw new HTTPException$2(404, { message: `Agent "${agentBody.agentId}" not found` });
+      throw new HTTPException$1(404, { message: `Agent "${agentBody.agentId}" not found` });
     }
     return await mastra.schedules.create({
       agentId: agentBody.agentId,
@@ -24662,18 +24250,18 @@ var LIST_SCHEDULE_TRIGGERS_ROUTE = createRoute$1({
 var listScorerVersionsQuerySchema = listVersionsQuerySchema;
 var compareScorerVersionsQuerySchema = compareVersionsQuerySchema;
 var createScorerVersionBodySchema = createVersionBodySchema;
-var scorerVersionPathParams = z$1.object({
-  scorerId: z$1.string().describe("Unique identifier for the stored scorer definition")
+var scorerVersionPathParams = z.object({
+  scorerId: z.string().describe("Unique identifier for the stored scorer definition")
 });
-var scorerVersionIdPathParams = z$1.object({
-  scorerId: z$1.string().describe("Unique identifier for the stored scorer definition"),
-  versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+var scorerVersionIdPathParams = z.object({
+  scorerId: z.string().describe("Unique identifier for the stored scorer definition"),
+  versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-var samplingConfigSchema = z$1.union([
-  z$1.object({ type: z$1.literal("none") }),
-  z$1.object({ type: z$1.literal("ratio"), rate: z$1.number().min(0).max(1) })
+var samplingConfigSchema = z.union([
+  z.object({ type: z.literal("none") }),
+  z.object({ type: z.literal("ratio"), rate: z.number().min(0).max(1) })
 ]);
-var scorerTypeEnum = z$1.enum([
+var scorerTypeEnum = z.enum([
   "llm-judge",
   "answer-relevancy",
   "answer-similarity",
@@ -24687,35 +24275,35 @@ var scorerTypeEnum = z$1.enum([
   "tool-call-accuracy",
   "toxicity"
 ]);
-var scorerVersionSchema = z$1.object({
-  id: z$1.string().describe("Unique identifier for the version (UUID)"),
-  scorerDefinitionId: z$1.string().describe("ID of the scorer this version belongs to"),
-  versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
+var scorerVersionSchema = z.object({
+  id: z.string().describe("Unique identifier for the version (UUID)"),
+  scorerDefinitionId: z.string().describe("ID of the scorer this version belongs to"),
+  versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
   // Snapshot config fields
-  name: z$1.string().describe("Name of the scorer"),
-  description: z$1.string().optional().describe("Description of the scorer"),
+  name: z.string().describe("Name of the scorer"),
+  description: z.string().optional().describe("Description of the scorer"),
   type: scorerTypeEnum,
   model: modelConfigSchema.optional(),
-  instructions: z$1.string().optional(),
-  scoreRange: z$1.object({
-    min: z$1.number().optional(),
-    max: z$1.number().optional()
+  instructions: z.string().optional(),
+  scoreRange: z.object({
+    min: z.number().optional(),
+    max: z.number().optional()
   }).optional(),
-  presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  presetConfig: z.record(z.string(), z.unknown()).optional(),
   defaultSampling: samplingConfigSchema.optional(),
   // Version metadata
-  changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-  changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-  createdAt: z$1.coerce.date().describe("When this version was created")
+  changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+  changeMessage: z.string().optional().describe("Optional message describing the changes"),
+  createdAt: z.coerce.date().describe("When this version was created")
 });
 var listScorerVersionsResponseSchema = createListVersionsResponseSchema(scorerVersionSchema);
 var getScorerVersionResponseSchema = scorerVersionSchema;
 var createScorerVersionResponseSchema = scorerVersionSchema.partial().merge(
-  z$1.object({
-    id: z$1.string(),
-    scorerDefinitionId: z$1.string(),
-    versionNumber: z$1.number(),
-    createdAt: z$1.coerce.date()
+  z.object({
+    id: z.string(),
+    scorerDefinitionId: z.string(),
+    versionNumber: z.number(),
+    createdAt: z.coerce.date()
   })
 );
 var activateScorerVersionResponseSchema = activateVersionResponseSchema;
@@ -24749,15 +24337,15 @@ var LIST_SCORER_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer with id ${scorerId} not found` });
+        throw new HTTPException$1(404, { message: `Scorer with id ${scorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       const result = await scorerStore.listVersions({
@@ -24787,15 +24375,15 @@ var CREATE_SCORER_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer with id ${scorerId} not found` });
+        throw new HTTPException$1(404, { message: `Scorer with id ${scorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       let currentConfig = {};
@@ -24827,7 +24415,7 @@ var CREATE_SCORER_VERSION_ROUTE = createRoute$1({
       );
       const version = await scorerStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         scorerStore,
@@ -24855,18 +24443,18 @@ var GET_SCORER_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const version = await scorerStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for scorer ${scorerId}`
         });
       }
@@ -24892,23 +24480,23 @@ var ACTIVATE_SCORER_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer with id ${scorerId} not found` });
+        throw new HTTPException$1(404, { message: `Scorer with id ${scorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       const version = await scorerStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for scorer ${scorerId}`
         });
       }
@@ -24942,23 +24530,23 @@ var RESTORE_SCORER_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer with id ${scorerId} not found` });
+        throw new HTTPException$1(404, { message: `Scorer with id ${scorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       const versionToRestore = await scorerStore.getVersion(versionId);
       if (!versionToRestore) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (versionToRestore.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for scorer ${scorerId}`
         });
       }
@@ -24985,7 +24573,7 @@ var RESTORE_SCORER_VERSION_ROUTE = createRoute$1({
       );
       const newVersion = await scorerStore.getVersion(newVersionId);
       if (!newVersion) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         scorerStore,
@@ -25014,28 +24602,28 @@ var DELETE_SCORER_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer with id ${scorerId} not found` });
+        throw new HTTPException$1(404, { message: `Scorer with id ${scorerId} not found` });
       }
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       const version = await scorerStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for scorer ${scorerId}`
         });
       }
       if (scorer.activeVersionId === versionId) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Cannot delete the active version. Activate a different version first."
         });
       }
@@ -25065,29 +24653,29 @@ var COMPARE_SCORER_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const scorerStore = await storage.getStore("scorerDefinitions");
       if (!scorerStore) {
-        throw new HTTPException$2(500, { message: "Scorer definitions storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Scorer definitions storage domain is not available" });
       }
       const scorer = await scorerStore.getById(scorerId);
       assertStoredResourceScope(scorer, await getStoredResourceScope(mastra, requestContext));
       const fromVersion = await scorerStore.getVersion(from);
       if (!fromVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${from} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${from} not found` });
       }
       if (fromVersion.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${from} not found for scorer ${scorerId}`
         });
       }
       const toVersion = await scorerStore.getVersion(to);
       if (!toVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${to} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${to} not found` });
       }
       if (toVersion.scorerDefinitionId !== scorerId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${to} not found for scorer ${scorerId}`
         });
       }
@@ -25112,32 +24700,32 @@ var COMPARE_SCORER_VERSIONS_ROUTE = createRoute$1({
 });
 
 // src/server/schemas/processor-providers.ts
-var processorProviderIdPathParams = z$1.object({
-  providerId: z$1.string().describe("Unique identifier for the processor provider")
+var processorProviderIdPathParams = z.object({
+  providerId: z.string().describe("Unique identifier for the processor provider")
 });
-var processorPhaseSchema = z$1.enum([
+var processorPhaseSchema = z.enum([
   "processInput",
   "processInputStep",
   "processOutputStream",
   "processOutputResult",
   "processOutputStep"
 ]);
-var getProcessorProvidersResponseSchema = z$1.object({
-  providers: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string().optional(),
-      availablePhases: z$1.array(processorPhaseSchema)
+var getProcessorProvidersResponseSchema = z.object({
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string().optional(),
+      availablePhases: z.array(processorPhaseSchema)
     })
   )
 });
-var getProcessorProviderResponseSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  description: z$1.string().optional(),
-  availablePhases: z$1.array(processorPhaseSchema),
-  configSchema: z$1.record(z$1.string(), z$1.unknown())
+var getProcessorProviderResponseSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  availablePhases: z.array(processorPhaseSchema),
+  configSchema: z.record(z.string(), z.unknown())
 });
 
 var LIST_PROCESSOR_PROVIDERS_ROUTE = createRoute$1({
@@ -25153,7 +24741,7 @@ var LIST_PROCESSOR_PROVIDERS_ROUTE = createRoute$1({
     try {
       const editor = mastra.getEditor();
       if (!editor) {
-        throw new HTTPException$2(500, { message: "Editor is not configured" });
+        throw new HTTPException$1(500, { message: "Editor is not configured" });
       }
       const providers = editor.getProcessorProviders();
       return {
@@ -25181,11 +24769,11 @@ var GET_PROCESSOR_PROVIDER_ROUTE = createRoute$1({
     try {
       const editor = mastra.getEditor();
       if (!editor) {
-        throw new HTTPException$2(500, { message: "Editor is not configured" });
+        throw new HTTPException$1(500, { message: "Editor is not configured" });
       }
       const provider = editor.getProcessorProvider(providerId);
       if (!provider) {
-        throw new HTTPException$2(404, { message: `Processor provider with id ${providerId} not found` });
+        throw new HTTPException$1(404, { message: `Processor provider with id ${providerId} not found` });
       }
       return {
         ...provider.info,
@@ -25198,96 +24786,96 @@ var GET_PROCESSOR_PROVIDER_ROUTE = createRoute$1({
   }
 });
 
-var jsonSchemaObject = z$1.lazy(() => z$1.record(z$1.string(), z$1.unknown()));
-var jsonSchemaField = z$1.union([jsonSchemaObject, z$1.null()]).optional();
+var jsonSchemaObject = z.lazy(() => z.record(z.string(), z.unknown()));
+var jsonSchemaField = z.union([jsonSchemaObject, z.null()]).optional();
 var expectedStepBase = {
-  name: z$1.string().describe("Step name to match"),
-  durationMs: z$1.number().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  children: z$1.any().optional().describe("Nested trajectory expectation (untyped at this depth)")
+  name: z.string().describe("Step name to match"),
+  durationMs: z.number().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  children: z.any().optional().describe("Nested trajectory expectation (untyped at this depth)")
 };
-var expectedToolCallStepSchema = z$1.object({
+var expectedToolCallStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("tool_call"),
-  toolArgs: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  toolResult: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  success: z$1.boolean().optional()
+  stepType: z.literal("tool_call"),
+  toolArgs: z.record(z.string(), z.unknown()).optional(),
+  toolResult: z.record(z.string(), z.unknown()).optional(),
+  success: z.boolean().optional()
 });
-var expectedMcpToolCallStepSchema = z$1.object({
+var expectedMcpToolCallStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("mcp_tool_call"),
-  toolArgs: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  toolResult: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  mcpServer: z$1.string().optional(),
-  success: z$1.boolean().optional()
+  stepType: z.literal("mcp_tool_call"),
+  toolArgs: z.record(z.string(), z.unknown()).optional(),
+  toolResult: z.record(z.string(), z.unknown()).optional(),
+  mcpServer: z.string().optional(),
+  success: z.boolean().optional()
 });
-var expectedModelGenerationStepSchema = z$1.object({
+var expectedModelGenerationStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("model_generation"),
-  modelId: z$1.string().optional(),
-  promptTokens: z$1.number().optional(),
-  completionTokens: z$1.number().optional(),
-  finishReason: z$1.string().optional()
+  stepType: z.literal("model_generation"),
+  modelId: z.string().optional(),
+  promptTokens: z.number().optional(),
+  completionTokens: z.number().optional(),
+  finishReason: z.string().optional()
 });
-var expectedAgentRunStepSchema = z$1.object({
+var expectedAgentRunStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("agent_run"),
-  agentId: z$1.string().optional()
+  stepType: z.literal("agent_run"),
+  agentId: z.string().optional()
 });
-var expectedWorkflowStepStepSchema = z$1.object({
+var expectedWorkflowStepStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_step"),
-  stepId: z$1.string().optional(),
-  status: z$1.string().optional(),
-  output: z$1.record(z$1.string(), z$1.unknown()).optional()
+  stepType: z.literal("workflow_step"),
+  stepId: z.string().optional(),
+  status: z.string().optional(),
+  output: z.record(z.string(), z.unknown()).optional()
 });
-var expectedWorkflowRunStepSchema = z$1.object({
+var expectedWorkflowRunStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_run"),
-  workflowId: z$1.string().optional(),
-  status: z$1.string().optional()
+  stepType: z.literal("workflow_run"),
+  workflowId: z.string().optional(),
+  status: z.string().optional()
 });
-var expectedWorkflowConditionalStepSchema = z$1.object({
+var expectedWorkflowConditionalStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_conditional"),
-  conditionCount: z$1.number().optional(),
-  selectedSteps: z$1.array(z$1.string()).optional()
+  stepType: z.literal("workflow_conditional"),
+  conditionCount: z.number().optional(),
+  selectedSteps: z.array(z.string()).optional()
 });
-var expectedWorkflowParallelStepSchema = z$1.object({
+var expectedWorkflowParallelStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_parallel"),
-  branchCount: z$1.number().optional(),
-  parallelSteps: z$1.array(z$1.string()).optional()
+  stepType: z.literal("workflow_parallel"),
+  branchCount: z.number().optional(),
+  parallelSteps: z.array(z.string()).optional()
 });
-var expectedWorkflowLoopStepSchema = z$1.object({
+var expectedWorkflowLoopStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_loop"),
-  loopType: z$1.string().optional(),
-  totalIterations: z$1.number().optional()
+  stepType: z.literal("workflow_loop"),
+  loopType: z.string().optional(),
+  totalIterations: z.number().optional()
 });
-var expectedWorkflowSleepStepSchema = z$1.object({
+var expectedWorkflowSleepStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_sleep"),
-  sleepDurationMs: z$1.number().optional(),
-  sleepType: z$1.string().optional()
+  stepType: z.literal("workflow_sleep"),
+  sleepDurationMs: z.number().optional(),
+  sleepType: z.string().optional()
 });
-var expectedWorkflowWaitEventStepSchema = z$1.object({
+var expectedWorkflowWaitEventStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("workflow_wait_event"),
-  eventName: z$1.string().optional(),
-  eventReceived: z$1.boolean().optional()
+  stepType: z.literal("workflow_wait_event"),
+  eventName: z.string().optional(),
+  eventReceived: z.boolean().optional()
 });
-var expectedProcessorRunStepSchema = z$1.object({
+var expectedProcessorRunStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.literal("processor_run"),
-  processorId: z$1.string().optional()
+  stepType: z.literal("processor_run"),
+  processorId: z.string().optional()
 });
-var expectedGenericStepSchema = z$1.object({
+var expectedGenericStepSchema = z.object({
   ...expectedStepBase,
-  stepType: z$1.undefined().optional()
+  stepType: z.undefined().optional()
 });
-var expectedStepSchema = z$1.union([
-  z$1.discriminatedUnion("stepType", [
+var expectedStepSchema = z.union([
+  z.discriminatedUnion("stepType", [
     expectedToolCallStepSchema,
     expectedMcpToolCallStepSchema,
     expectedModelGenerationStepSchema,
@@ -25303,411 +24891,411 @@ var expectedStepSchema = z$1.union([
   ]),
   expectedGenericStepSchema
 ]);
-var trajectoryExpectationSchema = z$1.object({
+var trajectoryExpectationSchema = z.object({
   // Accuracy
-  steps: z$1.array(expectedStepSchema).optional().describe("Expected steps for accuracy checking"),
-  ordering: z$1.enum(["strict", "relaxed", "unordered"]).optional().describe("How to compare step ordering (default: relaxed)"),
-  allowRepeatedSteps: z$1.boolean().optional().describe("Whether to allow repeated steps (default: true)"),
+  steps: z.array(expectedStepSchema).optional().describe("Expected steps for accuracy checking"),
+  ordering: z.enum(["strict", "relaxed", "unordered"]).optional().describe("How to compare step ordering (default: relaxed)"),
+  allowRepeatedSteps: z.boolean().optional().describe("Whether to allow repeated steps (default: true)"),
   // Efficiency
-  maxSteps: z$1.number().int().optional().describe("Maximum number of steps allowed"),
-  maxTotalTokens: z$1.number().int().optional().describe("Maximum total tokens across all model_generation steps"),
-  maxTotalDurationMs: z$1.number().optional().describe("Maximum total duration in milliseconds"),
-  noRedundantCalls: z$1.boolean().optional().describe("Whether to penalize redundant calls (same tool + same args consecutively, default: true)"),
+  maxSteps: z.number().int().optional().describe("Maximum number of steps allowed"),
+  maxTotalTokens: z.number().int().optional().describe("Maximum total tokens across all model_generation steps"),
+  maxTotalDurationMs: z.number().optional().describe("Maximum total duration in milliseconds"),
+  noRedundantCalls: z.boolean().optional().describe("Whether to penalize redundant calls (same tool + same args consecutively, default: true)"),
   // Blacklist
-  blacklistedTools: z$1.array(z$1.string()).optional().describe("Tool names that should never appear"),
-  blacklistedSequences: z$1.array(z$1.array(z$1.string())).optional().describe("Tool name sequences that should never appear"),
+  blacklistedTools: z.array(z.string()).optional().describe("Tool names that should never appear"),
+  blacklistedSequences: z.array(z.array(z.string())).optional().describe("Tool name sequences that should never appear"),
   // Tool failure tolerance
-  maxRetriesPerTool: z$1.number().int().optional().describe("Maximum retries per tool before penalizing (default: 2)")
+  maxRetriesPerTool: z.number().int().optional().describe("Maximum retries per tool before penalizing (default: 2)")
 }).optional().nullable().describe("Expected trajectory configuration for trajectory scoring");
-var datasetItemSourceSchema = z$1.object({
-  type: z$1.enum(["csv", "json", "trace", "llm", "experiment-result", "candidate-screener"]).describe("How this item was created"),
-  referenceId: z$1.string().optional().describe("Reference identifier (e.g., trace id, csv filename)")
+var datasetItemSourceSchema = z.object({
+  type: z.enum(["csv", "json", "trace", "llm", "experiment-result", "candidate-screener"]).describe("How this item was created"),
+  referenceId: z.string().optional().describe("Reference identifier (e.g., trace id, csv filename)")
 }).optional().describe("Source/provenance of this dataset item");
-var itemToolMockSchema = z$1.object({
-  toolName: z$1.string().describe("Name of the tool this mock applies to"),
-  args: z$1.record(z$1.string(), z$1.unknown()).describe("Arguments to match against the tool call"),
-  output: z$1.unknown().describe("Output served to the agent when matched"),
-  matchArgs: z$1.enum(["strict", "ignore"]).optional().describe("Argument matching mode. 'strict' (default) deep-equals args; 'ignore' matches on toolName only")
+var itemToolMockSchema = z.object({
+  toolName: z.string().describe("Name of the tool this mock applies to"),
+  args: z.record(z.string(), z.unknown()).describe("Arguments to match against the tool call"),
+  output: z.unknown().describe("Output served to the agent when matched"),
+  matchArgs: z.enum(["strict", "ignore"]).optional().describe("Argument matching mode. 'strict' (default) deep-equals args; 'ignore' matches on toolName only")
 });
-var toolMocksSchema = z$1.array(itemToolMockSchema).optional().describe("Ordered item-level static tool mocks served in place of executing the real tool");
-var toolMockReportSchema = z$1.object({
-  served: z$1.array(z$1.object({ mockIndex: z$1.number().int(), toolName: z$1.string(), args: z$1.unknown() })),
-  unconsumed: z$1.array(z$1.object({ mockIndex: z$1.number().int(), toolName: z$1.string(), args: z$1.unknown() })),
-  liveCalls: z$1.array(z$1.object({ toolName: z$1.string(), args: z$1.unknown() })),
-  failure: z$1.object({
-    code: z$1.enum(["TOOL_MOCK_MISMATCH", "TOOL_MOCK_EXHAUSTED"]),
-    toolName: z$1.string(),
-    args: z$1.unknown()
+var toolMocksSchema = z.array(itemToolMockSchema).optional().describe("Ordered item-level static tool mocks served in place of executing the real tool");
+var toolMockReportSchema = z.object({
+  served: z.array(z.object({ mockIndex: z.number().int(), toolName: z.string(), args: z.unknown() })),
+  unconsumed: z.array(z.object({ mockIndex: z.number().int(), toolName: z.string(), args: z.unknown() })),
+  liveCalls: z.array(z.object({ toolName: z.string(), args: z.unknown() })),
+  failure: z.object({
+    code: z.enum(["TOOL_MOCK_MISMATCH", "TOOL_MOCK_EXHAUSTED"]),
+    toolName: z.string(),
+    args: z.unknown()
   }).optional()
 }).optional().describe("Diagnostic receipt for item-level tool mocks");
-var datasetIdPathParams = z$1.object({
-  datasetId: z$1.string().describe("Unique identifier for the dataset")
+var datasetIdPathParams = z.object({
+  datasetId: z.string().describe("Unique identifier for the dataset")
 });
-z$1.object({
-  experimentId: z$1.string().describe("Unique identifier for the experiment")
+z.object({
+  experimentId: z.string().describe("Unique identifier for the experiment")
 });
-z$1.object({
-  itemId: z$1.string().describe("Unique identifier for the dataset item")
+z.object({
+  itemId: z.string().describe("Unique identifier for the dataset item")
 });
-var datasetAndExperimentIdPathParams = z$1.object({
-  datasetId: z$1.string().describe("Unique identifier for the dataset"),
-  experimentId: z$1.string().describe("Unique identifier for the experiment")
+var datasetAndExperimentIdPathParams = z.object({
+  datasetId: z.string().describe("Unique identifier for the dataset"),
+  experimentId: z.string().describe("Unique identifier for the experiment")
 });
-var experimentResultIdPathParams = z$1.object({
-  datasetId: z$1.string().describe("Unique identifier for the dataset"),
-  experimentId: z$1.string().describe("Unique identifier for the experiment"),
-  resultId: z$1.string().describe("Unique identifier for the experiment result")
+var experimentResultIdPathParams = z.object({
+  datasetId: z.string().describe("Unique identifier for the dataset"),
+  experimentId: z.string().describe("Unique identifier for the experiment"),
+  resultId: z.string().describe("Unique identifier for the experiment result")
 });
-var datasetAndItemIdPathParams = z$1.object({
-  datasetId: z$1.string().describe("Unique identifier for the dataset"),
-  itemId: z$1.string().describe("Unique identifier for the dataset item")
+var datasetAndItemIdPathParams = z.object({
+  datasetId: z.string().describe("Unique identifier for the dataset"),
+  itemId: z.string().describe("Unique identifier for the dataset item")
 });
-var paginationQuerySchema = z$1.object({
-  page: z$1.coerce.number().optional().default(0),
-  perPage: z$1.coerce.number().optional().default(10)
+var paginationQuerySchema = z.object({
+  page: z.coerce.number().optional().default(0),
+  perPage: z.coerce.number().optional().default(10)
 });
-var tenancyQuerySchema = z$1.object({
-  organizationId: z$1.string().optional().describe("Restrict lookup to the given organization"),
-  projectId: z$1.string().optional().describe("Restrict lookup to the given project")
+var tenancyQuerySchema = z.object({
+  organizationId: z.string().optional().describe("Restrict lookup to the given organization"),
+  projectId: z.string().optional().describe("Restrict lookup to the given project")
 });
-var listItemsQuerySchema = z$1.object({
-  page: z$1.coerce.number().optional().default(0),
-  perPage: z$1.coerce.number().optional().default(10),
-  version: z$1.coerce.number().int().optional(),
+var listItemsQuerySchema = z.object({
+  page: z.coerce.number().optional().default(0),
+  perPage: z.coerce.number().optional().default(10),
+  version: z.coerce.number().int().optional(),
   // Optional version filter for snapshot semantics
-  search: z$1.string().optional()
+  search: z.string().optional()
 });
-var createDatasetBodySchema = z$1.object({
-  name: z$1.string().describe("Name of the dataset"),
-  description: z$1.string().optional().describe("Description of the dataset"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+var createDatasetBodySchema = z.object({
+  name: z.string().describe("Name of the dataset"),
+  description: z.string().optional().describe("Description of the dataset"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
   inputSchema: jsonSchemaField.describe("JSON Schema for validating item input"),
   groundTruthSchema: jsonSchemaField.describe("JSON Schema for validating item groundTruth"),
   requestContextSchema: jsonSchemaField.describe("JSON Schema describing expected request context shape"),
-  targetType: z$1.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
-  targetIds: z$1.array(z$1.string()).optional().describe("IDs of target entities this dataset is attached to"),
-  scorerIds: z$1.array(z$1.string()).optional().describe("IDs of scorers attached to this dataset")
+  targetType: z.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
+  targetIds: z.array(z.string()).optional().describe("IDs of target entities this dataset is attached to"),
+  scorerIds: z.array(z.string()).optional().describe("IDs of scorers attached to this dataset")
 });
-var updateDatasetBodySchema = z$1.object({
-  name: z$1.string().optional().describe("Name of the dataset"),
-  description: z$1.string().optional().describe("Description of the dataset"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+var updateDatasetBodySchema = z.object({
+  name: z.string().optional().describe("Name of the dataset"),
+  description: z.string().optional().describe("Description of the dataset"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
   inputSchema: jsonSchemaField.describe("JSON Schema for validating item input"),
   groundTruthSchema: jsonSchemaField.describe("JSON Schema for validating item groundTruth"),
   requestContextSchema: jsonSchemaField.describe("JSON Schema describing expected request context shape"),
-  tags: z$1.array(z$1.string()).optional().describe("Tag definitions for categorizing experiment results"),
-  targetType: z$1.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
-  targetIds: z$1.array(z$1.string()).optional().describe("IDs of target entities this dataset is attached to"),
-  scorerIds: z$1.array(z$1.string()).optional().nullable().describe("IDs of scorers attached to this dataset")
+  tags: z.array(z.string()).optional().describe("Tag definitions for categorizing experiment results"),
+  targetType: z.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
+  targetIds: z.array(z.string()).optional().describe("IDs of target entities this dataset is attached to"),
+  scorerIds: z.array(z.string()).optional().nullable().describe("IDs of scorers attached to this dataset")
 });
-var addItemBodySchema = z$1.object({
-  externalId: z$1.string().optional().nullable().describe("Caller-defined, dataset-local item identity"),
-  input: z$1.unknown().describe("Input data for the dataset item"),
-  groundTruth: z$1.unknown().optional().describe("Expected output for comparison"),
+var addItemBodySchema = z.object({
+  externalId: z.string().optional().nullable().describe("Caller-defined, dataset-local item identity"),
+  input: z.unknown().describe("Input data for the dataset item"),
+  groundTruth: z.unknown().optional().describe("Expected output for comparison"),
   expectedTrajectory: trajectoryExpectationSchema,
   toolMocks: toolMocksSchema,
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Request context preset for this item"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+  requestContext: z.record(z.string(), z.unknown()).optional().describe("Request context preset for this item"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
   source: datasetItemSourceSchema
 });
-var updateItemBodySchema = z$1.object({
-  input: z$1.unknown().optional().describe("Input data for the dataset item"),
-  groundTruth: z$1.unknown().optional().describe("Expected output for comparison"),
+var updateItemBodySchema = z.object({
+  input: z.unknown().optional().describe("Input data for the dataset item"),
+  groundTruth: z.unknown().optional().describe("Expected output for comparison"),
   expectedTrajectory: trajectoryExpectationSchema,
   toolMocks: toolMocksSchema,
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Request context preset for this item"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+  requestContext: z.record(z.string(), z.unknown()).optional().describe("Request context preset for this item"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
   source: datasetItemSourceSchema
 });
-var triggerExperimentBodySchema = z$1.object({
-  targetType: z$1.enum(["agent", "workflow", "scorer"]).describe("Type of target to run against"),
-  targetId: z$1.string().describe("ID of the target"),
-  scorerIds: z$1.array(z$1.string()).optional().describe("IDs of scorers to apply"),
-  version: z$1.coerce.number().int().optional().describe("Pin to specific dataset version"),
-  agentVersion: z$1.string().optional().describe("Agent version ID to use for experiment"),
-  maxConcurrency: z$1.number().optional().describe("Maximum concurrent executions"),
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Global request context passed to the target"),
-  versions: z$1.object({
-    agents: z$1.record(
-      z$1.string(),
-      z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])
+var triggerExperimentBodySchema = z.object({
+  targetType: z.enum(["agent", "workflow", "scorer"]).describe("Type of target to run against"),
+  targetId: z.string().describe("ID of the target"),
+  scorerIds: z.array(z.string()).optional().describe("IDs of scorers to apply"),
+  version: z.coerce.number().int().optional().describe("Pin to specific dataset version"),
+  agentVersion: z.string().optional().describe("Agent version ID to use for experiment"),
+  maxConcurrency: z.number().optional().describe("Maximum concurrent executions"),
+  requestContext: z.record(z.string(), z.unknown()).optional().describe("Global request context passed to the target"),
+  versions: z.object({
+    agents: z.record(
+      z.string(),
+      z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])
     ).optional(),
-    defaultStatus: z$1.enum(["draft", "published"]).optional()
+    defaultStatus: z.enum(["draft", "published"]).optional()
   }).optional().describe("Version overrides for sub-agent delegation during experiment execution")
 });
-var compareExperimentsBodySchema = z$1.object({
-  experimentIdA: z$1.string().describe("ID of baseline experiment"),
-  experimentIdB: z$1.string().describe("ID of candidate experiment")
+var compareExperimentsBodySchema = z.object({
+  experimentIdA: z.string().describe("ID of baseline experiment"),
+  experimentIdB: z.string().describe("ID of candidate experiment")
 });
-var datasetResponseSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  description: z$1.string().optional().nullable(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-  inputSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  groundTruthSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  tags: z$1.array(z$1.string()).optional().nullable(),
-  targetType: z$1.string().optional().nullable(),
-  targetIds: z$1.array(z$1.string()).optional().nullable(),
-  scorerIds: z$1.array(z$1.string()).optional().nullable(),
-  version: z$1.number().int(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date()
+var datasetResponseSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional().nullable(),
+  metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+  inputSchema: z.record(z.string(), z.unknown()).optional(),
+  groundTruthSchema: z.record(z.string(), z.unknown()).optional(),
+  requestContextSchema: z.record(z.string(), z.unknown()).optional(),
+  tags: z.array(z.string()).optional().nullable(),
+  targetType: z.string().optional().nullable(),
+  targetIds: z.array(z.string()).optional().nullable(),
+  scorerIds: z.array(z.string()).optional().nullable(),
+  version: z.number().int(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date()
 });
-var datasetItemResponseSchema = z$1.object({
-  id: z$1.string(),
-  datasetId: z$1.string(),
-  datasetVersion: z$1.number().int(),
-  externalId: z$1.string().optional().nullable(),
-  input: z$1.unknown(),
-  groundTruth: z$1.unknown().optional(),
-  expectedTrajectory: z$1.unknown().optional(),
+var datasetItemResponseSchema = z.object({
+  id: z.string(),
+  datasetId: z.string(),
+  datasetVersion: z.number().int(),
+  externalId: z.string().optional().nullable(),
+  input: z.unknown(),
+  groundTruth: z.unknown().optional(),
+  expectedTrajectory: z.unknown().optional(),
   toolMocks: toolMocksSchema,
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
   source: datasetItemSourceSchema,
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date()
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date()
 });
-var experimentResponseSchema = z$1.object({
-  id: z$1.string(),
-  datasetId: z$1.string().nullable(),
-  datasetVersion: z$1.number().int().nullable(),
-  agentVersion: z$1.string().nullable().optional(),
-  targetType: z$1.enum(["agent", "workflow", "scorer", "processor"]),
-  targetId: z$1.string(),
-  name: z$1.string().optional(),
-  description: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  status: z$1.enum(["pending", "running", "completed", "failed"]),
-  totalItems: z$1.number(),
-  succeededCount: z$1.number(),
-  failedCount: z$1.number(),
-  skippedCount: z$1.number(),
-  startedAt: z$1.coerce.date().nullable(),
-  completedAt: z$1.coerce.date().nullable(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date()
+var experimentResponseSchema = z.object({
+  id: z.string(),
+  datasetId: z.string().nullable(),
+  datasetVersion: z.number().int().nullable(),
+  agentVersion: z.string().nullable().optional(),
+  targetType: z.enum(["agent", "workflow", "scorer", "processor"]),
+  targetId: z.string(),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  status: z.enum(["pending", "running", "completed", "failed"]),
+  totalItems: z.number(),
+  succeededCount: z.number(),
+  failedCount: z.number(),
+  skippedCount: z.number(),
+  startedAt: z.coerce.date().nullable(),
+  completedAt: z.coerce.date().nullable(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date()
 });
-z$1.object({
-  scorerId: z$1.string(),
-  scorerName: z$1.string(),
-  score: z$1.number().nullable(),
-  reason: z$1.string().nullable(),
-  error: z$1.string().nullable()
+z.object({
+  scorerId: z.string(),
+  scorerName: z.string(),
+  score: z.number().nullable(),
+  reason: z.string().nullable(),
+  error: z.string().nullable()
 });
-var experimentResultResponseSchema = z$1.object({
-  id: z$1.string(),
-  experimentId: z$1.string(),
-  itemId: z$1.string(),
-  itemDatasetVersion: z$1.number().int().nullable(),
-  input: z$1.unknown(),
-  output: z$1.unknown().nullable(),
-  groundTruth: z$1.unknown().nullable(),
-  expectedTrajectory: z$1.unknown().optional(),
-  error: z$1.object({
-    message: z$1.string(),
-    stack: z$1.string().optional(),
-    code: z$1.string().optional()
+var experimentResultResponseSchema = z.object({
+  id: z.string(),
+  experimentId: z.string(),
+  itemId: z.string(),
+  itemDatasetVersion: z.number().int().nullable(),
+  input: z.unknown(),
+  output: z.unknown().nullable(),
+  groundTruth: z.unknown().nullable(),
+  expectedTrajectory: z.unknown().optional(),
+  error: z.object({
+    message: z.string(),
+    stack: z.string().optional(),
+    code: z.string().optional()
   }).nullable(),
-  startedAt: z$1.coerce.date(),
-  completedAt: z$1.coerce.date(),
-  retryCount: z$1.number(),
-  traceId: z$1.string().nullable(),
-  status: z$1.enum(["needs-review", "reviewed", "complete"]).nullable().optional(),
-  tags: z$1.array(z$1.string()).nullable().optional(),
+  startedAt: z.coerce.date(),
+  completedAt: z.coerce.date(),
+  retryCount: z.number(),
+  traceId: z.string().nullable(),
+  status: z.enum(["needs-review", "reviewed", "complete"]).nullable().optional(),
+  tags: z.array(z.string()).nullable().optional(),
   toolMockReport: toolMockReportSchema.nullable(),
-  createdAt: z$1.coerce.date()
+  createdAt: z.coerce.date()
 });
-var updateExperimentResultBodySchema = z$1.object({
-  status: z$1.enum(["needs-review", "reviewed", "complete"]).nullable().optional(),
-  tags: z$1.array(z$1.string()).optional()
+var updateExperimentResultBodySchema = z.object({
+  status: z.enum(["needs-review", "reviewed", "complete"]).nullable().optional(),
+  tags: z.array(z.string()).optional()
 });
-var comparisonItemSchema = z$1.object({
-  itemId: z$1.string(),
-  input: z$1.unknown().nullable(),
-  groundTruth: z$1.unknown().nullable(),
-  results: z$1.record(
-    z$1.string(),
-    z$1.object({
-      output: z$1.unknown().nullable(),
-      scores: z$1.record(z$1.string(), z$1.number().nullable())
+var comparisonItemSchema = z.object({
+  itemId: z.string(),
+  input: z.unknown().nullable(),
+  groundTruth: z.unknown().nullable(),
+  results: z.record(
+    z.string(),
+    z.object({
+      output: z.unknown().nullable(),
+      scores: z.record(z.string(), z.number().nullable())
     }).nullable()
   )
 });
-var comparisonResponseSchema = z$1.object({
-  baselineId: z$1.string(),
-  items: z$1.array(comparisonItemSchema)
+var comparisonResponseSchema = z.object({
+  baselineId: z.string(),
+  items: z.array(comparisonItemSchema)
 });
-var experimentSummaryResponseSchema = z$1.object({
-  experimentId: z$1.string(),
-  status: z$1.enum(["pending", "running", "completed", "failed"]),
-  totalItems: z$1.number(),
-  succeededCount: z$1.number(),
-  failedCount: z$1.number(),
-  startedAt: z$1.coerce.date(),
-  completedAt: z$1.coerce.date().nullable(),
-  results: z$1.array(
-    z$1.object({
-      itemId: z$1.string(),
-      itemDatasetVersion: z$1.number().int().nullable(),
-      input: z$1.unknown(),
-      output: z$1.unknown().nullable(),
-      groundTruth: z$1.unknown().nullable(),
-      error: z$1.string().nullable(),
-      startedAt: z$1.coerce.date(),
-      completedAt: z$1.coerce.date(),
-      retryCount: z$1.number(),
+var experimentSummaryResponseSchema = z.object({
+  experimentId: z.string(),
+  status: z.enum(["pending", "running", "completed", "failed"]),
+  totalItems: z.number(),
+  succeededCount: z.number(),
+  failedCount: z.number(),
+  startedAt: z.coerce.date(),
+  completedAt: z.coerce.date().nullable(),
+  results: z.array(
+    z.object({
+      itemId: z.string(),
+      itemDatasetVersion: z.number().int().nullable(),
+      input: z.unknown(),
+      output: z.unknown().nullable(),
+      groundTruth: z.unknown().nullable(),
+      error: z.string().nullable(),
+      startedAt: z.coerce.date(),
+      completedAt: z.coerce.date(),
+      retryCount: z.number(),
       toolMockReport: toolMockReportSchema.nullable(),
-      scores: z$1.array(
-        z$1.object({
-          scorerId: z$1.string(),
-          scorerName: z$1.string(),
-          score: z$1.number().nullable(),
-          reason: z$1.string().nullable(),
-          error: z$1.string().nullable()
+      scores: z.array(
+        z.object({
+          scorerId: z.string(),
+          scorerName: z.string(),
+          score: z.number().nullable(),
+          reason: z.string().nullable(),
+          error: z.string().nullable()
         })
       )
     })
   )
 });
-var listDatasetsResponseSchema = z$1.object({
-  datasets: z$1.array(datasetResponseSchema),
+var listDatasetsResponseSchema = z.object({
+  datasets: z.array(datasetResponseSchema),
   pagination: paginationInfoSchema$1
 });
-var listItemsResponseSchema = z$1.object({
-  items: z$1.array(datasetItemResponseSchema),
+var listItemsResponseSchema = z.object({
+  items: z.array(datasetItemResponseSchema),
   pagination: paginationInfoSchema$1
 });
-var listExperimentsResponseSchema = z$1.object({
-  experiments: z$1.array(experimentResponseSchema),
+var listExperimentsResponseSchema = z.object({
+  experiments: z.array(experimentResponseSchema),
   pagination: paginationInfoSchema$1
 });
-var listExperimentResultsResponseSchema = z$1.object({
-  results: z$1.array(experimentResultResponseSchema),
+var listExperimentResultsResponseSchema = z.object({
+  results: z.array(experimentResultResponseSchema),
   pagination: paginationInfoSchema$1
 });
-var experimentReviewCountsSchema = z$1.object({
-  experimentId: z$1.string(),
-  total: z$1.number().int(),
-  needsReview: z$1.number().int(),
-  reviewed: z$1.number().int(),
-  complete: z$1.number().int()
+var experimentReviewCountsSchema = z.object({
+  experimentId: z.string(),
+  total: z.number().int(),
+  needsReview: z.number().int(),
+  reviewed: z.number().int(),
+  complete: z.number().int()
 });
-var reviewSummaryResponseSchema = z$1.object({
-  counts: z$1.array(experimentReviewCountsSchema)
+var reviewSummaryResponseSchema = z.object({
+  counts: z.array(experimentReviewCountsSchema)
 });
-var datasetItemVersionPathParams = z$1.object({
-  datasetId: z$1.string().describe("Unique identifier for the dataset"),
-  itemId: z$1.string().describe("Unique identifier for the dataset item"),
-  datasetVersion: z$1.coerce.number().int().describe("Dataset version number")
+var datasetItemVersionPathParams = z.object({
+  datasetId: z.string().describe("Unique identifier for the dataset"),
+  itemId: z.string().describe("Unique identifier for the dataset item"),
+  datasetVersion: z.coerce.number().int().describe("Dataset version number")
 });
-var itemVersionResponseSchema = z$1.object({
-  id: z$1.string(),
-  datasetId: z$1.string(),
-  datasetVersion: z$1.number().int(),
-  input: z$1.unknown(),
-  groundTruth: z$1.unknown().optional(),
-  expectedTrajectory: z$1.unknown().optional(),
+var itemVersionResponseSchema = z.object({
+  id: z.string(),
+  datasetId: z.string(),
+  datasetVersion: z.number().int(),
+  input: z.unknown(),
+  groundTruth: z.unknown().optional(),
+  expectedTrajectory: z.unknown().optional(),
   toolMocks: toolMocksSchema,
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  validTo: z$1.number().int().nullable(),
-  isDeleted: z$1.boolean(),
-  createdAt: z$1.coerce.date(),
-  updatedAt: z$1.coerce.date()
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  validTo: z.number().int().nullable(),
+  isDeleted: z.boolean(),
+  createdAt: z.coerce.date(),
+  updatedAt: z.coerce.date()
 });
-var listItemVersionsResponseSchema = z$1.object({
-  history: z$1.array(itemVersionResponseSchema)
+var listItemVersionsResponseSchema = z.object({
+  history: z.array(itemVersionResponseSchema)
 });
-var datasetVersionResponseSchema = z$1.object({
-  id: z$1.string(),
-  datasetId: z$1.string(),
-  version: z$1.number().int(),
-  createdAt: z$1.coerce.date()
+var datasetVersionResponseSchema = z.object({
+  id: z.string(),
+  datasetId: z.string(),
+  version: z.number().int(),
+  createdAt: z.coerce.date()
 });
-var listDatasetVersionsResponseSchema = z$1.object({
-  versions: z$1.array(datasetVersionResponseSchema),
+var listDatasetVersionsResponseSchema = z.object({
+  versions: z.array(datasetVersionResponseSchema),
   pagination: paginationInfoSchema$1
 });
-var batchInsertItemsBodySchema = z$1.object({
-  items: z$1.array(
-    z$1.object({
-      externalId: z$1.string().optional().nullable(),
-      input: z$1.unknown(),
-      groundTruth: z$1.unknown().optional(),
+var batchInsertItemsBodySchema = z.object({
+  items: z.array(
+    z.object({
+      externalId: z.string().optional().nullable(),
+      input: z.unknown(),
+      groundTruth: z.unknown().optional(),
       expectedTrajectory: trajectoryExpectationSchema,
       toolMocks: toolMocksSchema,
-      requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-      metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+      requestContext: z.record(z.string(), z.unknown()).optional(),
+      metadata: z.record(z.string(), z.unknown()).optional(),
       source: datasetItemSourceSchema
     })
   )
 });
-var batchInsertItemsResponseSchema = z$1.object({
-  items: z$1.array(datasetItemResponseSchema),
-  count: z$1.number()
+var batchInsertItemsResponseSchema = z.object({
+  items: z.array(datasetItemResponseSchema),
+  count: z.number()
 });
-var batchDeleteItemsBodySchema = z$1.object({
-  itemIds: z$1.array(z$1.string())
+var batchDeleteItemsBodySchema = z.object({
+  itemIds: z.array(z.string())
 });
-var batchDeleteItemsResponseSchema = z$1.object({
-  success: z$1.boolean(),
-  deletedCount: z$1.number()
+var batchDeleteItemsResponseSchema = z.object({
+  success: z.boolean(),
+  deletedCount: z.number()
 });
-var generateItemsBodySchema = z$1.object({
-  modelId: z$1.string().describe('Model identifier in "provider/model" format (e.g., "openai/gpt-4o")'),
-  prompt: z$1.string().describe("Description of the kind of test data to generate"),
-  count: z$1.number().int().min(1).max(50).default(5).describe("Number of items to generate"),
-  agentContext: z$1.object({
-    description: z$1.string().optional(),
-    instructions: z$1.string().optional(),
-    tools: z$1.array(z$1.string()).optional()
+var generateItemsBodySchema = z.object({
+  modelId: z.string().describe('Model identifier in "provider/model" format (e.g., "openai/gpt-4o")'),
+  prompt: z.string().describe("Description of the kind of test data to generate"),
+  count: z.number().int().min(1).max(50).default(5).describe("Number of items to generate"),
+  agentContext: z.object({
+    description: z.string().optional(),
+    instructions: z.string().optional(),
+    tools: z.array(z.string()).optional()
   }).optional().describe("Context about the agent to generate relevant test data")
 });
-var generatedItemSchema = z$1.object({
-  input: z$1.unknown(),
-  groundTruth: z$1.unknown().optional()
+var generatedItemSchema = z.object({
+  input: z.unknown(),
+  groundTruth: z.unknown().optional()
 });
-var generateItemsResponseSchema = z$1.object({
-  items: z$1.array(generatedItemSchema)
+var generateItemsResponseSchema = z.object({
+  items: z.array(generatedItemSchema)
 });
-var clusterFailuresBodySchema = z$1.object({
-  modelId: z$1.string().describe('Model identifier in "provider/model" format (e.g., "openai/gpt-4o")'),
-  items: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      input: z$1.unknown(),
-      output: z$1.unknown().optional(),
-      error: z$1.string().optional(),
-      scores: z$1.record(z$1.string(), z$1.number()).optional(),
-      existingTags: z$1.array(z$1.string()).optional().describe("Tags already applied to this item")
+var clusterFailuresBodySchema = z.object({
+  modelId: z.string().describe('Model identifier in "provider/model" format (e.g., "openai/gpt-4o")'),
+  items: z.array(
+    z.object({
+      id: z.string(),
+      input: z.unknown(),
+      output: z.unknown().optional(),
+      error: z.string().optional(),
+      scores: z.record(z.string(), z.number()).optional(),
+      existingTags: z.array(z.string()).optional().describe("Tags already applied to this item")
     })
   ).min(1).max(200).describe("Failure items to cluster"),
-  availableTags: z$1.array(z$1.string()).optional().describe("Existing tag vocabulary from the dataset. The LLM should prefer reusing these tags when applicable."),
-  prompt: z$1.string().optional().describe('Optional user instructions to guide the analysis (e.g., "focus on tool usage failures")')
+  availableTags: z.array(z.string()).optional().describe("Existing tag vocabulary from the dataset. The LLM should prefer reusing these tags when applicable."),
+  prompt: z.string().optional().describe('Optional user instructions to guide the analysis (e.g., "focus on tool usage failures")')
 });
-var failureClusterSchema = z$1.object({
-  id: z$1.string().describe("A unique cluster identifier"),
-  label: z$1.string().describe("Short label for this failure pattern"),
-  description: z$1.string().describe("Description of the common pattern"),
-  itemIds: z$1.array(z$1.string()).describe("IDs of items belonging to this cluster")
+var failureClusterSchema = z.object({
+  id: z.string().describe("A unique cluster identifier"),
+  label: z.string().describe("Short label for this failure pattern"),
+  description: z.string().describe("Description of the common pattern"),
+  itemIds: z.array(z.string()).describe("IDs of items belonging to this cluster")
 });
-var clusterFailuresResponseSchema = z$1.object({
-  clusters: z$1.array(failureClusterSchema),
+var clusterFailuresResponseSchema = z.object({
+  clusters: z.array(failureClusterSchema),
   /** Per-item proposed tag assignments. Each entry maps an item ID to the tags the LLM suggests adding. */
-  proposedTags: z$1.array(
-    z$1.object({
-      itemId: z$1.string(),
-      tags: z$1.array(z$1.string()),
-      reason: z$1.string().describe("Brief explanation of why these tags were assigned to this item")
+  proposedTags: z.array(
+    z.object({
+      itemId: z.string(),
+      tags: z.array(z.string()),
+      reason: z.string().describe("Brief explanation of why these tags were assigned to this item")
     })
   ).optional()
 });
 
 function assertDatasetsAvailable() {
   if (!coreFeatures.has("datasets")) {
-    throw new HTTPException$2(501, { message: "Datasets require @mastra/core >= 1.4.0" });
+    throw new HTTPException$1(501, { message: "Datasets require @mastra/core >= 1.4.0" });
   }
 }
 function isSchemaValidationError(error) {
@@ -25751,7 +25339,7 @@ var LIST_DATASETS_ROUTE = createRoute$1({
       };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing datasets");
     }
@@ -25796,7 +25384,7 @@ var CREATE_DATASET_ROUTE = createRoute$1({
       return details;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error creating dataset");
     }
@@ -25821,7 +25409,7 @@ var GET_DATASET_ROUTE = createRoute$1({
       return await ds.getDetails();
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error getting dataset");
     }
@@ -25872,19 +25460,19 @@ var UPDATE_DATASET_ROUTE = createRoute$1({
       return result;
     } catch (error) {
       if (isSchemaUpdateValidationError(error)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: error.message,
           cause: { failingItems: error.failingItems }
         });
       }
       if (isSchemaValidationError(error)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: error.message,
           cause: { field: error.field, errors: error.errors }
         });
       }
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error updating dataset");
     }
@@ -25912,7 +25500,7 @@ var DELETE_DATASET_ROUTE = createRoute$1({
       return { success: true };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error deleting dataset");
     }
@@ -25946,7 +25534,7 @@ var LIST_ITEMS_ROUTE = createRoute$1({
       return { items: result.items, pagination: result.pagination };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing dataset items");
     }
@@ -25980,22 +25568,22 @@ var ADD_ITEM_ROUTE = createRoute$1({
       });
     } catch (error) {
       if (isSchemaValidationError(error)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: error.message,
           cause: { field: error.field, errors: error.errors }
         });
       }
       if (error instanceof MastraError$1) {
         if (error.id === "DATASET_ITEM_IDENTITY_CONFLICT") {
-          throw new HTTPException$2(409, {
+          throw new HTTPException$1(409, {
             message: error.message,
             cause: { conflicts: "conflicts" in error ? error.conflicts : [] }
           });
         }
         if (error.id === "DATASET_ITEM_EXTERNAL_ID_INVALID") {
-          throw new HTTPException$2(400, { message: error.message, cause: { field: "externalId" } });
+          throw new HTTPException$1(400, { message: error.message, cause: { field: "externalId" } });
         }
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error adding item to dataset");
     }
@@ -26017,12 +25605,12 @@ var GET_ITEM_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const item = await ds.getItem({ itemId });
       if (!item || item.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Item not found: ${itemId}` });
+        throw new HTTPException$1(404, { message: `Item not found: ${itemId}` });
       }
       return item;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error getting dataset item");
     }
@@ -26046,7 +25634,7 @@ var UPDATE_ITEM_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const existing = await ds.getItem({ itemId });
       if (!existing || existing.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Item not found: ${itemId}` });
+        throw new HTTPException$1(404, { message: `Item not found: ${itemId}` });
       }
       return await ds.updateItem({
         itemId,
@@ -26059,13 +25647,13 @@ var UPDATE_ITEM_ROUTE = createRoute$1({
       });
     } catch (error) {
       if (isSchemaValidationError(error)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: error.message,
           cause: { field: error.field, errors: error.errors }
         });
       }
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error updating dataset item");
     }
@@ -26087,13 +25675,13 @@ var DELETE_ITEM_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const existing = await ds.getItem({ itemId });
       if (!existing || existing.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Item not found: ${itemId}` });
+        throw new HTTPException$1(404, { message: `Item not found: ${itemId}` });
       }
       await ds.deleteItem({ itemId });
       return { success: true };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error deleting dataset item");
     }
@@ -26115,11 +25703,11 @@ var LIST_ALL_EXPERIMENTS_ROUTE = createRoute$1({
       const { page, perPage } = params;
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage not configured" });
+        throw new HTTPException$1(500, { message: "Storage not configured" });
       }
       const experimentsStore = await storage.getStore("experiments");
       if (!experimentsStore) {
-        throw new HTTPException$2(500, { message: "Experiments storage not available" });
+        throw new HTTPException$1(500, { message: "Experiments storage not available" });
       }
       const result = await experimentsStore.listExperiments({
         pagination: { page: page ?? 0, perPage: perPage ?? 20 }
@@ -26127,7 +25715,7 @@ var LIST_ALL_EXPERIMENTS_ROUTE = createRoute$1({
       return { experiments: result.experiments, pagination: result.pagination };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing experiments");
     }
@@ -26147,17 +25735,17 @@ var EXPERIMENT_REVIEW_SUMMARY_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage not configured" });
+        throw new HTTPException$1(500, { message: "Storage not configured" });
       }
       const experimentsStore = await storage.getStore("experiments");
       if (!experimentsStore) {
-        throw new HTTPException$2(500, { message: "Experiments storage not available" });
+        throw new HTTPException$1(500, { message: "Experiments storage not available" });
       }
       const counts = await experimentsStore.getReviewSummary();
       return { counts };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error getting review summary");
     }
@@ -26183,7 +25771,7 @@ var LIST_EXPERIMENTS_ROUTE = createRoute$1({
       return { experiments: result.experiments, pagination: result.pagination };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing experiments");
     }
@@ -26237,7 +25825,7 @@ var TRIGGER_EXPERIMENT_ROUTE = createRoute$1({
       };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error triggering experiment");
     }
@@ -26259,12 +25847,12 @@ var GET_EXPERIMENT_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const run = await ds.getExperiment({ experimentId });
       if (!run || run.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Experiment not found: ${experimentId}` });
+        throw new HTTPException$1(404, { message: `Experiment not found: ${experimentId}` });
       }
       return run;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error getting experiment");
     }
@@ -26288,7 +25876,7 @@ var LIST_EXPERIMENT_RESULTS_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const run = await ds.getExperiment({ experimentId });
       if (!run || run.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Experiment not found: ${experimentId}` });
+        throw new HTTPException$1(404, { message: `Experiment not found: ${experimentId}` });
       }
       const result = await ds.listExperimentResults({ experimentId, page: page ?? 0, perPage: perPage ?? 10 });
       return {
@@ -26297,7 +25885,7 @@ var LIST_EXPERIMENT_RESULTS_ROUTE = createRoute$1({
       };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing experiment results");
     }
@@ -26319,11 +25907,11 @@ var UPDATE_EXPERIMENT_RESULT_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage not configured" });
+        throw new HTTPException$1(500, { message: "Storage not configured" });
       }
       const experimentsStore = await storage.getStore("experiments");
       if (!experimentsStore) {
-        throw new HTTPException$2(500, { message: "Experiments storage not available" });
+        throw new HTTPException$1(500, { message: "Experiments storage not available" });
       }
       const result = await experimentsStore.updateExperimentResult({
         id: resultId,
@@ -26334,7 +25922,7 @@ var UPDATE_EXPERIMENT_RESULT_ROUTE = createRoute$1({
       return result;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error updating experiment result");
     }
@@ -26363,7 +25951,7 @@ var COMPARE_EXPERIMENTS_ROUTE = createRoute$1({
       return result;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error comparing experiments");
     }
@@ -26389,7 +25977,7 @@ var LIST_DATASET_VERSIONS_ROUTE = createRoute$1({
       return { versions: result.versions, pagination: result.pagination };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing dataset versions");
     }
@@ -26411,12 +25999,12 @@ var LIST_ITEM_VERSIONS_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const rows = await ds.getItemHistory({ itemId });
       if (rows.length > 0 && rows[0]?.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Item not found in dataset: ${itemId}` });
+        throw new HTTPException$1(404, { message: `Item not found in dataset: ${itemId}` });
       }
       return { history: rows };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error listing item history");
     }
@@ -26438,15 +26026,15 @@ var GET_ITEM_VERSION_ROUTE = createRoute$1({
       const ds = await mastra.datasets.get({ id: datasetId });
       const item = await ds.getItem({ itemId, version: datasetVersion });
       if (!item) {
-        throw new HTTPException$2(404, { message: `Item ${itemId} not found at version ${datasetVersion}` });
+        throw new HTTPException$1(404, { message: `Item ${itemId} not found at version ${datasetVersion}` });
       }
       if (item.datasetId !== datasetId) {
-        throw new HTTPException$2(404, { message: `Item not found in dataset: ${itemId}` });
+        throw new HTTPException$1(404, { message: `Item not found in dataset: ${itemId}` });
       }
       return item;
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error getting item version");
     }
@@ -26474,22 +26062,22 @@ var BATCH_INSERT_ITEMS_ROUTE = createRoute$1({
       return { items: addedItems, count: addedItems.length };
     } catch (error) {
       if (isSchemaValidationError(error)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: error.message,
           cause: { field: error.field, errors: error.errors }
         });
       }
       if (error instanceof MastraError$1) {
         if (error.id === "DATASET_ITEM_IDENTITY_CONFLICT") {
-          throw new HTTPException$2(409, {
+          throw new HTTPException$1(409, {
             message: error.message,
             cause: { conflicts: "conflicts" in error ? error.conflicts : [] }
           });
         }
         if (error.id === "DATASET_ITEM_EXTERNAL_ID_INVALID") {
-          throw new HTTPException$2(400, { message: error.message, cause: { field: "externalId" } });
+          throw new HTTPException$1(400, { message: error.message, cause: { field: "externalId" } });
         }
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error batch inserting items");
     }
@@ -26515,7 +26103,7 @@ var BATCH_DELETE_ITEMS_ROUTE = createRoute$1({
       return { success: true, deletedCount: itemIds.length };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error bulk deleting items");
     }
@@ -26563,12 +26151,12 @@ ${JSON.stringify(dataset.groundTruthSchema, null, 2)}` : null
         instructions: GENERATE_ITEMS_SYSTEM_PROMPT,
         model
       });
-      const itemSchema = z.object({
-        input: z.string().describe("The input data as a JSON string matching the input schema, or a plain text string if no schema"),
-        groundTruth: z.string().optional().describe("The expected output as a JSON string matching the ground truth schema")
+      const itemSchema = z$1.object({
+        input: z$1.string().describe("The input data as a JSON string matching the input schema, or a plain text string if no schema"),
+        groundTruth: z$1.string().optional().describe("The expected output as a JSON string matching the ground truth schema")
       });
-      const outputSchema = z.object({
-        items: z.array(itemSchema).min(1).max(count)
+      const outputSchema = z$1.object({
+        items: z$1.array(itemSchema).min(1).max(count)
       });
       const agentContextParts = [];
       if (agentContext?.description) {
@@ -26613,7 +26201,7 @@ ${agentContextSection}` : null,
       return { items };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error generating dataset items");
     }
@@ -26657,20 +26245,20 @@ var CLUSTER_FAILURES_ROUTE = createRoute$1({
         instructions: CLUSTER_FAILURES_SYSTEM_PROMPT,
         model
       });
-      const outputSchema = z.object({
-        clusters: z.array(
-          z.object({
-            id: z.string(),
-            label: z.string(),
-            description: z.string(),
-            itemIds: z.array(z.string())
+      const outputSchema = z$1.object({
+        clusters: z$1.array(
+          z$1.object({
+            id: z$1.string(),
+            label: z$1.string(),
+            description: z$1.string(),
+            itemIds: z$1.array(z$1.string())
           })
         ),
-        proposedTags: z.array(
-          z.object({
-            itemId: z.string(),
-            tags: z.array(z.string()),
-            reason: z.string().describe("Brief explanation of why these tags were assigned")
+        proposedTags: z$1.array(
+          z$1.object({
+            itemId: z$1.string(),
+            tags: z$1.array(z$1.string()),
+            reason: z$1.string().describe("Brief explanation of why these tags were assigned")
           })
         )
       });
@@ -26712,7 +26300,7 @@ Return both "clusters" (grouping items by pattern) and "proposedTags" (a list ma
       return { clusters: generated.clusters, proposedTags: generated.proposedTags ?? [] };
     } catch (error) {
       if (error instanceof MastraError$1) {
-        throw new HTTPException$2(getHttpStatusForMastraError(error.id), { message: error.message });
+        throw new HTTPException$1(getHttpStatusForMastraError(error.id), { message: error.message });
       }
       return handleError$2(error, "Error clustering failures");
     }
@@ -26722,42 +26310,42 @@ Return both "clusters" (grouping items by pattern) and "proposedTags" (a list ma
 var listMCPClientVersionsQuerySchema = listVersionsQuerySchema;
 var compareMCPClientVersionsQuerySchema = compareVersionsQuerySchema;
 var createMCPClientVersionBodySchema = createVersionBodySchema;
-var mcpClientVersionPathParams = z$1.object({
-  mcpClientId: z$1.string().describe("Unique identifier for the stored MCP client")
+var mcpClientVersionPathParams = z.object({
+  mcpClientId: z.string().describe("Unique identifier for the stored MCP client")
 });
-var mcpClientVersionIdPathParams = z$1.object({
-  mcpClientId: z$1.string().describe("Unique identifier for the stored MCP client"),
-  versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+var mcpClientVersionIdPathParams = z.object({
+  mcpClientId: z.string().describe("Unique identifier for the stored MCP client"),
+  versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-var mcpServerConfigSchema = z$1.object({
-  type: z$1.enum(["stdio", "http"]),
-  command: z$1.string().optional(),
-  args: z$1.array(z$1.string()).optional(),
-  env: z$1.record(z$1.string(), z$1.string()).optional(),
-  url: z$1.string().optional(),
-  timeout: z$1.number().optional()
+var mcpServerConfigSchema = z.object({
+  type: z.enum(["stdio", "http"]),
+  command: z.string().optional(),
+  args: z.array(z.string()).optional(),
+  env: z.record(z.string(), z.string()).optional(),
+  url: z.string().optional(),
+  timeout: z.number().optional()
 });
-var mcpClientVersionSchema = z$1.object({
-  id: z$1.string().describe("Unique identifier for the version (UUID)"),
-  mcpClientId: z$1.string().describe("ID of the MCP client this version belongs to"),
-  versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
+var mcpClientVersionSchema = z.object({
+  id: z.string().describe("Unique identifier for the version (UUID)"),
+  mcpClientId: z.string().describe("ID of the MCP client this version belongs to"),
+  versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
   // Snapshot config fields
-  name: z$1.string().describe("Name of the MCP client"),
-  description: z$1.string().optional().describe("Description of the MCP client"),
-  servers: z$1.record(z$1.string(), mcpServerConfigSchema),
+  name: z.string().describe("Name of the MCP client"),
+  description: z.string().optional().describe("Description of the MCP client"),
+  servers: z.record(z.string(), mcpServerConfigSchema),
   // Version metadata
-  changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-  changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-  createdAt: z$1.coerce.date().describe("When this version was created")
+  changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+  changeMessage: z.string().optional().describe("Optional message describing the changes"),
+  createdAt: z.coerce.date().describe("When this version was created")
 });
 var listMCPClientVersionsResponseSchema = createListVersionsResponseSchema(mcpClientVersionSchema);
 var getMCPClientVersionResponseSchema = mcpClientVersionSchema;
 var createMCPClientVersionResponseSchema = mcpClientVersionSchema.partial().merge(
-  z$1.object({
-    id: z$1.string(),
-    mcpClientId: z$1.string(),
-    versionNumber: z$1.number(),
-    createdAt: z$1.coerce.date()
+  z.object({
+    id: z.string(),
+    mcpClientId: z.string(),
+    versionNumber: z.number(),
+    createdAt: z.coerce.date()
   })
 );
 var activateMCPClientVersionResponseSchema = activateVersionResponseSchema;
@@ -26781,15 +26369,15 @@ var LIST_MCP_CLIENT_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `MCP client with id ${mcpClientId} not found` });
+        throw new HTTPException$1(404, { message: `MCP client with id ${mcpClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       const result = await mcpClientStore.listVersions({
@@ -26819,15 +26407,15 @@ var CREATE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `MCP client with id ${mcpClientId} not found` });
+        throw new HTTPException$1(404, { message: `MCP client with id ${mcpClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       let currentConfig = {};
@@ -26862,7 +26450,7 @@ var CREATE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
       );
       const version = await mcpClientStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         mcpClientStore,
@@ -26890,18 +26478,18 @@ var GET_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const version = await mcpClientStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for MCP client ${mcpClientId}`
         });
       }
@@ -26927,23 +26515,23 @@ var ACTIVATE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `MCP client with id ${mcpClientId} not found` });
+        throw new HTTPException$1(404, { message: `MCP client with id ${mcpClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       const version = await mcpClientStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for MCP client ${mcpClientId}`
         });
       }
@@ -26977,23 +26565,23 @@ var RESTORE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `MCP client with id ${mcpClientId} not found` });
+        throw new HTTPException$1(404, { message: `MCP client with id ${mcpClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       const versionToRestore = await mcpClientStore.getVersion(versionId);
       if (!versionToRestore) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (versionToRestore.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for MCP client ${mcpClientId}`
         });
       }
@@ -27023,7 +26611,7 @@ var RESTORE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
       );
       const newVersion = await mcpClientStore.getVersion(newVersionId);
       if (!newVersion) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         mcpClientStore,
@@ -27052,28 +26640,28 @@ var DELETE_MCP_CLIENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       if (!mcpClient) {
-        throw new HTTPException$2(404, { message: `MCP client with id ${mcpClientId} not found` });
+        throw new HTTPException$1(404, { message: `MCP client with id ${mcpClientId} not found` });
       }
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       const version = await mcpClientStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${versionId} not found for MCP client ${mcpClientId}`
         });
       }
       if (mcpClient.activeVersionId === versionId) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Cannot delete the active version. Activate a different version first."
         });
       }
@@ -27103,29 +26691,29 @@ var COMPARE_MCP_CLIENT_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const mcpClientStore = await storage.getStore("mcpClients");
       if (!mcpClientStore) {
-        throw new HTTPException$2(500, { message: "MCP clients storage domain is not available" });
+        throw new HTTPException$1(500, { message: "MCP clients storage domain is not available" });
       }
       const mcpClient = await mcpClientStore.getById(mcpClientId);
       assertStoredResourceScope(mcpClient, await getStoredResourceScope(mastra, requestContext));
       const fromVersion = await mcpClientStore.getVersion(from);
       if (!fromVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${from} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${from} not found` });
       }
       if (fromVersion.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${from} not found for MCP client ${mcpClientId}`
         });
       }
       const toVersion = await mcpClientStore.getVersion(to);
       if (!toVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${to} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${to} not found` });
       }
       if (toVersion.mcpClientId !== mcpClientId) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Version with id ${to} not found for MCP client ${mcpClientId}`
         });
       }
@@ -27149,52 +26737,52 @@ var COMPARE_MCP_CLIENT_VERSIONS_ROUTE = createRoute$1({
   }
 });
 
-var mcpClientToolsConfigSchema = z$1.object({
-  tools: z$1.record(z$1.string(), toolConfigSchema).optional()
+var mcpClientToolsConfigSchema = z.object({
+  tools: z.record(z.string(), toolConfigSchema).optional()
 });
-var agentVersionPathParams = z$1.object({
-  agentId: z$1.string().describe("Unique identifier for the stored agent")
+var agentVersionPathParams = z.object({
+  agentId: z.string().describe("Unique identifier for the stored agent")
 });
-var versionIdPathParams = z$1.object({
-  agentId: z$1.string().describe("Unique identifier for the stored agent"),
-  versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+var versionIdPathParams = z.object({
+  agentId: z.string().describe("Unique identifier for the stored agent"),
+  versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-var agentVersionSchema = z$1.object({
-  id: z$1.string().describe("Unique identifier for the version (UUID)"),
-  agentId: z$1.string().describe("ID of the agent this version belongs to"),
-  versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
+var agentVersionSchema = z.object({
+  id: z.string().describe("Unique identifier for the version (UUID)"),
+  agentId: z.string().describe("ID of the agent this version belongs to"),
+  versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
   // Top-level config fields (from StorageAgentSnapshotType)
-  name: z$1.string().describe("Name of the agent"),
-  description: z$1.string().optional().describe("Description of the agent"),
+  name: z.string().describe("Name of the agent"),
+  description: z.string().optional().describe("Description of the agent"),
   instructions: instructionsSchema,
   model: conditionalFieldSchema(modelConfigSchema).describe(
     "Model configuration \u2014 static value or array of conditional variants"
   ),
   tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config \u2014 static or conditional"),
   defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls \u2014 static or conditional"),
-  workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
-  agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
-  integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
-  mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
+  workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config \u2014 static or conditional"),
+  agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config \u2014 static or conditional"),
+  integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema)).optional().describe("Map of tool provider IDs to their tool configurations \u2014 static or conditional"),
+  mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema)).optional().describe("Map of stored MCP client IDs to their tool configurations \u2014 static or conditional"),
   inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph \u2014 static or conditional"),
   outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph \u2014 static or conditional"),
   memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration \u2014 static or conditional"),
-  scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
-  requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables"),
+  scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config \u2014 static or conditional"),
+  requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables"),
   // Version metadata fields
-  changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-  changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-  createdAt: z$1.coerce.date().describe("When this version was created")
+  changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+  changeMessage: z.string().optional().describe("Optional message describing the changes"),
+  createdAt: z.coerce.date().describe("When this version was created")
 });
 var listVersionsResponseSchema = createListVersionsResponseSchema(agentVersionSchema);
 var getVersionResponseSchema = agentVersionSchema;
 var createVersionResponseSchema = agentVersionSchema.partial().merge(
-  z$1.object({
+  z.object({
     // These fields are always present in a version response
-    id: z$1.string().describe("Unique identifier for the version (UUID)"),
-    agentId: z$1.string().describe("ID of the agent this version belongs to"),
-    versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-    createdAt: z$1.coerce.date().describe("When this version was created")
+    id: z.string().describe("Unique identifier for the version (UUID)"),
+    agentId: z.string().describe("ID of the agent this version belongs to"),
+    versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+    createdAt: z.coerce.date().describe("When this version was created")
   })
 );
 var restoreVersionResponseSchema = agentVersionSchema.describe(
@@ -27235,11 +26823,11 @@ var LIST_AGENT_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const storedAgent = await agentsStore.getById(agentId);
       let codeAgentExists = false;
@@ -27249,7 +26837,7 @@ var LIST_AGENT_VERSIONS_ROUTE = createRoute$1({
       } catch {
       }
       if (!storedAgent && !codeAgentExists) {
-        throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+        throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
       }
       assertStoredResourceScope(storedAgent, await getStoredResourceScope(mastra, requestContext));
       const result = await agentsStore.listVersions({
@@ -27279,15 +26867,15 @@ var CREATE_AGENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getById(agentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+        throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       let currentConfig = {};
@@ -27319,7 +26907,7 @@ var CREATE_AGENT_VERSION_ROUTE = createRoute$1({
       );
       const version = await agentsStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         agentsStore,
@@ -27347,18 +26935,18 @@ var GET_AGENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const version = await agentsStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
       const agent = await agentsStore.getById(agentId);
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
@@ -27382,23 +26970,23 @@ var ACTIVATE_AGENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getById(agentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+        throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       const version = await agentsStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
       await agentsStore.update({
         id: agentId,
@@ -27430,23 +27018,23 @@ var RESTORE_AGENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getById(agentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+        throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       const versionToRestore = await agentsStore.getVersion(versionId);
       if (!versionToRestore) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (versionToRestore.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
       const restoredConfig = extractConfigFromVersion(
         versionToRestore,
@@ -27471,7 +27059,7 @@ var RESTORE_AGENT_VERSION_ROUTE = createRoute$1({
       );
       const newVersion = await agentsStore.getVersion(newVersionId);
       if (!newVersion) {
-        throw new HTTPException$2(500, { message: "Failed to retrieve created version" });
+        throw new HTTPException$1(500, { message: "Failed to retrieve created version" });
       }
       await enforceRetentionLimit(
         agentsStore,
@@ -27500,26 +27088,26 @@ var DELETE_AGENT_VERSION_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getById(agentId);
       if (!agent) {
-        throw new HTTPException$2(404, { message: `Agent with id ${agentId} not found` });
+        throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
       }
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       const version = await agentsStore.getVersion(versionId);
       if (!version) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found` });
       }
       if (version.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${versionId} not found for agent ${agentId}` });
       }
       if (agent.activeVersionId === versionId) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Cannot delete the active version. Activate a different version first."
         });
       }
@@ -27549,27 +27137,27 @@ var COMPARE_AGENT_VERSIONS_ROUTE = createRoute$1({
     try {
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const agentsStore = await storage.getStore("agents");
       if (!agentsStore) {
-        throw new HTTPException$2(500, { message: "Agents storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Agents storage domain is not available" });
       }
       const agent = await agentsStore.getById(agentId);
       assertStoredResourceScope(agent, await getStoredResourceScope(mastra, requestContext));
       const fromVersion = await agentsStore.getVersion(from);
       if (!fromVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${from} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${from} not found` });
       }
       if (fromVersion.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${from} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${from} not found for agent ${agentId}` });
       }
       const toVersion = await agentsStore.getVersion(to);
       if (!toVersion) {
-        throw new HTTPException$2(404, { message: `Version with id ${to} not found` });
+        throw new HTTPException$1(404, { message: `Version with id ${to} not found` });
       }
       if (toVersion.agentId !== agentId) {
-        throw new HTTPException$2(404, { message: `Version with id ${to} not found for agent ${agentId}` });
+        throw new HTTPException$1(404, { message: `Version with id ${to} not found for agent ${agentId}` });
       }
       const fromConfig = extractConfigFromVersion(
         fromVersion,
@@ -27591,7 +27179,7 @@ var COMPARE_AGENT_VERSIONS_ROUTE = createRoute$1({
   }
 });
 
-var backgroundTaskStatusSchema = z.enum([
+var backgroundTaskStatusSchema = z$1.enum([
   "pending",
   "running",
   "suspended",
@@ -27600,58 +27188,58 @@ var backgroundTaskStatusSchema = z.enum([
   "cancelled",
   "timed_out"
 ]);
-var backgroundTaskStreamQuerySchema = z.object({
-  agentId: z.string().optional(),
-  runId: z.string().optional(),
-  threadId: z.string().optional(),
-  resourceId: z.string().optional(),
-  taskId: z.string().optional()
+var backgroundTaskStreamQuerySchema = z$1.object({
+  agentId: z$1.string().optional(),
+  runId: z$1.string().optional(),
+  threadId: z$1.string().optional(),
+  resourceId: z$1.string().optional(),
+  taskId: z$1.string().optional()
 });
-var backgroundTaskDateColumnSchema = z.enum(["createdAt", "startedAt", "suspendedAt", "completedAt"]);
-var listBackgroundTasksQuerySchema = z.object({
-  agentId: z.string().optional(),
+var backgroundTaskDateColumnSchema = z$1.enum(["createdAt", "startedAt", "suspendedAt", "completedAt"]);
+var listBackgroundTasksQuerySchema = z$1.object({
+  agentId: z$1.string().optional(),
   status: backgroundTaskStatusSchema.optional(),
-  runId: z.string().optional(),
-  threadId: z.string().optional(),
-  resourceId: z.string().optional(),
-  toolName: z.string().optional(),
-  toolCallId: z.string().optional(),
-  fromDate: z.coerce.date().optional(),
-  toDate: z.coerce.date().optional(),
+  runId: z$1.string().optional(),
+  threadId: z$1.string().optional(),
+  resourceId: z$1.string().optional(),
+  toolName: z$1.string().optional(),
+  toolCallId: z$1.string().optional(),
+  fromDate: z$1.coerce.date().optional(),
+  toDate: z$1.coerce.date().optional(),
   dateFilterBy: backgroundTaskDateColumnSchema.optional(),
   orderBy: backgroundTaskDateColumnSchema.optional(),
-  orderDirection: z.enum(["asc", "desc"]).optional(),
-  page: z.coerce.number().optional(),
-  perPage: z.coerce.number().optional()
+  orderDirection: z$1.enum(["asc", "desc"]).optional(),
+  page: z$1.coerce.number().optional(),
+  perPage: z$1.coerce.number().optional()
 });
-var backgroundTaskIdPathParams = z.object({
-  backgroundTaskId: z.string()
+var backgroundTaskIdPathParams = z$1.object({
+  backgroundTaskId: z$1.string()
 });
-var backgroundTaskResponseSchema = z.object({
-  id: z.string(),
+var backgroundTaskResponseSchema = z$1.object({
+  id: z$1.string(),
   status: backgroundTaskStatusSchema,
-  toolName: z.string(),
-  toolCallId: z.string(),
-  args: z.record(z.string(), z.unknown()),
-  agentId: z.string(),
-  threadId: z.string().optional(),
-  resourceId: z.string().optional(),
-  runId: z.string(),
-  result: z.unknown().optional(),
-  error: z.object({ message: z.string(), stack: z.string().optional() }).optional(),
-  createdAt: z.date(),
-  startedAt: z.date().optional(),
-  completedAt: z.date().optional(),
-  retryCount: z.number(),
-  maxRetries: z.number(),
-  timeoutMs: z.number(),
-  suspendPayload: z.unknown().optional()
+  toolName: z$1.string(),
+  toolCallId: z$1.string(),
+  args: z$1.record(z$1.string(), z$1.unknown()),
+  agentId: z$1.string(),
+  threadId: z$1.string().optional(),
+  resourceId: z$1.string().optional(),
+  runId: z$1.string(),
+  result: z$1.unknown().optional(),
+  error: z$1.object({ message: z$1.string(), stack: z$1.string().optional() }).optional(),
+  createdAt: z$1.date(),
+  startedAt: z$1.date().optional(),
+  completedAt: z$1.date().optional(),
+  retryCount: z$1.number(),
+  maxRetries: z$1.number(),
+  timeoutMs: z$1.number(),
+  suspendPayload: z$1.unknown().optional()
 });
-var listBackgroundTaskResponseSchema = z.object({
-  tasks: z.array(backgroundTaskResponseSchema),
-  total: z.number()
+var listBackgroundTaskResponseSchema = z$1.object({
+  tasks: z$1.array(backgroundTaskResponseSchema),
+  total: z$1.number()
 });
-var backgroundTaskStreamResponseSchema = z.any();
+var backgroundTaskStreamResponseSchema = z$1.any();
 
 // src/server/handlers/background-tasks.ts
 var BACKGROUND_TASK_STREAM_ROUTE = createRoute$1({
@@ -27713,11 +27301,11 @@ var GET_BACKGROUND_TASK_ROUTE = createRoute$1({
   handler: async ({ mastra, backgroundTaskId }) => {
     const bgManager = mastra.backgroundTaskManager;
     if (!bgManager) {
-      throw new HTTPException$2(404, { message: "Background task not found" });
+      throw new HTTPException$1(404, { message: "Background task not found" });
     }
     const task = await bgManager.getTask(backgroundTaskId);
     if (!task) {
-      throw new HTTPException$2(404, { message: "Background task not found" });
+      throw new HTTPException$1(404, { message: "Background task not found" });
     }
     return task;
   }
@@ -27731,7 +27319,7 @@ var FILE_FETCH_TIMEOUT_MS = 3e4;
 var SKILL_NAME_REGEX$1 = /^[a-z0-9][a-z0-9-_]*$/i;
 function assertSafeSkillName$1(name) {
   if (!SKILL_NAME_REGEX$1.test(name)) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: `Invalid skill name "${name}". Names must start with alphanumeric and contain only letters, numbers, hyphens, and underscores.`
     });
   }
@@ -27739,14 +27327,14 @@ function assertSafeSkillName$1(name) {
 }
 function assertSafeFilePath$1(filePath) {
   if (filePath.startsWith("/") || filePath.startsWith("\\") || /^[a-zA-Z]:[\\/]/.test(filePath)) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: `Invalid file path "${filePath}". Absolute paths are not allowed.`
     });
   }
   const segments = filePath.split(/[\\/]/);
   for (const segment of segments) {
     if (segment === ".." || segment === ".") {
-      throw new HTTPException$2(400, {
+      throw new HTTPException$1(400, {
         message: `Invalid file path "${filePath}". Path traversal is not allowed.`
       });
     }
@@ -27760,7 +27348,7 @@ async function searchSkillsSh({ q, limit }) {
     const url = `${SKILLS_SH_API_URL$1}/api/skills?query=${encodeURIComponent(q)}&pageSize=${limit}`;
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
-      throw new HTTPException$2(502, {
+      throw new HTTPException$1(502, {
         message: `Skills API error: ${response.status} ${response.statusText}`
       });
     }
@@ -27786,7 +27374,7 @@ async function getPopularSkillsSh({
     const url = `${SKILLS_SH_API_URL$1}/api/skills/top?pageSize=${limit}&page=${page}`;
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
-      throw new HTTPException$2(502, {
+      throw new HTTPException$1(502, {
         message: `Skills API error: ${response.status} ${response.statusText}`
       });
     }
@@ -27813,18 +27401,18 @@ async function previewSkillsSh({
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
       if (response.status === 404) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Could not find skill "${skillName}" for ${owner}/${repo}`
         });
       }
-      throw new HTTPException$2(502, {
+      throw new HTTPException$1(502, {
         message: `Skills API error: ${response.status} ${response.statusText}`
       });
     }
     const data = await response.json();
     const content = data.instructions || data.raw || "";
     if (!content) {
-      throw new HTTPException$2(404, {
+      throw new HTTPException$1(404, {
         message: `No content available for skill "${skillName}"`
       });
     }
@@ -27851,43 +27439,43 @@ async function fetchSkillFiles$1(owner, repo, skillName) {
   }
 }
 
-var builderRegistryEntrySchema = z$1.object({
-  id: z$1.literal("skills-sh").describe("Stable registry identifier"),
-  enabled: z$1.boolean().describe("Whether this registry is enabled in the running deployment"),
-  label: z$1.string().describe("Human-readable registry name")
+var builderRegistryEntrySchema = z.object({
+  id: z.literal("skills-sh").describe("Stable registry identifier"),
+  enabled: z.boolean().describe("Whether this registry is enabled in the running deployment"),
+  label: z.string().describe("Human-readable registry name")
 });
-var builderRegistriesResponseSchema = z$1.object({
-  registries: z$1.array(builderRegistryEntrySchema)
+var builderRegistriesResponseSchema = z.object({
+  registries: z.array(builderRegistryEntrySchema)
 });
-var builderRegistryPathParams = z$1.object({
-  registryId: z$1.string().describe('Registry identifier (e.g. "skills-sh")')
+var builderRegistryPathParams = z.object({
+  registryId: z.string().describe('Registry identifier (e.g. "skills-sh")')
 });
-var builderRegistrySearchQuerySchema = z$1.object({
-  q: z$1.string().describe("Search query"),
-  limit: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)")
+var builderRegistrySearchQuerySchema = z.object({
+  q: z.string().describe("Search query"),
+  limit: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)")
 });
-var builderRegistryPopularQuerySchema = z$1.object({
-  limit: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)"),
-  offset: z$1.coerce.number().int().min(0).optional().default(0).describe("Offset for pagination (must be a multiple of `limit`)")
+var builderRegistryPopularQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)"),
+  offset: z.coerce.number().int().min(0).optional().default(0).describe("Offset for pagination (must be a multiple of `limit`)")
 }).refine((args) => args.offset % args.limit === 0, {
   message: "offset must be a multiple of limit (the upstream registry pages by `limit`)",
   path: ["offset"]
 });
-var builderRegistryPreviewQuerySchema = z$1.object({
-  owner: z$1.string().describe("GitHub repository owner"),
-  repo: z$1.string().describe("GitHub repository name"),
-  path: z$1.string().describe("Skill name within repo")
+var builderRegistryPreviewQuerySchema = z.object({
+  owner: z.string().describe("GitHub repository owner"),
+  repo: z.string().describe("GitHub repository name"),
+  path: z.string().describe("Skill name within repo")
 });
-var builderRegistryInstallBodySchema = z$1.object({
-  owner: z$1.string().describe("GitHub repository owner"),
-  repo: z$1.string().describe("GitHub repository name"),
-  skillName: z$1.string().describe("Skill name from the registry"),
-  visibility: z$1.enum(["private", "public"]).optional().describe("Visibility for the new stored skill")
+var builderRegistryInstallBodySchema = z.object({
+  owner: z.string().describe("GitHub repository owner"),
+  repo: z.string().describe("GitHub repository name"),
+  skillName: z.string().describe("Skill name from the registry"),
+  visibility: z.enum(["private", "public"]).optional().describe("Visibility for the new stored skill")
 });
-var builderRegistryInstallResponseSchema = z$1.object({
-  storedSkillId: z$1.string().describe("Id of the newly created stored skill"),
-  name: z$1.string().describe("Resolved skill name"),
-  filesWritten: z$1.number().describe("Number of files materialized into the skill version snapshot")
+var builderRegistryInstallResponseSchema = z.object({
+  storedSkillId: z.string().describe("Id of the newly created stored skill"),
+  name: z.string().describe("Resolved skill name"),
+  filesWritten: z.number().describe("Number of files materialized into the skill version snapshot")
 });
 
 // src/server/handlers/builder-registry.ts
@@ -27913,7 +27501,7 @@ async function requireEnabledRegistry(mastra, registryId) {
   const list = await resolveRegistries(mastra);
   const match = list.find((r) => r.id === registryId);
   if (!match || !match.enabled) {
-    throw new HTTPException$2(404, { message: "Registry not found" });
+    throw new HTTPException$1(404, { message: "Registry not found" });
   }
 }
 function buildFileTree(files) {
@@ -28000,7 +27588,7 @@ var BUILDER_REGISTRY_SEARCH_ROUTE = createRoute$1({
       await requireEnabledRegistry(mastra, registryId);
       return await searchSkillsSh({ q, limit });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error searching registry");
     }
   }
@@ -28022,7 +27610,7 @@ var BUILDER_REGISTRY_POPULAR_ROUTE = createRoute$1({
       await requireEnabledRegistry(mastra, registryId);
       return await getPopularSkillsSh({ limit, offset });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error fetching popular skills");
     }
   }
@@ -28044,7 +27632,7 @@ var BUILDER_REGISTRY_PREVIEW_ROUTE = createRoute$1({
       await requireEnabledRegistry(mastra, registryId);
       return await previewSkillsSh({ owner, repo, skillName });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error fetching skill preview");
     }
   }
@@ -28066,15 +27654,15 @@ var BUILDER_REGISTRY_INSTALL_ROUTE = createRoute$1({
       await requireEnabledRegistry(mastra, registryId);
       const storage = mastra.getStorage();
       if (!storage) {
-        throw new HTTPException$2(500, { message: "Storage is not configured" });
+        throw new HTTPException$1(500, { message: "Storage is not configured" });
       }
       const skillStore = await storage.getStore("skills");
       if (!skillStore) {
-        throw new HTTPException$2(500, { message: "Skills storage domain is not available" });
+        throw new HTTPException$1(500, { message: "Skills storage domain is not available" });
       }
       const result = await fetchSkillFiles$1(owner, repo, skillName);
       if (!result || result.files.length === 0) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Could not find skill "${skillName}" in ${owner}/${repo}.`
         });
       }
@@ -28085,13 +27673,13 @@ var BUILDER_REGISTRY_INSTALL_ROUTE = createRoute$1({
       const description = snapshot?.description ?? `Imported from ${owner}/${repo}`;
       const id = toSlug(resolvedName) || safeSkillId;
       if (!id) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Could not derive skill ID from registry skill metadata."
         });
       }
       const existing = await skillStore.getById(id);
       if (existing) {
-        throw new HTTPException$2(409, {
+        throw new HTTPException$1(409, {
           message: `Skill with id "${id}" already exists.`,
           // Surface the existing id so the client can deep-link.
           cause: { storedSkillId: id }
@@ -28125,67 +27713,67 @@ var BUILDER_REGISTRY_INSTALL_ROUTE = createRoute$1({
         filesWritten: result.files.length
       };
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error installing registry skill");
     }
   }
 });
 
-var channelPlatformPathParams = z$1.object({
-  platform: z$1.string().describe('Channel platform identifier (e.g., "slack")')
+var channelPlatformPathParams = z.object({
+  platform: z.string().describe('Channel platform identifier (e.g., "slack")')
 });
-var channelAgentPathParams = z$1.object({
-  platform: z$1.string().describe('Channel platform identifier (e.g., "slack")'),
-  agentId: z$1.string().describe("Agent identifier")
+var channelAgentPathParams = z.object({
+  platform: z.string().describe('Channel platform identifier (e.g., "slack")'),
+  agentId: z.string().describe("Agent identifier")
 });
-var connectChannelBodySchema = z$1.object({
-  agentId: z$1.string().describe("Agent identifier to connect"),
-  options: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Platform-specific connection options")
+var connectChannelBodySchema = z.object({
+  agentId: z.string().describe("Agent identifier to connect"),
+  options: z.record(z.string(), z.unknown()).optional().describe("Platform-specific connection options")
 });
-var channelPlatformInfoSchema = z$1.object({
-  id: z$1.string().describe("Platform identifier"),
-  name: z$1.string().describe("Human-readable platform name"),
-  isConfigured: z$1.boolean().describe("Whether the platform is ready to connect agents"),
-  connectOptionsSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema for connect options")
+var channelPlatformInfoSchema = z.object({
+  id: z.string().describe("Platform identifier"),
+  name: z.string().describe("Human-readable platform name"),
+  isConfigured: z.boolean().describe("Whether the platform is ready to connect agents"),
+  connectOptionsSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema for connect options")
 });
-var channelInstallationInfoSchema = z$1.object({
-  id: z$1.string().describe("Installation identifier"),
-  platform: z$1.string().describe("Platform identifier"),
-  agentId: z$1.string().describe("Connected agent identifier"),
-  status: z$1.enum(["active", "pending"]).describe("Installation status"),
-  displayName: z$1.string().optional().describe("Platform-specific display name"),
-  installedAt: z$1.coerce.date().optional().describe("Installation timestamp")
+var channelInstallationInfoSchema = z.object({
+  id: z.string().describe("Installation identifier"),
+  platform: z.string().describe("Platform identifier"),
+  agentId: z.string().describe("Connected agent identifier"),
+  status: z.enum(["active", "pending"]).describe("Installation status"),
+  displayName: z.string().optional().describe("Platform-specific display name"),
+  installedAt: z.coerce.date().optional().describe("Installation timestamp")
 });
-var channelConnectOAuthSchema = z$1.object({
-  type: z$1.literal("oauth").describe("OAuth-based connection requiring browser redirect"),
-  authorizationUrl: z$1.string().describe("OAuth authorization URL for user redirect"),
-  installationId: z$1.string().describe("Installation identifier")
+var channelConnectOAuthSchema = z.object({
+  type: z.literal("oauth").describe("OAuth-based connection requiring browser redirect"),
+  authorizationUrl: z.string().describe("OAuth authorization URL for user redirect"),
+  installationId: z.string().describe("Installation identifier")
 });
-var channelConnectDeepLinkSchema = z$1.object({
-  type: z$1.literal("deep_link").describe("Deep-link connection requiring native app interaction"),
-  url: z$1.string().describe("Deep link URL to open in platform app"),
-  installationId: z$1.string().describe("Installation identifier")
+var channelConnectDeepLinkSchema = z.object({
+  type: z.literal("deep_link").describe("Deep-link connection requiring native app interaction"),
+  url: z.string().describe("Deep link URL to open in platform app"),
+  installationId: z.string().describe("Installation identifier")
 });
-var channelConnectImmediateSchema = z$1.object({
-  type: z$1.literal("immediate").describe("Immediate connection with no user interaction needed"),
-  installationId: z$1.string().describe("Installation identifier")
+var channelConnectImmediateSchema = z.object({
+  type: z.literal("immediate").describe("Immediate connection with no user interaction needed"),
+  installationId: z.string().describe("Installation identifier")
 });
-var channelConnectResultSchema = z$1.discriminatedUnion("type", [
+var channelConnectResultSchema = z.discriminatedUnion("type", [
   channelConnectOAuthSchema,
   channelConnectDeepLinkSchema,
   channelConnectImmediateSchema
 ]);
-var listChannelPlatformsResponseSchema = z$1.array(channelPlatformInfoSchema);
-var listChannelInstallationsResponseSchema = z$1.array(channelInstallationInfoSchema);
+var listChannelPlatformsResponseSchema = z.array(channelPlatformInfoSchema);
+var listChannelInstallationsResponseSchema = z.array(channelInstallationInfoSchema);
 var connectChannelResponseSchema = channelConnectResultSchema;
-var disconnectChannelResponseSchema = z$1.object({
-  success: z$1.boolean()
+var disconnectChannelResponseSchema = z.object({
+  success: z.boolean()
 });
 
 // src/server/handlers/channels.ts
 function assertChannelsAvailable() {
   if (!coreFeatures.has("channels")) {
-    throw new HTTPException$2(501, { message: "Channels require a newer version of @mastra/core" });
+    throw new HTTPException$1(501, { message: "Channels require a newer version of @mastra/core" });
   }
 }
 function getChannelOrThrow(mastra, platform) {
@@ -28193,7 +27781,7 @@ function getChannelOrThrow(mastra, platform) {
   const channel = channels.find((c) => c.id === platform);
   if (!channel) {
     const available = channels.map((c) => c.id).join(", ");
-    throw new HTTPException$2(404, {
+    throw new HTTPException$1(404, {
       message: `Channel "${platform}" is not registered. Available: ${available || "none"}`
     });
   }
@@ -28218,13 +27806,13 @@ async function assertChannelAgentWriteAccess(mastra, requestContext, agentId, ac
     return;
   }
   if (action === "connect") {
-    throw new HTTPException$2(404, { message: `Agent "${agentId}" not found` });
+    throw new HTTPException$1(404, { message: `Agent "${agentId}" not found` });
   }
   const callerAuthorId = getCallerAuthorId(requestContext);
   if (!callerAuthorId && !requestContext.get(MASTRA_USER_KEY)) return;
   if (hasAdminBypass(requestContext, "channels")) return;
   if (hasScopedPermission({ requestContext, resource: "channels", action: "write" })) return;
-  throw new HTTPException$2(404, { message: "Not found" });
+  throw new HTTPException$1(404, { message: "Not found" });
 }
 var LIST_CHANNEL_PLATFORMS_ROUTE = createRoute$1({
   method: "GET",
@@ -28293,7 +27881,7 @@ var CONNECT_CHANNEL_ROUTE = createRoute$1({
     try {
       const channel = getChannelOrThrow(mastra, platform);
       if (!channel.connect) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `Channel "${platform}" does not support programmatic connection`
         });
       }
@@ -28319,7 +27907,7 @@ var DISCONNECT_CHANNEL_ROUTE = createRoute$1({
     try {
       const channel = getChannelOrThrow(mastra, platform);
       if (!channel.disconnect) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `Channel "${platform}" does not support programmatic disconnection`
         });
       }
@@ -28332,61 +27920,61 @@ var DISCONNECT_CHANNEL_ROUTE = createRoute$1({
   }
 });
 
-var vectorNamePathParams = z$1.object({
-  vectorName: z$1.string().describe("Name of the vector store")
+var vectorNamePathParams = z.object({
+  vectorName: z.string().describe("Name of the vector store")
 });
 var vectorIndexPathParams = vectorNamePathParams.extend({
-  indexName: z$1.string().describe("Name of the index")
+  indexName: z.string().describe("Name of the index")
 });
-var indexBodyBaseSchema = z$1.object({
-  indexName: z$1.string()
+var indexBodyBaseSchema = z.object({
+  indexName: z.string()
 });
 var upsertVectorsBodySchema = indexBodyBaseSchema.extend({
-  vectors: z$1.array(z$1.array(z$1.number())),
-  metadata: z$1.array(z$1.record(z$1.string(), z$1.any())).optional(),
-  ids: z$1.array(z$1.string()).optional()
+  vectors: z.array(z.array(z.number())),
+  metadata: z.array(z.record(z.string(), z.any())).optional(),
+  ids: z.array(z.string()).optional()
 });
 var createIndexBodySchema = indexBodyBaseSchema.extend({
-  dimension: z$1.number(),
-  metric: z$1.enum(["cosine", "euclidean", "dotproduct"]).optional()
+  dimension: z.number(),
+  metric: z.enum(["cosine", "euclidean", "dotproduct"]).optional()
 });
 var queryVectorsBodySchema = indexBodyBaseSchema.extend({
-  queryVector: z$1.array(z$1.number()),
-  topK: z$1.number().optional(),
-  filter: z$1.record(z$1.string(), z$1.any()).optional(),
-  includeVector: z$1.boolean().optional()
+  queryVector: z.array(z.number()),
+  topK: z.number().optional(),
+  filter: z.record(z.string(), z.any()).optional(),
+  includeVector: z.boolean().optional()
 });
-var upsertVectorsResponseSchema = z$1.object({
-  ids: z$1.array(z$1.string())
+var upsertVectorsResponseSchema = z.object({
+  ids: z.array(z.string())
 });
 var createIndexResponseSchema = successResponseSchema;
-var queryVectorsResponseSchema = z$1.array(z$1.unknown());
-var listIndexesResponseSchema = z$1.array(z$1.string());
-var describeIndexResponseSchema = z$1.object({
-  dimension: z$1.number(),
-  count: z$1.number(),
-  metric: z$1.string().optional()
+var queryVectorsResponseSchema = z.array(z.unknown());
+var listIndexesResponseSchema = z.array(z.string());
+var describeIndexResponseSchema = z.object({
+  dimension: z.number(),
+  count: z.number(),
+  metric: z.string().optional()
 });
 var deleteIndexResponseSchema = successResponseSchema;
-var listVectorsResponseSchema = z$1.object({
-  vectors: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string(),
-      type: z$1.string(),
-      description: z$1.string().optional()
+var listVectorsResponseSchema = z.object({
+  vectors: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      type: z.string(),
+      description: z.string().optional()
     })
   )
 });
-var listEmbeddersResponseSchema = z$1.object({
-  embedders: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      provider: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string(),
-      dimensions: z$1.number(),
-      maxInputTokens: z$1.number()
+var listEmbeddersResponseSchema = z.object({
+  embedders: z.array(
+    z.object({
+      id: z.string(),
+      provider: z.string(),
+      name: z.string(),
+      description: z.string(),
+      dimensions: z.number(),
+      maxInputTokens: z.number()
     })
   )
 });
@@ -28412,11 +28000,11 @@ __export(vector_exports, {
 });
 function getVector(mastra, vectorName) {
   if (!vectorName) {
-    throw new HTTPException$2(400, { message: "Vector name is required" });
+    throw new HTTPException$1(400, { message: "Vector name is required" });
   }
   const vector = mastra.getVector(vectorName);
   if (!vector) {
-    throw new HTTPException$2(404, { message: `Vector store ${vectorName} not found` });
+    throw new HTTPException$1(404, { message: `Vector store ${vectorName} not found` });
   }
   return vector;
 }
@@ -28430,7 +28018,7 @@ async function upsertVectors({
 }) {
   try {
     if (!indexName || !vectors || !Array.isArray(vectors)) {
-      throw new HTTPException$2(400, { message: "Invalid request index. indexName and vectors array are required." });
+      throw new HTTPException$1(400, { message: "Invalid request index. indexName and vectors array are required." });
     }
     const vector = getVector(mastra, vectorName);
     const result = await vector.upsert({ indexName, vectors, metadata, ids });
@@ -28448,12 +28036,12 @@ async function createIndex({
 }) {
   try {
     if (!indexName || typeof dimension !== "number" || dimension <= 0) {
-      throw new HTTPException$2(400, {
+      throw new HTTPException$1(400, {
         message: "Invalid request index, indexName and positive dimension number are required."
       });
     }
     if (metric && !["cosine", "euclidean", "dotproduct"].includes(metric)) {
-      throw new HTTPException$2(400, { message: "Invalid metric. Must be one of: cosine, euclidean, dotproduct" });
+      throw new HTTPException$1(400, { message: "Invalid metric. Must be one of: cosine, euclidean, dotproduct" });
     }
     const vector = getVector(mastra, vectorName);
     await vector.createIndex({ indexName, dimension, metric });
@@ -28473,7 +28061,7 @@ async function queryVectors({
 }) {
   try {
     if (!indexName || !queryVector || !Array.isArray(queryVector)) {
-      throw new HTTPException$2(400, { message: "Invalid request query. indexName and queryVector array are required." });
+      throw new HTTPException$1(400, { message: "Invalid request query. indexName and queryVector array are required." });
     }
     const vector = getVector(mastra, vectorName);
     const results = await vector.query({ indexName, queryVector, topK, filter, includeVector });
@@ -28498,7 +28086,7 @@ async function describeIndex({
 }) {
   try {
     if (!indexName) {
-      throw new HTTPException$2(400, { message: "Index name is required" });
+      throw new HTTPException$1(400, { message: "Index name is required" });
     }
     const vector = getVector(mastra, vectorName);
     const stats = await vector.describeIndex({ indexName });
@@ -28518,7 +28106,7 @@ async function deleteIndex({
 }) {
   try {
     if (!indexName) {
-      throw new HTTPException$2(400, { message: "Index name is required" });
+      throw new HTTPException$1(400, { message: "Index name is required" });
     }
     const vector = getVector(mastra, vectorName);
     await vector.deleteIndex({ indexName });
@@ -28560,7 +28148,7 @@ var UPSERT_VECTORS_ROUTE = createRoute$1({
     try {
       const { indexName, vectors, metadata, ids } = params;
       if (!indexName || !vectors || !Array.isArray(vectors)) {
-        throw new HTTPException$2(400, { message: "Invalid request index. indexName and vectors array are required." });
+        throw new HTTPException$1(400, { message: "Invalid request index. indexName and vectors array are required." });
       }
       const vector = getVector(mastra, vectorName);
       const result = await vector.upsert({ indexName, vectors, metadata, ids });
@@ -28585,12 +28173,12 @@ var CREATE_INDEX_ROUTE = createRoute$1({
     try {
       const { indexName, dimension, metric } = params;
       if (!indexName || typeof dimension !== "number" || dimension <= 0) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Invalid request index, indexName and positive dimension number are required."
         });
       }
       if (metric && !["cosine", "euclidean", "dotproduct"].includes(metric)) {
-        throw new HTTPException$2(400, { message: "Invalid metric. Must be one of: cosine, euclidean, dotproduct" });
+        throw new HTTPException$1(400, { message: "Invalid metric. Must be one of: cosine, euclidean, dotproduct" });
       }
       const vector = getVector(mastra, vectorName);
       await vector.createIndex({ indexName, dimension, metric });
@@ -28615,7 +28203,7 @@ var QUERY_VECTORS_ROUTE = createRoute$1({
     try {
       const { indexName, queryVector, topK, filter, includeVector } = params;
       if (!indexName || !queryVector || !Array.isArray(queryVector)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: "Invalid request query. indexName and queryVector array are required."
         });
       }
@@ -28660,7 +28248,7 @@ var DESCRIBE_INDEX_ROUTE = createRoute$1({
   handler: async ({ mastra, vectorName, indexName }) => {
     try {
       if (!indexName) {
-        throw new HTTPException$2(400, { message: "Index name is required" });
+        throw new HTTPException$1(400, { message: "Index name is required" });
       }
       const vector = getVector(mastra, vectorName);
       const stats = await vector.describeIndex({ indexName });
@@ -28687,7 +28275,7 @@ var DELETE_INDEX_ROUTE = createRoute$1({
   handler: async ({ mastra, vectorName, indexName }) => {
     try {
       if (!indexName) {
-        throw new HTTPException$2(400, { message: "Index name is required" });
+        throw new HTTPException$1(400, { message: "Index name is required" });
       }
       const vector = getVector(mastra, vectorName);
       await vector.deleteIndex({ indexName });
@@ -28988,28 +28576,28 @@ function createRoute(config) {
     onValidationError
   };
 }
-var voiceSpeakersResponseSchema = z$1.array(
-  z$1.object({
-    voiceId: z$1.string()
+var voiceSpeakersResponseSchema = z.array(
+  z.object({
+    voiceId: z.string()
   }).passthrough()
 );
-var generateSpeechBodySchema = z$1.object({
-  text: z$1.string(),
-  speakerId: z$1.string().optional()
+var generateSpeechBodySchema = z.object({
+  text: z.string(),
+  speakerId: z.string().optional()
 });
-var transcribeSpeechBodySchema = z$1.object({
-  audio: z$1.any(),
-  options: z$1.record(z$1.string(), z$1.any()).optional()
+var transcribeSpeechBodySchema = z.object({
+  audio: z.any(),
+  options: z.record(z.string(), z.any()).optional()
 });
-var transcribeSpeechResponseSchema = z$1.object({
-  text: z$1.string()
+var transcribeSpeechResponseSchema = z.object({
+  text: z.string()
 });
-var getListenerResponseSchema = z$1.any();
-var speakResponseSchema = z$1.any();
-var agentIdPathParams = z$1.object({
-  agentId: z$1.string().describe("Agent ID")
+var getListenerResponseSchema = z.any();
+var speakResponseSchema = z.any();
+var agentIdPathParams = z.object({
+  agentId: z.string().describe("Agent ID")
 });
-var HTTPException$1 = class HTTPException extends Error {
+var HTTPException = class extends Error {
   status;
   constructor(status, options = {}) {
     super(options.message, { cause: options.cause });
@@ -29023,7 +28611,7 @@ function isMastraVoiceError(error) {
 function handleError$1(error, defaultMessage) {
   const apiError = error;
   const status = apiError.status || apiError.details?.status || 500;
-  throw new HTTPException$1(status, {
+  throw new HTTPException(status, {
     message: apiError.message || defaultMessage,
     stack: apiError.stack,
     cause: apiError.cause
@@ -29032,7 +28620,7 @@ function handleError$1(error, defaultMessage) {
 function validateBody(data) {
   for (const [key, value] of Object.entries(data)) {
     if (value === void 0 || value === null || value === "") {
-      throw new HTTPException$1(400, { message: `${key} is required` });
+      throw new HTTPException(400, { message: `${key} is required` });
     }
   }
 }
@@ -29043,7 +28631,7 @@ async function getAgentFromSystem({
 }) {
   const logger = mastra.getLogger?.();
   if (!agentId) {
-    throw new HTTPException$1(400, { message: "Agent ID is required" });
+    throw new HTTPException(400, { message: "Agent ID is required" });
   }
   let agent;
   try {
@@ -29088,7 +28676,7 @@ async function getAgentFromSystem({
     }
   }
   if (!agent) {
-    throw new HTTPException$1(404, { message: `Agent with id ${agentId} not found` });
+    throw new HTTPException(404, { message: `Agent with id ${agentId} not found` });
   }
   return agent;
 }
@@ -29105,7 +28693,7 @@ var GET_SPEAKERS_ROUTE = createRoute({
   handler: async ({ mastra, agentId, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$1(400, { message: "Agent ID is required" });
+        throw new HTTPException(400, { message: "Agent ID is required" });
       }
       const agent = await getAgentFromSystem({ mastra, agentId, requestContext });
       const voice = await agent.getVoice({ requestContext });
@@ -29148,22 +28736,22 @@ var GENERATE_SPEECH_ROUTE = createRoute({
   handler: async ({ mastra, agentId, text, speakerId, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$1(400, { message: "Agent ID is required" });
+        throw new HTTPException(400, { message: "Agent ID is required" });
       }
       validateBody({ text });
       const agent = await getAgentFromSystem({ mastra, agentId, requestContext });
       const voice = await agent.getVoice({ requestContext });
       if (!voice) {
-        throw new HTTPException$1(400, { message: "Agent does not have voice capabilities" });
+        throw new HTTPException(400, { message: "Agent does not have voice capabilities" });
       }
       const audioStream = await Promise.resolve().then(() => voice.speak(text, { speaker: speakerId })).catch((err) => {
         if (isMastraVoiceError(err)) {
-          throw new HTTPException$1(400, { message: err.message });
+          throw new HTTPException(400, { message: err.message });
         }
         throw err;
       });
       if (!audioStream) {
-        throw new HTTPException$1(500, { message: "Failed to generate speech" });
+        throw new HTTPException(500, { message: "Failed to generate speech" });
       }
       const webStream = audioStream instanceof ReadableStream ? audioStream : audioStream instanceof Readable ? Readable.toWeb(audioStream) : audioStream;
       return new Response(webStream, {
@@ -29202,15 +28790,15 @@ var TRANSCRIBE_SPEECH_ROUTE = createRoute({
   handler: async ({ mastra, agentId, audio, options, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$1(400, { message: "Agent ID is required" });
+        throw new HTTPException(400, { message: "Agent ID is required" });
       }
       if (!audio) {
-        throw new HTTPException$1(400, { message: "Audio data is required" });
+        throw new HTTPException(400, { message: "Audio data is required" });
       }
       const agent = await getAgentFromSystem({ mastra, agentId, requestContext });
       const voice = await agent.getVoice({ requestContext });
       if (!voice) {
-        throw new HTTPException$1(400, { message: "Agent does not have voice capabilities" });
+        throw new HTTPException(400, { message: "Agent does not have voice capabilities" });
       }
       const audioStream = new Readable();
       audioStream.push(audio);
@@ -29249,11 +28837,11 @@ var GET_LISTENER_ROUTE = createRoute({
   handler: async ({ mastra, agentId, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$1(400, { message: "Agent ID is required" });
+        throw new HTTPException(400, { message: "Agent ID is required" });
       }
       const agent = mastra.getAgentById(agentId);
       if (!agent) {
-        throw new HTTPException$1(404, { message: "Agent not found" });
+        throw new HTTPException(404, { message: "Agent not found" });
       }
       const voice = await agent.getVoice({ requestContext });
       const listeners = await Promise.resolve().then(() => voice.getListener()).catch((err) => {
@@ -29339,17 +28927,17 @@ function isFilesystemPermissionError(error) {
 function handleWorkspaceError(error, defaultMessage) {
   if (isFilesystemNotFoundError(error)) {
     const message = error instanceof Error ? error.message : "Not found";
-    throw new HTTPException$2(404, { message });
+    throw new HTTPException$1(404, { message });
   }
   if (isFilesystemPermissionError(error)) {
     const message = error instanceof Error ? error.message : "Permission denied";
-    throw new HTTPException$2(403, { message });
+    throw new HTTPException$1(403, { message });
   }
   return handleError$2(error, defaultMessage);
 }
 function requireWorkspaceV1Support() {
   if (!coreFeatures.has("workspaces-v1")) {
-    throw new HTTPException$2(501, {
+    throw new HTTPException$1(501, {
       message: "Workspace v1 not supported by this version of @mastra/core. Please upgrade to a newer version."
     });
   }
@@ -29390,12 +28978,12 @@ function buildSkillInstallPath(filesystem, safeSkillId, requestedMount) {
     if (requestedMount) {
       const mountFs = filesystem.mounts.get(requestedMount);
       if (!mountFs) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `Mount "${requestedMount}" not found. Available mounts: ${filesystem.mountPaths.join(", ")}`
         });
       }
       if (mountFs.readOnly) {
-        throw new HTTPException$2(403, { message: `Mount "${requestedMount}" is read-only` });
+        throw new HTTPException$1(403, { message: `Mount "${requestedMount}" is read-only` });
       }
       return `${stripTrailingSlash(requestedMount)}/${SKILLS_SH_DIR}/${safeSkillId}`;
     }
@@ -29404,7 +28992,7 @@ function buildSkillInstallPath(filesystem, safeSkillId, requestedMount) {
         return `${stripTrailingSlash(mountPath)}/${SKILLS_SH_DIR}/${safeSkillId}`;
       }
     }
-    throw new HTTPException$2(403, { message: "No writable mount available for skill installation" });
+    throw new HTTPException$1(403, { message: "No writable mount available for skill installation" });
   }
   return `${SKILLS_SH_DIR}/${safeSkillId}`;
 }
@@ -29597,15 +29185,15 @@ var WORKSPACE_FS_READ_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path) {
-        throw new HTTPException$2(400, { message: "Path is required" });
+        throw new HTTPException$1(400, { message: "Path is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
-        throw new HTTPException$2(404, { message: "No workspace filesystem configured" });
+        throw new HTTPException$1(404, { message: "No workspace filesystem configured" });
       }
       const decodedPath = decodeURIComponent(path);
       if (!await workspace.filesystem.exists(decodedPath)) {
-        throw new HTTPException$2(404, { message: `Path "${decodedPath}" not found` });
+        throw new HTTPException$1(404, { message: `Path "${decodedPath}" not found` });
       }
       const content = await workspace.filesystem.readFile(decodedPath, {
         encoding: encoding || "utf-8"
@@ -29634,14 +29222,14 @@ var WORKSPACE_FS_WRITE_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path || content === void 0) {
-        throw new HTTPException$2(400, { message: "Path and content are required" });
+        throw new HTTPException$1(400, { message: "Path and content are required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
-        throw new HTTPException$2(404, { message: "No workspace filesystem configured" });
+        throw new HTTPException$1(404, { message: "No workspace filesystem configured" });
       }
       if (workspace.filesystem?.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is in read-only mode" });
+        throw new HTTPException$1(403, { message: "Workspace is in read-only mode" });
       }
       const decodedPath = decodeURIComponent(path);
       let fileContent = content;
@@ -29672,7 +29260,7 @@ var WORKSPACE_FS_LIST_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path) {
-        throw new HTTPException$2(400, { message: "Path is required" });
+        throw new HTTPException$1(400, { message: "Path is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
@@ -29684,7 +29272,7 @@ var WORKSPACE_FS_LIST_ROUTE = createRoute$1({
       }
       const decodedPath = decodeURIComponent(path);
       if (!await workspace.filesystem.exists(decodedPath)) {
-        throw new HTTPException$2(404, { message: `Path "${decodedPath}" not found` });
+        throw new HTTPException$1(404, { message: `Path "${decodedPath}" not found` });
       }
       const entries = await workspace.filesystem.readdir(decodedPath, { recursive });
       return {
@@ -29710,19 +29298,19 @@ var WORKSPACE_FS_DELETE_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path) {
-        throw new HTTPException$2(400, { message: "Path is required" });
+        throw new HTTPException$1(400, { message: "Path is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
-        throw new HTTPException$2(404, { message: "No workspace filesystem configured" });
+        throw new HTTPException$1(404, { message: "No workspace filesystem configured" });
       }
       if (workspace.filesystem?.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is in read-only mode" });
+        throw new HTTPException$1(403, { message: "Workspace is in read-only mode" });
       }
       const decodedPath = decodeURIComponent(path);
       const exists = await workspace.filesystem.exists(decodedPath);
       if (!exists && !force) {
-        throw new HTTPException$2(404, { message: `Path "${decodedPath}" not found` });
+        throw new HTTPException$1(404, { message: `Path "${decodedPath}" not found` });
       }
       if (exists) {
         try {
@@ -29754,14 +29342,14 @@ var WORKSPACE_FS_MKDIR_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path) {
-        throw new HTTPException$2(400, { message: "Path is required" });
+        throw new HTTPException$1(400, { message: "Path is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
-        throw new HTTPException$2(404, { message: "No workspace filesystem configured" });
+        throw new HTTPException$1(404, { message: "No workspace filesystem configured" });
       }
       if (workspace.filesystem?.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is in read-only mode" });
+        throw new HTTPException$1(403, { message: "Workspace is in read-only mode" });
       }
       const decodedPath = decodeURIComponent(path);
       await workspace.filesystem.mkdir(decodedPath, { recursive: recursive ?? true });
@@ -29788,15 +29376,15 @@ var WORKSPACE_FS_STAT_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path) {
-        throw new HTTPException$2(400, { message: "Path is required" });
+        throw new HTTPException$1(400, { message: "Path is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace?.filesystem) {
-        throw new HTTPException$2(404, { message: "No workspace filesystem configured" });
+        throw new HTTPException$1(404, { message: "No workspace filesystem configured" });
       }
       const decodedPath = decodeURIComponent(path);
       if (!await workspace.filesystem.exists(decodedPath)) {
-        throw new HTTPException$2(404, { message: `Path "${decodedPath}" not found` });
+        throw new HTTPException$1(404, { message: `Path "${decodedPath}" not found` });
       }
       const stat = await workspace.filesystem.stat(decodedPath);
       return {
@@ -29826,7 +29414,7 @@ var WORKSPACE_SEARCH_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!query) {
-        throw new HTTPException$2(400, { message: "Search query is required" });
+        throw new HTTPException$1(400, { message: "Search query is required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace) {
@@ -29889,15 +29477,15 @@ var WORKSPACE_INDEX_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!path || content === void 0) {
-        throw new HTTPException$2(400, { message: "Path and content are required" });
+        throw new HTTPException$1(400, { message: "Path and content are required" });
       }
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace) {
-        throw new HTTPException$2(404, { message: "No workspace configured" });
+        throw new HTTPException$1(404, { message: "No workspace configured" });
       }
       const canSearch = workspace.canBM25 || workspace.canVector;
       if (!canSearch) {
-        throw new HTTPException$2(400, { message: "Workspace does not have search configured" });
+        throw new HTTPException$1(400, { message: "Workspace does not have search configured" });
       }
       await workspace.index(path, content, { metadata });
       return {
@@ -29978,17 +29566,17 @@ var WORKSPACE_GET_SKILL_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!skillName) {
-        throw new HTTPException$2(400, { message: "Skill name is required" });
+        throw new HTTPException$1(400, { message: "Skill name is required" });
       }
       const identifier = path ? decodeURIComponent(path) : skillName;
       const skills = await getSkillsById(mastra, workspaceId);
       if (!skills) {
-        throw new HTTPException$2(404, { message: "No workspace with skills configured" });
+        throw new HTTPException$1(404, { message: "No workspace with skills configured" });
       }
       await skills.maybeRefresh({ requestContext });
       const skill = await skills.get(identifier);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Skill "${identifier}" not found` });
+        throw new HTTPException$1(404, { message: `Skill "${identifier}" not found` });
       }
       return {
         name: skill.name,
@@ -30022,17 +29610,17 @@ var WORKSPACE_LIST_SKILL_REFERENCES_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!skillName) {
-        throw new HTTPException$2(400, { message: "Skill name is required" });
+        throw new HTTPException$1(400, { message: "Skill name is required" });
       }
       const identifier = path ? decodeURIComponent(path) : skillName;
       const skills = await getSkillsById(mastra, workspaceId);
       if (!skills) {
-        throw new HTTPException$2(404, { message: "No workspace with skills configured" });
+        throw new HTTPException$1(404, { message: "No workspace with skills configured" });
       }
       await skills.maybeRefresh({ requestContext });
       const skill = await skills.get(identifier);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Skill "${identifier}" not found` });
+        throw new HTTPException$1(404, { message: `Skill "${identifier}" not found` });
       }
       const references = await skills.listReferences(identifier);
       return {
@@ -30058,28 +29646,28 @@ var WORKSPACE_GET_SKILL_REFERENCE_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!skillName || !referencePath) {
-        throw new HTTPException$2(400, { message: "Skill name and reference path are required" });
+        throw new HTTPException$1(400, { message: "Skill name and reference path are required" });
       }
       const identifier = skillPath ? decodeURIComponent(skillPath) : skillName;
       const skills = await getSkillsById(mastra, workspaceId);
       if (!skills) {
-        throw new HTTPException$2(404, { message: "No workspace with skills configured" });
+        throw new HTTPException$1(404, { message: "No workspace with skills configured" });
       }
       await skills.maybeRefresh({ requestContext });
       const skill = await skills.get(identifier);
       if (!skill) {
-        throw new HTTPException$2(404, { message: `Skill "${identifier}" not found` });
+        throw new HTTPException$1(404, { message: `Skill "${identifier}" not found` });
       }
       let decodedPath;
       try {
         decodedPath = decodeURIComponent(referencePath);
       } catch {
-        throw new HTTPException$2(400, { message: "Malformed referencePath" });
+        throw new HTTPException$1(400, { message: "Malformed referencePath" });
       }
       assertSafeFilePath(decodedPath);
       const content = await skills.getReference(identifier, `references/${decodedPath}`);
       if (content === null) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Reference "${decodedPath}" not found in skill "${identifier}"`
         });
       }
@@ -30107,7 +29695,7 @@ var WORKSPACE_SEARCH_SKILLS_ROUTE = createRoute$1({
     try {
       requireWorkspaceV1Support();
       if (!query) {
-        throw new HTTPException$2(400, { message: "Search query is required" });
+        throw new HTTPException$1(400, { message: "Search query is required" });
       }
       const skills = await getSkillsById(mastra, workspaceId);
       if (!skills) {
@@ -30160,7 +29748,7 @@ var WORKSPACE_SKILLS_SH_SEARCH_ROUTE = createRoute$1({
       const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
       if (!response.ok) {
-        throw new HTTPException$2(502, {
+        throw new HTTPException$1(502, {
           message: `Skills API error: ${response.status} ${response.statusText}`
         });
       }
@@ -30172,7 +29760,7 @@ var WORKSPACE_SKILLS_SH_SEARCH_ROUTE = createRoute$1({
         count: data.total
       };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error searching skills");
@@ -30198,7 +29786,7 @@ var WORKSPACE_SKILLS_SH_POPULAR_ROUTE = createRoute$1({
       const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
       if (!response.ok) {
-        throw new HTTPException$2(502, {
+        throw new HTTPException$1(502, {
           message: `Skills API error: ${response.status} ${response.statusText}`
         });
       }
@@ -30210,7 +29798,7 @@ var WORKSPACE_SKILLS_SH_POPULAR_ROUTE = createRoute$1({
         offset
       };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error fetching popular skills");
@@ -30220,7 +29808,7 @@ var WORKSPACE_SKILLS_SH_POPULAR_ROUTE = createRoute$1({
 var SKILL_NAME_REGEX = /^[a-z0-9][a-z0-9-_]*$/i;
 function assertSafeSkillName(name) {
   if (!SKILL_NAME_REGEX.test(name)) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: `Invalid skill name "${name}". Names must start with alphanumeric and contain only letters, numbers, hyphens, and underscores.`
     });
   }
@@ -30228,14 +29816,14 @@ function assertSafeSkillName(name) {
 }
 function assertSafeFilePath(filePath) {
   if (filePath.startsWith("/") || /^[a-zA-Z]:/.test(filePath)) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: `Invalid file path "${filePath}". Absolute paths are not allowed.`
     });
   }
   const segments = filePath.split("/");
   for (const segment of segments) {
     if (segment === ".." || segment === ".") {
-      throw new HTTPException$2(400, {
+      throw new HTTPException$1(400, {
         message: `Invalid file path "${filePath}". Path traversal is not allowed.`
       });
     }
@@ -30274,20 +29862,20 @@ var WORKSPACE_SKILLS_SH_PREVIEW_ROUTE = createRoute$1({
       const response = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
       if (!response.ok) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Could not find skill "${skillName}" for ${owner}/${repo}`
         });
       }
       const data = await response.json();
       const content = data.instructions || data.raw || "";
       if (!content) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `No content available for skill "${skillName}"`
         });
       }
       return { content };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error fetching skill preview");
@@ -30309,17 +29897,17 @@ var WORKSPACE_SKILLS_SH_INSTALL_ROUTE = createRoute$1({
       requireWorkspaceV1Support();
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace) {
-        throw new HTTPException$2(404, { message: "Workspace not found" });
+        throw new HTTPException$1(404, { message: "Workspace not found" });
       }
       if (!workspace.filesystem) {
-        throw new HTTPException$2(400, { message: "Workspace filesystem not available" });
+        throw new HTTPException$1(400, { message: "Workspace filesystem not available" });
       }
       if (workspace.filesystem.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is read-only" });
+        throw new HTTPException$1(403, { message: "Workspace is read-only" });
       }
       const result = await fetchSkillFiles(owner, repo, skillName);
       if (!result || result.files.length === 0) {
-        throw new HTTPException$2(404, {
+        throw new HTTPException$1(404, {
           message: `Could not find skill "${skillName}" in ${owner}/${repo}.`
         });
       }
@@ -30369,7 +29957,7 @@ var WORKSPACE_SKILLS_SH_INSTALL_ROUTE = createRoute$1({
         filesWritten
       };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error installing skill");
@@ -30391,13 +29979,13 @@ var WORKSPACE_SKILLS_SH_REMOVE_ROUTE = createRoute$1({
       requireWorkspaceV1Support();
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace) {
-        throw new HTTPException$2(404, { message: "Workspace not found" });
+        throw new HTTPException$1(404, { message: "Workspace not found" });
       }
       if (!workspace.filesystem) {
-        throw new HTTPException$2(400, { message: "Workspace filesystem not available" });
+        throw new HTTPException$1(400, { message: "Workspace filesystem not available" });
       }
       if (workspace.filesystem.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is read-only" });
+        throw new HTTPException$1(403, { message: "Workspace is read-only" });
       }
       const safeSkillName = assertSafeSkillName(skillName);
       const allSkills = await workspace.skills?.list();
@@ -30406,7 +29994,7 @@ var WORKSPACE_SKILLS_SH_REMOVE_ROUTE = createRoute$1({
       try {
         await workspace.filesystem.stat(skillPath);
       } catch {
-        throw new HTTPException$2(404, { message: `Skill "${skillName}" not found at ${skillPath}` });
+        throw new HTTPException$1(404, { message: `Skill "${skillName}" not found at ${skillPath}` });
       }
       await workspace.filesystem.rmdir(skillPath, { recursive: true });
       if (workspace.skills?.removeSkill) {
@@ -30424,7 +30012,7 @@ var WORKSPACE_SKILLS_SH_REMOVE_ROUTE = createRoute$1({
         removedPath: skillPath
       };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error removing skill");
@@ -30446,13 +30034,13 @@ var WORKSPACE_SKILLS_SH_UPDATE_ROUTE = createRoute$1({
       requireWorkspaceV1Support();
       const workspace = await getWorkspaceById(mastra, workspaceId);
       if (!workspace) {
-        throw new HTTPException$2(404, { message: "Workspace not found" });
+        throw new HTTPException$1(404, { message: "Workspace not found" });
       }
       if (!workspace.filesystem) {
-        throw new HTTPException$2(400, { message: "Workspace filesystem not available" });
+        throw new HTTPException$1(400, { message: "Workspace filesystem not available" });
       }
       if (workspace.filesystem.readOnly) {
-        throw new HTTPException$2(403, { message: "Workspace is read-only" });
+        throw new HTTPException$1(403, { message: "Workspace is read-only" });
       }
       const results = [];
       let skillsToUpdate;
@@ -30565,7 +30153,7 @@ var WORKSPACE_SKILLS_SH_UPDATE_ROUTE = createRoute$1({
       }
       return { updated: results };
     } catch (error) {
-      if (error instanceof HTTPException$2) {
+      if (error instanceof HTTPException$1) {
         throw error;
       }
       return handleError$2(error, "Error updating skills");
@@ -30733,7 +30321,7 @@ var GET_TOOL_BY_ID_ROUTE = createRoute$1({
         tool = await findToolInAgents(mastra, toolId, requestContext);
       }
       if (!tool) {
-        throw new HTTPException$2(404, { message: "Tool not found" });
+        throw new HTTPException$1(404, { message: "Tool not found" });
       }
       return serializeTool(tool);
     } catch (error) {
@@ -30756,7 +30344,7 @@ var EXECUTE_TOOL_ROUTE = createRoute$1({
   handler: async ({ mastra, runId, toolId, registeredTools, requestContext, ...bodyParams }) => {
     try {
       if (!toolId) {
-        throw new HTTPException$2(400, { message: "Tool ID is required" });
+        throw new HTTPException$1(400, { message: "Tool ID is required" });
       }
       let tool;
       if (registeredTools && Object.keys(registeredTools).length > 0) {
@@ -30772,10 +30360,10 @@ var EXECUTE_TOOL_ROUTE = createRoute$1({
         tool = await findToolInAgents(mastra, toolId, requestContext);
       }
       if (!tool) {
-        throw new HTTPException$2(404, { message: "Tool not found" });
+        throw new HTTPException$1(404, { message: "Tool not found" });
       }
       if (!tool?.execute) {
-        throw new HTTPException$2(400, { message: "Tool is not executable" });
+        throw new HTTPException$1(400, { message: "Tool is not executable" });
       }
       const { data } = bodyParams;
       validateBody$1({ data });
@@ -30816,13 +30404,13 @@ var GET_AGENT_TOOL_ROUTE = createRoute$1({
   handler: async ({ mastra, agentId, toolId, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$2(400, { message: "Agent ID is required" });
+        throw new HTTPException$1(400, { message: "Agent ID is required" });
       }
       const agent = await getAgentFromSystem$1({ mastra, agentId });
       const agentTools = await agent.listTools({ requestContext });
       const tool = Object.values(agentTools || {}).find((tool2) => tool2.id === toolId);
       if (!tool) {
-        throw new HTTPException$2(404, { message: "Tool not found" });
+        throw new HTTPException$1(404, { message: "Tool not found" });
       }
       return serializeTool(tool);
     } catch (error) {
@@ -30844,16 +30432,16 @@ var EXECUTE_AGENT_TOOL_ROUTE = createRoute$1({
   handler: async ({ mastra, agentId, toolId, data, requestContext }) => {
     try {
       if (!agentId) {
-        throw new HTTPException$2(400, { message: "Agent ID is required" });
+        throw new HTTPException$1(400, { message: "Agent ID is required" });
       }
       const agent = await getAgentFromSystem$1({ mastra, agentId });
       const agentTools = await agent.listTools({ requestContext });
       const tool = Object.values(agentTools || {}).find((tool2) => tool2.id === toolId);
       if (!tool) {
-        throw new HTTPException$2(404, { message: "Tool not found" });
+        throw new HTTPException$1(404, { message: "Tool not found" });
       }
       if (!tool?.execute) {
-        throw new HTTPException$2(400, { message: "Tool is not executable" });
+        throw new HTTPException$1(400, { message: "Tool is not executable" });
       }
       const result = await tool.execute(data, {
         mastra,
@@ -30868,59 +30456,59 @@ var EXECUTE_AGENT_TOOL_ROUTE = createRoute$1({
   }
 });
 
-var scoringSamplingConfigSchema = z$1.object({});
-var mastraScorerConfigSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string().optional(),
-  description: z$1.string(),
-  type: z$1.unknown().optional(),
-  judge: z$1.unknown().optional()
+var scoringSamplingConfigSchema = z.object({});
+var mastraScorerConfigSchema = z.object({
+  id: z.string(),
+  name: z.string().optional(),
+  description: z.string(),
+  type: z.unknown().optional(),
+  judge: z.unknown().optional()
 });
-var mastraScorerSchema = z$1.object({
+var mastraScorerSchema = z.object({
   config: mastraScorerConfigSchema
 });
-var scorerEntrySchema = z$1.object({
+var scorerEntrySchema = z.object({
   scorer: mastraScorerSchema,
   sampling: scoringSamplingConfigSchema.optional(),
-  agentIds: z$1.array(z$1.string()),
-  agentNames: z$1.array(z$1.string()),
-  workflowIds: z$1.array(z$1.string()),
-  isRegistered: z$1.boolean(),
-  source: z$1.enum(["code", "stored", "fs"])
+  agentIds: z.array(z.string()),
+  agentNames: z.array(z.string()),
+  workflowIds: z.array(z.string()),
+  isRegistered: z.boolean(),
+  source: z.enum(["code", "stored", "fs"])
 });
-var listScorersResponseSchema = z$1.record(z$1.string(), scorerEntrySchema);
-var scorerIdPathParams = z$1.object({
-  scorerId: z$1.string().describe("Unique identifier for the scorer")
+var listScorersResponseSchema = z.record(z.string(), scorerEntrySchema);
+var scorerIdPathParams = z.object({
+  scorerId: z.string().describe("Unique identifier for the scorer")
 });
-var entityPathParams = z$1.object({
-  entityType: z$1.string().describe("Type of the entity (AGENT or WORKFLOW)"),
-  entityId: z$1.string().describe("Unique identifier for the entity")
+var entityPathParams = z.object({
+  entityType: z.string().describe("Type of the entity (AGENT or WORKFLOW)"),
+  entityId: z.string().describe("Unique identifier for the entity")
 });
-var listScoresByRunIdQuerySchema = z$1.object({
-  page: z$1.coerce.number().optional().default(0),
-  perPage: z$1.coerce.number().optional().default(10)
+var listScoresByRunIdQuerySchema = z.object({
+  page: z.coerce.number().optional().default(0),
+  perPage: z.coerce.number().optional().default(10)
 });
-var listScoresByScorerIdQuerySchema = z$1.object({
-  page: z$1.coerce.number().optional().default(0),
-  perPage: z$1.coerce.number().optional().default(10),
-  entityId: z$1.string().optional(),
-  entityType: z$1.string().optional()
+var listScoresByScorerIdQuerySchema = z.object({
+  page: z.coerce.number().optional().default(0),
+  perPage: z.coerce.number().optional().default(10),
+  entityId: z.string().optional(),
+  entityType: z.string().optional()
 });
-var listScoresByEntityIdQuerySchema = z$1.object({
-  page: z$1.coerce.number().optional().default(0),
-  perPage: z$1.coerce.number().optional().default(10)
+var listScoresByEntityIdQuerySchema = z.object({
+  page: z.coerce.number().optional().default(0),
+  perPage: z.coerce.number().optional().default(10)
 });
-var saveScoreBodySchema = z$1.object({
-  score: z$1.unknown()
+var saveScoreBodySchema = z.object({
+  score: z.unknown()
   // ScoreRowData - complex type
 });
-var scoresWithPaginationResponseSchema = z$1.object({
+var scoresWithPaginationResponseSchema = z.object({
   pagination: paginationInfoSchema$1,
-  scores: z$1.array(z$1.unknown())
+  scores: z.array(z.unknown())
   // Array of score records
 });
-var saveScoreResponseSchema = z$1.object({
-  score: z$1.unknown()
+var saveScoreResponseSchema = z.object({
+  score: z.unknown()
   // ScoreRowData
 });
 
@@ -31204,7 +30792,7 @@ var SAVE_SCORE_ROUTE = createRoute$1({
       const scoresStore = await mastra.getStorage()?.getStore("scores");
       const result = await scoresStore?.saveScore?.(score);
       if (!result) {
-        throw new HTTPException$2(500, { message: "Storage not configured" });
+        throw new HTTPException$1(500, { message: "Storage not configured" });
       }
       return result;
     } catch (error) {
@@ -32814,7 +32402,7 @@ async function persistResponseTurnRecord({
   messages
 }) {
   if (!memoryStore) {
-    throw new HTTPException$2(500, { message: "Memory storage was not available while storing the response" });
+    throw new HTTPException$1(500, { message: "Memory storage was not available while storing the response" });
   }
   const normalizedMessages = messages.map((message) => ({
     ...message,
@@ -32926,7 +32514,7 @@ async function resolveThreadExecutionContext({
   requestContext
 }) {
   if (conversationId && previousResponseTurnRecord && previousResponseTurnRecord.thread.id !== conversationId) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: "conversation_id and previous_response_id must reference the same conversation thread when both are provided"
     });
   }
@@ -32944,7 +32532,7 @@ async function resolveThreadExecutionContext({
   const memory = await agent.getMemory({ requestContext });
   if (!memory) {
     if (conversationId) {
-      throw new HTTPException$2(400, {
+      throw new HTTPException$1(400, {
         message: "conversation_id requires the target agent to have memory configured"
       });
     }
@@ -32953,7 +32541,7 @@ async function resolveThreadExecutionContext({
   if (conversationId) {
     const existingThread2 = await memory.getThreadById({ threadId: conversationId });
     if (!existingThread2) {
-      throw new HTTPException$2(404, { message: `Conversation ${conversationId} was not found` });
+      throw new HTTPException$1(404, { message: `Conversation ${conversationId} was not found` });
     }
     await enforceThreadAccess({
       mastra: agent.getMastraInstance(),
@@ -33025,12 +32613,12 @@ async function resolveResponseAgent({
   agentId
 }) {
   if (!agentId) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: "Responses requests require an agent_id"
     });
   }
   if (!mastra) {
-    throw new HTTPException$2(500, { message: "Mastra instance is required for agent-backed responses" });
+    throw new HTTPException$1(500, { message: "Mastra instance is required for agent-backed responses" });
   }
   return getAgentFromSystem$1({ mastra, agentId });
 }
@@ -33041,7 +32629,7 @@ async function resolveAgentMemoryStore({
 }) {
   const agentMemoryStore = await getAgentMemoryStore({ agent, requestContext });
   if (!agentMemoryStore) {
-    throw new HTTPException$2(400, { message: errorMessage });
+    throw new HTTPException$1(400, { message: errorMessage });
   }
   return agentMemoryStore;
 }
@@ -33275,18 +32863,18 @@ async function prepareCreateResponseRequest({
           if (owningResponseTurnRecord.metadata.agentId === body.agent_id) {
             previousResponseTurnRecord = owningResponseTurnRecord;
           } else {
-            throw new HTTPException$2(400, {
+            throw new HTTPException$1(400, {
               message: `Stored response ${body.previous_response_id} belongs to agent ${owningResponseTurnRecord.metadata.agentId}, not ${body.agent_id}`
             });
           }
         }
         if (!previousResponseTurnRecord) {
-          throw new HTTPException$2(404, { message: `Stored response ${body.previous_response_id} was not found` });
+          throw new HTTPException$1(404, { message: `Stored response ${body.previous_response_id} was not found` });
         }
       }
     } else {
       if (!mastra) {
-        throw new HTTPException$2(500, { message: "Mastra instance is required for agent-backed responses" });
+        throw new HTTPException$1(500, { message: "Mastra instance is required for agent-backed responses" });
       }
       previousResponseTurnRecord = await findResponseTurnRecordAcrossAgents({
         mastra,
@@ -33294,7 +32882,7 @@ async function prepareCreateResponseRequest({
         requestContext
       });
       if (!previousResponseTurnRecord) {
-        throw new HTTPException$2(404, { message: `Stored response ${body.previous_response_id} was not found` });
+        throw new HTTPException$1(404, { message: `Stored response ${body.previous_response_id} was not found` });
       }
     }
   }
@@ -33314,7 +32902,7 @@ async function prepareCreateResponseRequest({
     if (resolvedModel.modelId) {
       return resolvedModel.modelId;
     }
-    throw new HTTPException$2(500, {
+    throw new HTTPException$1(500, {
       message: "Responses route could not determine the effective model for this request"
     });
   })();
@@ -33338,7 +32926,7 @@ async function prepareCreateResponseRequest({
     requestContext
   });
   if (shouldStore && !threadContext) {
-    throw new HTTPException$2(400, {
+    throw new HTTPException$1(400, {
       message: "Stored responses require the target agent to have memory configured"
     });
   }
@@ -33583,7 +33171,7 @@ var GET_RESPONSE_ROUTE = createRoute$1({
     try {
       const responseTurnRecord = await findResponseTurnRecordAcrossAgents({ mastra, responseId, requestContext });
       if (!responseTurnRecord) {
-        throw new HTTPException$2(404, { message: `Stored response ${responseId} was not found` });
+        throw new HTTPException$1(404, { message: `Stored response ${responseId} was not found` });
       }
       return mapResponseTurnRecordToResponse(responseTurnRecord);
     } catch (error) {
@@ -33606,7 +33194,7 @@ var DELETE_RESPONSE_ROUTE = createRoute$1({
     try {
       const responseTurnRecord = await findResponseTurnRecordAcrossAgents({ mastra, responseId, requestContext });
       if (!responseTurnRecord) {
-        throw new HTTPException$2(404, { message: `Stored response ${responseId} was not found` });
+        throw new HTTPException$1(404, { message: `Stored response ${responseId} was not found` });
       }
       await deleteResponseTurnRecord({ responseTurnRecord });
       const response = {
@@ -33621,92 +33209,92 @@ var DELETE_RESPONSE_ROUTE = createRoute$1({
   }
 });
 
-var mcpServerIdPathParams = z$1.object({
-  serverId: z$1.string().describe("MCP server ID")
+var mcpServerIdPathParams = z.object({
+  serverId: z.string().describe("MCP server ID")
 });
-var mcpServerDetailPathParams = z$1.object({
-  id: z$1.string().describe("MCP server ID")
+var mcpServerDetailPathParams = z.object({
+  id: z.string().describe("MCP server ID")
 });
-var mcpServerToolPathParams = z$1.object({
-  serverId: z$1.string().describe("MCP server ID"),
-  toolId: z$1.string().describe("Tool ID")
+var mcpServerToolPathParams = z.object({
+  serverId: z.string().describe("MCP server ID"),
+  toolId: z.string().describe("Tool ID")
 });
-var executeToolBodySchema = z$1.object({
-  data: z$1.unknown().optional()
+var executeToolBodySchema = z.object({
+  data: z.unknown().optional()
 });
 var listMcpServersQuerySchema = createCombinedPaginationSchema();
-var getMcpServerDetailQuerySchema = z$1.object({
-  version: z$1.string().optional()
+var getMcpServerDetailQuerySchema = z.object({
+  version: z.string().optional()
 });
-var versionDetailSchema = z$1.object({
-  version: z$1.string(),
-  release_date: z$1.string(),
-  is_latest: z$1.boolean()
+var versionDetailSchema = z.object({
+  version: z.string(),
+  release_date: z.string(),
+  is_latest: z.boolean()
 });
-var serverInfoSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
+var serverInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
   version_detail: versionDetailSchema
 });
-var listMcpServersResponseSchema = z$1.object({
-  servers: z$1.array(serverInfoSchema),
-  total_count: z$1.number(),
-  next: z$1.string().nullable()
+var listMcpServersResponseSchema = z.object({
+  servers: z.array(serverInfoSchema),
+  total_count: z.number(),
+  next: z.string().nullable()
 });
-var serverDetailSchema = z$1.object({
-  id: z$1.string(),
-  name: z$1.string(),
-  description: z$1.string().optional(),
+var serverDetailSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
   version_detail: versionDetailSchema,
-  package_canonical: z$1.string().optional(),
-  packages: z$1.array(z$1.unknown()).optional(),
-  remotes: z$1.array(z$1.unknown()).optional()
+  package_canonical: z.string().optional(),
+  packages: z.array(z.unknown()).optional(),
+  remotes: z.array(z.unknown()).optional()
 });
-var mcpToolInfoSchema = z$1.object({
-  name: z$1.string(),
-  description: z$1.string().optional(),
-  inputSchema: z$1.unknown(),
-  outputSchema: z$1.unknown().optional(),
-  toolType: z$1.string().optional(),
-  _meta: z$1.record(z$1.string(), z$1.unknown()).optional()
+var mcpToolInfoSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  inputSchema: z.unknown(),
+  outputSchema: z.unknown().optional(),
+  toolType: z.string().optional(),
+  _meta: z.record(z.string(), z.unknown()).optional()
 });
-var listMcpServerToolsResponseSchema = z$1.object({
-  tools: z$1.array(mcpToolInfoSchema)
+var listMcpServerToolsResponseSchema = z.object({
+  tools: z.array(mcpToolInfoSchema)
 });
-var executeToolResponseSchema = z$1.object({
-  result: z$1.unknown()
+var executeToolResponseSchema = z.object({
+  result: z.unknown()
 });
-var mcpServerResourcePathParams = z$1.object({
-  serverId: z$1.string().describe("MCP server ID")
+var mcpServerResourcePathParams = z.object({
+  serverId: z.string().describe("MCP server ID")
 });
-var readResourceBodySchema = z$1.object({
-  uri: z$1.string().describe("Resource URI to read")
+var readResourceBodySchema = z.object({
+  uri: z.string().describe("Resource URI to read")
 });
-var resourceContentSchema = z$1.object({
-  uri: z$1.string(),
-  text: z$1.string().optional(),
-  blob: z$1.string().optional()
+var resourceContentSchema = z.object({
+  uri: z.string(),
+  text: z.string().optional(),
+  blob: z.string().optional()
 });
-var readResourceResponseSchema = z$1.object({
-  contents: z$1.array(resourceContentSchema)
+var readResourceResponseSchema = z.object({
+  contents: z.array(resourceContentSchema)
 });
-var resourceInfoSchema = z$1.object({
-  uri: z$1.string(),
-  name: z$1.string(),
-  description: z$1.string().optional(),
-  mimeType: z$1.string().optional(),
-  _meta: z$1.record(z$1.string(), z$1.unknown()).optional()
+var resourceInfoSchema = z.object({
+  uri: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  mimeType: z.string().optional(),
+  _meta: z.record(z.string(), z.unknown()).optional()
 });
-var listResourcesResponseSchema = z$1.object({
-  resources: z$1.array(resourceInfoSchema)
+var listResourcesResponseSchema = z.object({
+  resources: z.array(resourceInfoSchema)
 });
-z$1.object({
-  jsonrpc: z$1.literal("2.0"),
-  error: z$1.object({
-    code: z$1.number(),
-    message: z$1.string()
+z.object({
+  jsonrpc: z.literal("2.0"),
+  error: z.object({
+    code: z.number(),
+    message: z.string()
   }),
-  id: z$1.null()
+  id: z.null()
 });
 
 // src/server/handlers/mcp.ts
@@ -33742,7 +33330,7 @@ var LIST_MCP_SERVERS_ROUTE = createRoute$1({
     offset
   }) => {
     if (!mastra || typeof mastra.listMCPServers !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or listMCPServers method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or listMCPServers method not available" });
     }
     const servers = mastra.listMCPServers();
     if (!servers) {
@@ -33793,15 +33381,15 @@ var GET_MCP_SERVER_DETAIL_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, id, version }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(id);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${id}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${id}' not found` });
     }
     const serverDetail = server.getServerDetail();
     if (version && serverDetail.version_detail.version !== version) {
-      throw new HTTPException$2(404, {
+      throw new HTTPException$1(404, {
         message: `MCP server with ID '${id}' found, but not version '${version}'. Available version: ${serverDetail.version_detail.version}`
       });
     }
@@ -33820,14 +33408,14 @@ var LIST_MCP_SERVER_TOOLS_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId, requestContext }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${serverId}' not found` });
     }
     if (typeof server.getToolListInfo !== "function") {
-      throw new HTTPException$2(501, { message: `Server '${serverId}' cannot list tools in this way.` });
+      throw new HTTPException$1(501, { message: `Server '${serverId}' cannot list tools in this way.` });
     }
     return await server.getToolListInfo(requestContext);
   }
@@ -33844,18 +33432,18 @@ var GET_MCP_SERVER_TOOL_DETAIL_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId, toolId }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${serverId}' not found` });
     }
     if (typeof server.getToolInfo !== "function") {
-      throw new HTTPException$2(501, { message: `Server '${serverId}' cannot provide tool details in this way.` });
+      throw new HTTPException$1(501, { message: `Server '${serverId}' cannot provide tool details in this way.` });
     }
     const toolInfo = await server.getToolInfo(toolId);
     if (!toolInfo) {
-      throw new HTTPException$2(404, { message: `Tool with ID '${toolId}' not found on MCP server '${serverId}'` });
+      throw new HTTPException$1(404, { message: `Tool with ID '${toolId}' not found on MCP server '${serverId}'` });
     }
     return toolInfo;
   }
@@ -33879,14 +33467,14 @@ var EXECUTE_MCP_SERVER_TOOL_ROUTE = createRoute$1({
     requestContext
   }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${serverId}' not found` });
     }
     if (typeof server.executeTool !== "function") {
-      throw new HTTPException$2(501, { message: `Server '${serverId}' cannot execute tools in this way.` });
+      throw new HTTPException$1(501, { message: `Server '${serverId}' cannot execute tools in this way.` });
     }
     const result = await server.executeTool(toolId, data, { requestContext });
     return { result };
@@ -33904,11 +33492,11 @@ var LIST_MCP_SERVER_RESOURCES_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${serverId}' not found` });
     }
     if (typeof server.listResources !== "function") {
       return { resources: [] };
@@ -33929,21 +33517,21 @@ var READ_MCP_SERVER_RESOURCE_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId, uri }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server with ID '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server with ID '${serverId}' not found` });
     }
     if (typeof server.readResource !== "function") {
-      throw new HTTPException$2(501, { message: `Server '${serverId}' does not support reading resources` });
+      throw new HTTPException$1(501, { message: `Server '${serverId}' does not support reading resources` });
     }
     try {
       return await server.readResource(uri);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.includes("not found") || message.includes("not configured")) {
-        throw new HTTPException$2(404, { message: `Resource '${uri}' not found on server '${serverId}'` });
+        throw new HTTPException$1(404, { message: `Resource '${uri}' not found on server '${serverId}'` });
       }
       throw error;
     }
@@ -33960,11 +33548,11 @@ var MCP_HTTP_TRANSPORT_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server '${serverId}' not found` });
     }
     return {
       server,
@@ -33983,11 +33571,11 @@ var MCP_SSE_TRANSPORT_ROUTE = createRoute$1({
   requiresAuth: true,
   handler: async ({ mastra, serverId }) => {
     if (!mastra || typeof mastra.getMCPServerById !== "function") {
-      throw new HTTPException$2(500, { message: "Mastra instance or getMCPServerById method not available" });
+      throw new HTTPException$1(500, { message: "Mastra instance or getMCPServerById method not available" });
     }
     const server = mastra.getMCPServerById(serverId);
     if (!server) {
-      throw new HTTPException$2(404, { message: `MCP server '${serverId}' not found` });
+      throw new HTTPException$1(404, { message: `MCP server '${serverId}' not found` });
     }
     return {
       server,
@@ -34008,16 +33596,16 @@ var MCP_SSE_MESSAGES_ROUTE = createRoute$1({
   handler: MCP_SSE_TRANSPORT_ROUTE.handler
 });
 
-var threadIdPathParams = z$1.object({
-  threadId: z$1.string().describe("Unique identifier for the conversation thread")
+var threadIdPathParams = z.object({
+  threadId: z.string().describe("Unique identifier for the conversation thread")
 });
-var agentIdQuerySchema = z$1.object({
-  agentId: z$1.string()
+var agentIdQuerySchema = z.object({
+  agentId: z.string()
 });
-var optionalAgentIdQuerySchema = z$1.object({
-  agentId: z$1.string().optional()
+var optionalAgentIdQuerySchema = z.object({
+  agentId: z.string().optional()
 });
-var storageOrderBySchema = z$1.preprocess(
+var storageOrderBySchema = z.preprocess(
   (val) => {
     if (val === void 0) return val;
     if (typeof val === "string") {
@@ -34029,12 +33617,12 @@ var storageOrderBySchema = z$1.preprocess(
     }
     return val;
   },
-  z$1.object({
-    field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-    direction: z$1.enum(["ASC", "DESC"]).optional()
+  z.object({
+    field: z.enum(["createdAt", "updatedAt"]).optional(),
+    direction: z.enum(["ASC", "DESC"]).optional()
   }).optional()
 ).optional();
-var messageOrderBySchema = z$1.preprocess(
+var messageOrderBySchema = z.preprocess(
   (val) => {
     if (val === void 0) return val;
     if (typeof val === "string") {
@@ -34046,12 +33634,12 @@ var messageOrderBySchema = z$1.preprocess(
     }
     return val;
   },
-  z$1.object({
-    field: z$1.enum(["createdAt"]).optional(),
-    direction: z$1.enum(["ASC", "DESC"]).optional()
+  z.object({
+    field: z.enum(["createdAt"]).optional(),
+    direction: z.enum(["ASC", "DESC"]).optional()
   }).optional()
 ).optional();
-var includeSchema = z$1.preprocess(
+var includeSchema = z.preprocess(
   (val) => {
     if (val === void 0) return val;
     if (typeof val === "string") {
@@ -34063,16 +33651,16 @@ var includeSchema = z$1.preprocess(
     }
     return val;
   },
-  z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      threadId: z$1.string().optional(),
-      withPreviousMessages: z$1.number().optional(),
-      withNextMessages: z$1.number().optional()
+  z.array(
+    z.object({
+      id: z.string(),
+      threadId: z.string().optional(),
+      withPreviousMessages: z.number().optional(),
+      withNextMessages: z.number().optional()
     })
   )
 ).optional();
-var filterSchema = z$1.preprocess(
+var filterSchema = z.preprocess(
   (val) => {
     if (val === void 0) return val;
     if (typeof val === "string") {
@@ -34084,17 +33672,17 @@ var filterSchema = z$1.preprocess(
     }
     return val;
   },
-  z$1.object({
-    dateRange: z$1.object({
-      start: z$1.coerce.date().optional(),
-      end: z$1.coerce.date().optional(),
-      startExclusive: z$1.boolean().optional(),
-      endExclusive: z$1.boolean().optional()
+  z.object({
+    dateRange: z.object({
+      start: z.coerce.date().optional(),
+      end: z.coerce.date().optional(),
+      startExclusive: z.boolean().optional(),
+      endExclusive: z.boolean().optional()
     }).optional(),
-    roles: z$1.array(z$1.string()).optional()
+    roles: z.array(z.string()).optional()
   })
 ).optional();
-var memoryConfigSchema = z$1.preprocess(
+var memoryConfigSchema = z.preprocess(
   (val) => {
     if (val === void 0) return val;
     if (typeof val === "string") {
@@ -34106,26 +33694,26 @@ var memoryConfigSchema = z$1.preprocess(
     }
     return val;
   },
-  z$1.record(z$1.string(), z$1.unknown())
+  z.record(z.string(), z.unknown())
 ).optional();
-var threadSchema = z$1.object({
-  id: z$1.string(),
-  title: z$1.string().optional(),
-  resourceId: z$1.string(),
-  createdAt: z$1.date(),
-  updatedAt: z$1.date(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var threadSchema = z.object({
+  id: z.string(),
+  title: z.string().optional(),
+  resourceId: z.string(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 });
-var messageSchema$1 = z$1.any();
+var messageSchema$1 = z.any();
 var getMemoryStatusQuerySchema = agentIdQuerySchema.extend({
-  resourceId: z$1.string().optional(),
-  threadId: z$1.string().optional()
+  resourceId: z.string().optional(),
+  threadId: z.string().optional()
 });
 var getMemoryConfigQuerySchema = agentIdQuerySchema;
 var listThreadsQueryInnerSchema = createPagePaginationSchema(100).extend({
-  agentId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
-  metadata: z$1.preprocess(
+  agentId: z.string().optional(),
+  resourceId: z.string().optional(),
+  metadata: z.preprocess(
     (val) => {
       if (val === void 0) return val;
       if (typeof val === "string") {
@@ -34137,11 +33725,11 @@ var listThreadsQueryInnerSchema = createPagePaginationSchema(100).extend({
       }
       return val;
     },
-    z$1.record(z$1.string(), z$1.any())
+    z.record(z.string(), z.any())
   ).optional(),
   orderBy: storageOrderBySchema
 });
-var listThreadsQuerySchema$1 = z$1.preprocess((val) => {
+var listThreadsQuerySchema$1 = z.preprocess((val) => {
   if (val === null || typeof val !== "object" || Array.isArray(val)) return val;
   const record = val;
   const rawOrderBy = record.orderBy;
@@ -34159,37 +33747,37 @@ var listThreadsQuerySchema$1 = z$1.preprocess((val) => {
   };
 }, listThreadsQueryInnerSchema);
 var getThreadByIdQuerySchema = optionalAgentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
 var listMessagesQuerySchema$1 = createPagePaginationSchema(40).extend({
-  agentId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
+  agentId: z.string().optional(),
+  resourceId: z.string().optional(),
   orderBy: messageOrderBySchema,
   include: includeSchema,
   filter: filterSchema,
-  includeSystemReminders: z$1.preprocess((val) => {
+  includeSystemReminders: z.preprocess((val) => {
     if (val === void 0) return val;
     if (val === "true") return true;
     if (val === "false") return false;
     return val;
-  }, z$1.boolean()).optional()
+  }, z.boolean()).optional()
 });
-var getWorkingMemoryQuerySchema = z$1.object({
-  agentId: z$1.string(),
-  resourceId: z$1.string().optional(),
+var getWorkingMemoryQuerySchema = z.object({
+  agentId: z.string(),
+  resourceId: z.string().optional(),
   memoryConfig: memoryConfigSchema
 });
 var deleteThreadQuerySchema = agentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
 var deleteMessagesQuerySchema = agentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
 var getMemoryStatusNetworkQuerySchema = agentIdQuerySchema;
 var listThreadsNetworkQuerySchema = createPagePaginationSchema(100).extend({
-  agentId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
-  metadata: z$1.preprocess(
+  agentId: z.string().optional(),
+  resourceId: z.string().optional(),
+  metadata: z.preprocess(
     (val) => {
       if (val === void 0) return val;
       if (typeof val === "string") {
@@ -34201,16 +33789,16 @@ var listThreadsNetworkQuerySchema = createPagePaginationSchema(100).extend({
       }
       return val;
     },
-    z$1.record(z$1.string(), z$1.any())
+    z.record(z.string(), z.any())
   ).optional(),
   orderBy: storageOrderBySchema
 });
 var getThreadByIdNetworkQuerySchema = optionalAgentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
 var listMessagesNetworkQuerySchema = createPagePaginationSchema(40).extend({
-  agentId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
+  agentId: z.string().optional(),
+  resourceId: z.string().optional(),
   orderBy: messageOrderBySchema,
   include: includeSchema,
   filter: filterSchema
@@ -34219,194 +33807,194 @@ var saveMessagesNetworkQuerySchema = agentIdQuerySchema;
 var createThreadNetworkQuerySchema = agentIdQuerySchema;
 var updateThreadNetworkQuerySchema = agentIdQuerySchema;
 var deleteThreadNetworkQuerySchema = agentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
 var deleteMessagesNetworkQuerySchema = agentIdQuerySchema.extend({
-  resourceId: z$1.string().optional()
+  resourceId: z.string().optional()
 });
-var memoryStatusResponseSchema = z$1.object({
-  result: z$1.boolean(),
-  memoryType: z$1.enum(["local", "gateway"]).optional(),
-  observationalMemory: z$1.object({
-    enabled: z$1.boolean(),
-    hasRecord: z$1.boolean().optional(),
-    originType: z$1.string().optional(),
-    lastObservedAt: z$1.date().optional(),
-    tokenCount: z$1.number().optional(),
-    observationTokenCount: z$1.number().optional(),
-    isObserving: z$1.boolean().optional(),
-    isReflecting: z$1.boolean().optional()
+var memoryStatusResponseSchema = z.object({
+  result: z.boolean(),
+  memoryType: z.enum(["local", "gateway"]).optional(),
+  observationalMemory: z.object({
+    enabled: z.boolean(),
+    hasRecord: z.boolean().optional(),
+    originType: z.string().optional(),
+    lastObservedAt: z.date().optional(),
+    tokenCount: z.number().optional(),
+    observationTokenCount: z.number().optional(),
+    isObserving: z.boolean().optional(),
+    isReflecting: z.boolean().optional()
   }).optional()
 });
-var observationalMemoryModelRoutingSchema = z$1.array(
-  z$1.object({
-    upTo: z$1.number(),
-    model: z$1.string()
+var observationalMemoryModelRoutingSchema = z.array(
+  z.object({
+    upTo: z.number(),
+    model: z.string()
   })
 );
-var observationalMemoryConfigSchema = z$1.object({
-  enabled: z$1.boolean(),
-  scope: z$1.enum(["thread", "resource"]).optional(),
-  shareTokenBudget: z$1.boolean().optional(),
-  messageTokens: z$1.union([z$1.number(), z$1.object({ min: z$1.number(), max: z$1.number() })]).optional(),
-  observationTokens: z$1.union([z$1.number(), z$1.object({ min: z$1.number(), max: z$1.number() })]).optional(),
-  observationModel: z$1.string().optional(),
-  reflectionModel: z$1.string().optional(),
+var observationalMemoryConfigSchema = z.object({
+  enabled: z.boolean(),
+  scope: z.enum(["thread", "resource"]).optional(),
+  shareTokenBudget: z.boolean().optional(),
+  messageTokens: z.union([z.number(), z.object({ min: z.number(), max: z.number() })]).optional(),
+  observationTokens: z.union([z.number(), z.object({ min: z.number(), max: z.number() })]).optional(),
+  observationModel: z.string().optional(),
+  reflectionModel: z.string().optional(),
   observationModelRouting: observationalMemoryModelRoutingSchema.optional(),
   reflectionModelRouting: observationalMemoryModelRoutingSchema.optional()
 });
-var memoryConfigResponseSchema = z$1.object({
-  memoryType: z$1.enum(["local", "gateway"]).optional(),
-  config: z$1.object({
-    lastMessages: z$1.union([z$1.number(), z$1.literal(false)]).optional(),
-    semanticRecall: z$1.union([z$1.boolean(), z$1.any()]).optional(),
-    workingMemory: z$1.any().optional(),
+var memoryConfigResponseSchema = z.object({
+  memoryType: z.enum(["local", "gateway"]).optional(),
+  config: z.object({
+    lastMessages: z.union([z.number(), z.literal(false)]).optional(),
+    semanticRecall: z.union([z.boolean(), z.any()]).optional(),
+    workingMemory: z.any().optional(),
     observationalMemory: observationalMemoryConfigSchema.optional()
   }).nullable()
 });
 var listThreadsResponseSchema$1 = paginationInfoSchema$1.extend({
-  threads: z$1.array(threadSchema)
+  threads: z.array(threadSchema)
 });
 var getThreadByIdResponseSchema = threadSchema;
-var listMessagesResponseSchema$1 = z$1.object({
-  messages: z$1.array(messageSchema$1),
-  uiMessages: z$1.array(z$1.any()).nullable()
+var listMessagesResponseSchema$1 = z.object({
+  messages: z.array(messageSchema$1),
+  uiMessages: z.array(z.any()).nullable()
   // Converted messages in UI format
 });
-var getWorkingMemoryResponseSchema = z$1.object({
-  workingMemory: z$1.unknown().nullable(),
+var getWorkingMemoryResponseSchema = z.object({
+  workingMemory: z.unknown().nullable(),
   // Can be string or structured object depending on template
-  source: z$1.enum(["thread", "resource"]),
-  workingMemoryTemplate: z$1.unknown().nullable(),
+  source: z.enum(["thread", "resource"]),
+  workingMemoryTemplate: z.unknown().nullable(),
   // Template structure varies
-  threadExists: z$1.boolean()
+  threadExists: z.boolean()
 });
-var saveMessagesBodySchema = z$1.object({
-  messages: z$1.array(messageSchema$1)
+var saveMessagesBodySchema = z.object({
+  messages: z.array(messageSchema$1)
 });
-var createThreadBodySchema$1 = z$1.object({
-  resourceId: z$1.string(),
-  title: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  threadId: z$1.string().optional()
+var createThreadBodySchema$1 = z.object({
+  resourceId: z.string(),
+  title: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  threadId: z.string().optional()
 });
-var updateThreadBodySchema = z$1.object({
-  title: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  resourceId: z$1.string().optional()
+var updateThreadBodySchema = z.object({
+  title: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  resourceId: z.string().optional()
 });
-var updateWorkingMemoryBodySchema = z$1.object({
-  workingMemory: z$1.string(),
-  resourceId: z$1.string().optional(),
-  memoryConfig: z$1.record(z$1.string(), z$1.unknown()).optional()
+var updateWorkingMemoryBodySchema = z.object({
+  workingMemory: z.string(),
+  resourceId: z.string().optional(),
+  memoryConfig: z.record(z.string(), z.unknown()).optional()
 });
-var deleteMessagesBodySchema = z$1.object({
-  messageIds: z$1.union([
-    z$1.string(),
-    z$1.array(z$1.string()),
-    z$1.object({ id: z$1.string() }),
-    z$1.array(z$1.object({ id: z$1.string() }))
+var deleteMessagesBodySchema = z.object({
+  messageIds: z.union([
+    z.string(),
+    z.array(z.string()),
+    z.object({ id: z.string() }),
+    z.array(z.object({ id: z.string() }))
   ])
 });
-var searchMemoryQuerySchema = z$1.object({
-  agentId: z$1.string(),
-  searchQuery: z$1.string(),
-  resourceId: z$1.string(),
-  threadId: z$1.string().optional(),
-  limit: z$1.coerce.number().optional().default(20),
+var searchMemoryQuerySchema = z.object({
+  agentId: z.string(),
+  searchQuery: z.string(),
+  resourceId: z.string(),
+  threadId: z.string().optional(),
+  limit: z.coerce.number().optional().default(20),
   memoryConfig: memoryConfigSchema
 });
-var saveMessagesResponseSchema = z$1.object({
-  messages: z$1.array(messageSchema$1)
+var saveMessagesResponseSchema = z.object({
+  messages: z.array(messageSchema$1)
 });
-var deleteThreadResponseSchema = z$1.object({
-  result: z$1.string()
+var deleteThreadResponseSchema = z.object({
+  result: z.string()
 });
 var updateWorkingMemoryResponseSchema = successResponseSchema;
 var deleteMessagesResponseSchema = successResponseSchema.extend({
-  message: z$1.string()
+  message: z.string()
 });
-var searchMemoryResponseSchema = z$1.object({
-  results: z$1.array(z$1.unknown()),
-  count: z$1.number(),
-  query: z$1.string(),
-  searchScope: z$1.string().optional(),
-  searchType: z$1.string().optional()
+var searchMemoryResponseSchema = z.object({
+  results: z.array(z.unknown()),
+  count: z.number(),
+  query: z.string(),
+  searchScope: z.string().optional(),
+  searchType: z.string().optional()
 });
-var cloneThreadBodySchema$1 = z$1.object({
-  newThreadId: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
-  title: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  options: z$1.object({
-    messageLimit: z$1.number().optional(),
-    messageFilter: z$1.object({
-      startDate: z$1.coerce.date().optional(),
-      endDate: z$1.coerce.date().optional(),
-      messageIds: z$1.array(z$1.string()).optional()
+var cloneThreadBodySchema$1 = z.object({
+  newThreadId: z.string().optional(),
+  resourceId: z.string().optional(),
+  title: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  options: z.object({
+    messageLimit: z.number().optional(),
+    messageFilter: z.object({
+      startDate: z.coerce.date().optional(),
+      endDate: z.coerce.date().optional(),
+      messageIds: z.array(z.string()).optional()
     }).optional()
   }).optional()
 });
-var cloneThreadResponseSchema = z$1.object({
+var cloneThreadResponseSchema = z.object({
   thread: threadSchema,
-  clonedMessages: z$1.array(messageSchema$1)
+  clonedMessages: z.array(messageSchema$1)
 });
-var getObservationalMemoryQuerySchema = z$1.object({
-  agentId: z$1.string(),
-  resourceId: z$1.string().optional(),
-  threadId: z$1.string().optional(),
-  from: z$1.coerce.date().optional(),
-  to: z$1.coerce.date().optional(),
-  offset: z$1.coerce.number().int().min(0).optional(),
-  limit: z$1.coerce.number().int().min(1).optional()
+var getObservationalMemoryQuerySchema = z.object({
+  agentId: z.string(),
+  resourceId: z.string().optional(),
+  threadId: z.string().optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).optional()
 });
-var bufferedObservationChunkSchema = z$1.object({
-  id: z$1.string().optional(),
-  cycleId: z$1.string(),
-  observations: z$1.string(),
-  tokenCount: z$1.number(),
-  messageIds: z$1.array(z$1.string()).optional(),
-  messageTokens: z$1.number(),
-  lastObservedAt: z$1.date().optional(),
-  createdAt: z$1.date().optional(),
-  suggestedContinuation: z$1.string().optional(),
-  currentTask: z$1.string().optional(),
-  threadTitle: z$1.string().optional(),
-  extractedValues: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  extractionFailures: z$1.array(z$1.object({ slug: z$1.string(), error: z$1.string() })).optional()
+var bufferedObservationChunkSchema = z.object({
+  id: z.string().optional(),
+  cycleId: z.string(),
+  observations: z.string(),
+  tokenCount: z.number(),
+  messageIds: z.array(z.string()).optional(),
+  messageTokens: z.number(),
+  lastObservedAt: z.date().optional(),
+  createdAt: z.date().optional(),
+  suggestedContinuation: z.string().optional(),
+  currentTask: z.string().optional(),
+  threadTitle: z.string().optional(),
+  extractedValues: z.record(z.string(), z.unknown()).optional(),
+  extractionFailures: z.array(z.object({ slug: z.string(), error: z.string() })).optional()
 });
-var observationalMemoryRecordSchema = z$1.object({
-  id: z$1.string(),
-  scope: z$1.enum(["thread", "resource"]),
-  resourceId: z$1.string(),
-  threadId: z$1.string().nullable(),
-  activeObservations: z$1.string(),
-  bufferedObservations: z$1.string().optional(),
-  bufferedObservationChunks: z$1.array(bufferedObservationChunkSchema).optional(),
-  bufferedReflection: z$1.string().optional(),
-  originType: z$1.enum(["initial", "observation", "reflection"]),
-  generationCount: z$1.number(),
-  lastObservedAt: z$1.date().optional(),
-  totalTokensObserved: z$1.number(),
-  observationTokenCount: z$1.number(),
-  pendingMessageTokens: z$1.number(),
-  isObserving: z$1.boolean(),
-  isReflecting: z$1.boolean(),
-  config: z$1.record(z$1.string(), z$1.unknown()),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  createdAt: z$1.date(),
-  updatedAt: z$1.date()
+var observationalMemoryRecordSchema = z.object({
+  id: z.string(),
+  scope: z.enum(["thread", "resource"]),
+  resourceId: z.string(),
+  threadId: z.string().nullable(),
+  activeObservations: z.string(),
+  bufferedObservations: z.string().optional(),
+  bufferedObservationChunks: z.array(bufferedObservationChunkSchema).optional(),
+  bufferedReflection: z.string().optional(),
+  originType: z.enum(["initial", "observation", "reflection"]),
+  generationCount: z.number(),
+  lastObservedAt: z.date().optional(),
+  totalTokensObserved: z.number(),
+  observationTokenCount: z.number(),
+  pendingMessageTokens: z.number(),
+  isObserving: z.boolean(),
+  isReflecting: z.boolean(),
+  config: z.record(z.string(), z.unknown()),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  createdAt: z.date(),
+  updatedAt: z.date()
 });
-var getObservationalMemoryResponseSchema = z$1.object({
+var getObservationalMemoryResponseSchema = z.object({
   record: observationalMemoryRecordSchema.nullable(),
-  history: z$1.array(observationalMemoryRecordSchema).optional()
+  history: z.array(observationalMemoryRecordSchema).optional()
 });
-var awaitBufferStatusBodySchema = z$1.object({
-  agentId: z$1.string(),
-  resourceId: z$1.string().optional(),
-  threadId: z$1.string().optional()
+var awaitBufferStatusBodySchema = z.object({
+  agentId: z.string(),
+  resourceId: z.string().optional(),
+  threadId: z.string().optional()
 });
-var awaitBufferStatusResponseSchema = z$1.object({
+var awaitBufferStatusResponseSchema = z.object({
   record: observationalMemoryRecordSchema.nullable()
 });
 
@@ -34713,12 +34301,12 @@ async function enforceDeleteMessagesThreadAccess({
   const { messages } = await memoryStore.listMessagesById({ messageIds });
   const threadIds = [...new Set(messages.map((m) => m.threadId).filter(Boolean))];
   if (messages.some((message) => !message.threadId)) {
-    throw new HTTPException$2(403, { message: "Access denied: unable to verify message thread access" });
+    throw new HTTPException$1(403, { message: "Access denied: unable to verify message thread access" });
   }
   for (const threadId of threadIds) {
     const thread = await memoryStore.getThreadById({ threadId });
     if (!thread) {
-      throw new HTTPException$2(403, { message: "Access denied: unable to verify message thread access" });
+      throw new HTTPException$1(403, { message: "Access denied: unable to verify message thread access" });
     }
     await enforceThreadAccess({
       mastra,
@@ -34787,7 +34375,7 @@ async function getMemoryFromContext({
         logger.debug("Agent not found in any resolution tier, returning null for storage fallback", { agentId });
         return null;
       }
-      throw new HTTPException$2(404, { message: "Agent not found" });
+      throw new HTTPException$1(404, { message: "Agent not found" });
     }
   }
   if (agent) {
@@ -35061,7 +34649,7 @@ var GET_OBSERVATIONAL_MEMORY_ROUTE = createRoute$1({
     try {
       const agent = await getAgentFromContext({ mastra, agentId, requestContext });
       if (!agent) {
-        throw new HTTPException$2(404, { message: "Agent not found" });
+        throw new HTTPException$1(404, { message: "Agent not found" });
       }
       const historyLimit = limit ?? 5;
       const historyOptions = { from, to, offset };
@@ -35081,24 +34669,24 @@ var GET_OBSERVATIONAL_MEMORY_ROUTE = createRoute$1({
       }
       const omConfig = await getOMConfigFromAgent(agent, requestContext);
       if (!omConfig?.enabled) {
-        throw new HTTPException$2(400, { message: "Observational Memory is not enabled for this agent" });
+        throw new HTTPException$1(400, { message: "Observational Memory is not enabled for this agent" });
       }
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not configured for this agent" });
+        throw new HTTPException$1(400, { message: "Memory is not configured for this agent" });
       }
       let memoryStore;
       try {
         memoryStore = await memory.storage.getStore("memory");
       } catch {
-        throw new HTTPException$2(400, { message: "Memory storage is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory storage is not initialized" });
       }
       if (!memoryStore) {
-        throw new HTTPException$2(400, { message: "Memory storage is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory storage is not initialized" });
       }
       const effectiveResourceId = resourceId;
       if (!effectiveResourceId) {
-        throw new HTTPException$2(400, { message: "resourceId is required for observational memory lookup" });
+        throw new HTTPException$1(400, { message: "resourceId is required for observational memory lookup" });
       }
       const omThreadId = omConfig.scope === "resource" ? null : threadId ?? null;
       const record = await memoryStore.getObservationalMemory(omThreadId, effectiveResourceId);
@@ -35131,7 +34719,7 @@ var AWAIT_BUFFER_STATUS_ROUTE = createRoute$1({
     try {
       const agent = await getAgentFromContext({ mastra, agentId, requestContext });
       if (!agent) {
-        throw new HTTPException$2(404, { message: "Agent not found" });
+        throw new HTTPException$1(404, { message: "Agent not found" });
       }
       if (await isGatewayAgentAsync(agent)) {
         const gwClient = getGatewayClient();
@@ -35154,29 +34742,29 @@ var AWAIT_BUFFER_STATUS_ROUTE = createRoute$1({
       }
       const omConfig = await getOMConfigFromAgent(agent, requestContext);
       if (!omConfig?.enabled) {
-        throw new HTTPException$2(400, { message: "Observational Memory is not enabled for this agent" });
+        throw new HTTPException$1(400, { message: "Observational Memory is not enabled for this agent" });
       }
       const omProcessor = await agent.resolveProcessorById("observational-memory", requestContext);
       if (!omProcessor || typeof omProcessor.waitForBuffering !== "function") {
-        throw new HTTPException$2(400, { message: "Observational Memory processor not available" });
+        throw new HTTPException$1(400, { message: "Observational Memory processor not available" });
       }
       await omProcessor.waitForBuffering(threadId, resourceId);
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not configured for this agent" });
+        throw new HTTPException$1(400, { message: "Memory is not configured for this agent" });
       }
       let memoryStore;
       try {
         memoryStore = await memory.storage.getStore("memory");
       } catch {
-        throw new HTTPException$2(400, { message: "Memory storage is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory storage is not initialized" });
       }
       if (!memoryStore) {
-        throw new HTTPException$2(400, { message: "Memory storage is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory storage is not initialized" });
       }
       const effectiveResourceId = resourceId;
       if (!effectiveResourceId) {
-        throw new HTTPException$2(400, { message: "resourceId is required" });
+        throw new HTTPException$1(400, { message: "resourceId is required" });
       }
       const omThreadId = omConfig.scope === "resource" ? null : threadId ?? null;
       const record = await memoryStore.getObservationalMemory(omThreadId, effectiveResourceId);
@@ -35310,7 +34898,7 @@ var LIST_THREADS_ROUTE = createRoute$1({
           });
         }
       }
-      throw new HTTPException$2(400, { message: "Memory is not initialized" });
+      throw new HTTPException$1(400, { message: "Memory is not initialized" });
     } catch (error) {
       return handleError$2(error, "Error listing threads");
     }
@@ -35363,7 +34951,7 @@ var GET_THREAD_BY_ID_ROUTE = createRoute$1({
       if (memory) {
         const thread = await memory.getThreadById({ threadId: effectiveThreadId });
         if (!thread) {
-          throw new HTTPException$2(404, { message: "Thread not found" });
+          throw new HTTPException$1(404, { message: "Thread not found" });
         }
         await enforceThreadAccess({
           mastra,
@@ -35380,7 +34968,7 @@ var GET_THREAD_BY_ID_ROUTE = createRoute$1({
         if (memoryStore) {
           const thread = await memoryStore.getThreadById({ threadId: effectiveThreadId });
           if (!thread) {
-            throw new HTTPException$2(404, { message: "Thread not found" });
+            throw new HTTPException$1(404, { message: "Thread not found" });
           }
           await enforceThreadAccess({
             mastra,
@@ -35392,7 +34980,7 @@ var GET_THREAD_BY_ID_ROUTE = createRoute$1({
           return thread;
         }
       }
-      throw new HTTPException$2(400, { message: "Memory is not initialized" });
+      throw new HTTPException$1(400, { message: "Memory is not initialized" });
     } catch (error) {
       return handleError$2(error, "Error getting thread");
     }
@@ -35427,7 +35015,7 @@ var LIST_MESSAGES_ROUTE = createRoute$1({
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       validateBody$1({ threadId: effectiveThreadId });
       if (!effectiveThreadId) {
-        throw new HTTPException$2(400, { message: "No threadId found" });
+        throw new HTTPException$1(400, { message: "No threadId found" });
       }
       const agent = await getAgentFromContext({ mastra, agentId, requestContext });
       if (agent && await isGatewayAgentAsync(agent)) {
@@ -35452,7 +35040,7 @@ var LIST_MESSAGES_ROUTE = createRoute$1({
             order: orderBy?.direction?.toLowerCase()
           });
           if (!result) {
-            throw new HTTPException$2(404, { message: "Thread not found" });
+            throw new HTTPException$1(404, { message: "Thread not found" });
           }
           return {
             messages: result.messages.map(toLocalMessage),
@@ -35464,7 +35052,7 @@ var LIST_MESSAGES_ROUTE = createRoute$1({
       if (memory) {
         const thread = await memory.getThreadById({ threadId: effectiveThreadId });
         if (!thread) {
-          throw new HTTPException$2(404, { message: "Thread not found" });
+          throw new HTTPException$1(404, { message: "Thread not found" });
         }
         await enforceThreadAccess({
           mastra,
@@ -35495,7 +35083,7 @@ var LIST_MESSAGES_ROUTE = createRoute$1({
         if (memoryStore) {
           const thread = await memoryStore.getThreadById({ threadId: effectiveThreadId });
           if (!thread) {
-            throw new HTTPException$2(404, { message: "Thread not found" });
+            throw new HTTPException$1(404, { message: "Thread not found" });
           }
           await enforceThreadAccess({
             mastra,
@@ -35591,13 +35179,13 @@ var SAVE_MESSAGES_ROUTE = createRoute$1({
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       if (!messages) {
-        throw new HTTPException$2(400, { message: "Messages are required" });
+        throw new HTTPException$1(400, { message: "Messages are required" });
       }
       if (!Array.isArray(messages)) {
-        throw new HTTPException$2(400, { message: "Messages should be an array" });
+        throw new HTTPException$1(400, { message: "Messages should be an array" });
       }
       const resourceIdByThread = /* @__PURE__ */ new Map();
       for (const message of messages) {
@@ -35608,21 +35196,21 @@ var SAVE_MESSAGES_ROUTE = createRoute$1({
         if (!existingResourceId) {
           resourceIdByThread.set(message.threadId, message.resourceId);
         } else if (existingResourceId !== message.resourceId) {
-          throw new HTTPException$2(400, {
+          throw new HTTPException$1(400, {
             message: "All messages for the same threadId must use the same resourceId."
           });
         }
       }
       const invalidMessages = messages.filter((message) => !message.threadId || !message.resourceId);
       if (invalidMessages.length > 0) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `All messages must have threadId and resourceId fields. Found ${invalidMessages.length} invalid message(s).`
         });
       }
       if (effectiveResourceId) {
         const unauthorizedMessages = messages.filter((message) => message.resourceId !== effectiveResourceId);
         if (unauthorizedMessages.length > 0) {
-          throw new HTTPException$2(403, {
+          throw new HTTPException$1(403, {
             message: "Access denied: cannot save messages for a different resource"
           });
         }
@@ -35702,7 +35290,7 @@ var CREATE_THREAD_ROUTE = createRoute$1({
       }
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const result = await memory.createThread({
         resourceId: effectiveResourceId,
@@ -35750,7 +35338,7 @@ var UPDATE_THREAD_ROUTE = createRoute$1({
           }
           const result2 = await gwClient.updateThread(effectiveThreadId, { title, metadata });
           if (!result2) {
-            throw new HTTPException$2(404, { message: "Thread not found" });
+            throw new HTTPException$1(404, { message: "Thread not found" });
           }
           return toLocalThread(result2.thread);
         }
@@ -35758,11 +35346,11 @@ var UPDATE_THREAD_ROUTE = createRoute$1({
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       const updatedAt = /* @__PURE__ */ new Date();
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const thread = await memory.getThreadById({ threadId: effectiveThreadId });
       if (!thread) {
-        throw new HTTPException$2(404, { message: "Thread not found" });
+        throw new HTTPException$1(404, { message: "Thread not found" });
       }
       await enforceThreadAccess({
         mastra,
@@ -35824,18 +35412,18 @@ var DELETE_THREAD_ROUTE = createRoute$1({
           }
           const deleteResult = await gwClient.deleteThread(effectiveThreadId);
           if (!deleteResult.ok) {
-            throw new HTTPException$2(404, { message: "Thread not found on gateway" });
+            throw new HTTPException$1(404, { message: "Thread not found on gateway" });
           }
           return { result: "Thread deleted" };
         }
       }
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const thread = await memory.getThreadById({ threadId: effectiveThreadId });
       if (!thread) {
-        throw new HTTPException$2(404, { message: "Thread not found" });
+        throw new HTTPException$1(404, { message: "Thread not found" });
       }
       await enforceThreadAccess({
         mastra,
@@ -35872,11 +35460,11 @@ var CLONE_THREAD_ROUTE = createRoute$1({
       validateBody$1({ threadId: effectiveThreadId });
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const sourceThread = await memory.getThreadById({ threadId: effectiveThreadId });
       if (!sourceThread) {
-        throw new HTTPException$2(404, { message: "Source thread not found" });
+        throw new HTTPException$1(404, { message: "Source thread not found" });
       }
       const cloneResourceId = effectiveResourceId ?? sourceThread.resourceId ?? void 0;
       await enforceThreadAccess({
@@ -35930,11 +35518,11 @@ var UPDATE_WORKING_MEMORY_ROUTE = createRoute$1({
       }
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const thread = await memory.getThreadById({ threadId: effectiveThreadId });
       if (!thread) {
-        throw new HTTPException$2(404, { message: "Thread not found" });
+        throw new HTTPException$1(404, { message: "Thread not found" });
       }
       await enforceThreadAccess({
         mastra,
@@ -35971,7 +35559,7 @@ var DELETE_MESSAGES_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (messageIds === void 0 || messageIds === null) {
-        throw new HTTPException$2(400, { message: "messageIds is required" });
+        throw new HTTPException$1(400, { message: "messageIds is required" });
       }
       let normalizedIds;
       if (Array.isArray(messageIds)) {
@@ -35986,11 +35574,11 @@ var DELETE_MESSAGES_ROUTE = createRoute$1({
       if (effectiveResourceId && stringIds.length > 0) {
         const storage = memory?.storage || getStorageFromContext({ mastra });
         if (!storage) {
-          throw new HTTPException$2(403, { message: "Access denied: unable to verify message ownership" });
+          throw new HTTPException$1(403, { message: "Access denied: unable to verify message ownership" });
         }
         const memoryStore = await storage.getStore("memory");
         if (!memoryStore) {
-          throw new HTTPException$2(400, { message: "Memory is not initialized" });
+          throw new HTTPException$1(400, { message: "Memory is not initialized" });
         }
         await enforceDeleteMessagesThreadAccess({
           mastra,
@@ -36002,11 +35590,11 @@ var DELETE_MESSAGES_ROUTE = createRoute$1({
       } else if (stringIds.length > 0) {
         const storage = memory?.storage || getStorageFromContext({ mastra });
         if (!storage) {
-          throw new HTTPException$2(400, { message: "Memory is not initialized" });
+          throw new HTTPException$1(400, { message: "Memory is not initialized" });
         }
         const memoryStore = await storage.getStore("memory");
         if (!memoryStore) {
-          throw new HTTPException$2(400, { message: "Memory is not initialized" });
+          throw new HTTPException$1(400, { message: "Memory is not initialized" });
         }
         await enforceDeleteMessagesThreadAccess({
           mastra,
@@ -36024,10 +35612,10 @@ var DELETE_MESSAGES_ROUTE = createRoute$1({
           if (memoryStore) {
             await memoryStore.deleteMessages(stringIds);
           } else {
-            throw new HTTPException$2(400, { message: "Memory is not initialized" });
+            throw new HTTPException$1(400, { message: "Memory is not initialized" });
           }
         } else {
-          throw new HTTPException$2(400, { message: "Memory is not initialized" });
+          throw new HTTPException$1(400, { message: "Memory is not initialized" });
         }
       }
       const count = Array.isArray(messageIds) ? messageIds.length : 1;
@@ -36064,7 +35652,7 @@ var SEARCH_MEMORY_ROUTE = createRoute$1({
       }
       const memory = await getMemoryFromContext({ mastra, agentId, requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: "Memory is not initialized" });
+        throw new HTTPException$1(400, { message: "Memory is not initialized" });
       }
       const config = memory.getMergedThreadConfig(memoryConfig || {});
       const hasSemanticRecall = !!config?.semanticRecall;
@@ -36332,13 +35920,13 @@ var DELETE_MESSAGES_NETWORK_ROUTE = createRoute$1({
 });
 
 // src/server/handlers/observability-list-query-schemas.ts
-var paginationArgsSchema = z$1.object({
-  page: z$1.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
-  perPage: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
+var paginationArgsSchema = z.object({
+  page: z.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
+  perPage: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
 }).describe("Pagination options for list queries");
-var deltaCursorSchema$1 = z$1.string().min(1).describe("Opaque cursor value for incremental polling");
-var listModeSchema$1 = z$1.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
-var deltaLimitSchema$1 = z$1.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
+var deltaCursorSchema$1 = z.string().min(1).describe("Opaque cursor value for incremental polling");
+var listModeSchema$1 = z.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
+var deltaLimitSchema$1 = z.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
 
 var OBSERVABILITY_DELTA_POLLING_FEATURE = "observability-delta-polling";
 var OBSERVABILITY_DELTA_POLLING_UPGRADE_MESSAGE = "Delta polling requires a newer @mastra/core with observability delta polling support. Please upgrade.";
@@ -36358,7 +35946,7 @@ function getFeatures(observabilityStore) {
 function getStorage(mastra) {
   const storage = mastra.getStorage();
   if (!storage) {
-    throw new HTTPException$2(500, { message: "Storage is not available" });
+    throw new HTTPException$1(500, { message: "Storage is not available" });
   }
   return storage;
 }
@@ -36366,20 +35954,20 @@ async function getObservabilityStore(mastra) {
   const storage = getStorage(mastra);
   const observability = await storage.getStore("observability");
   if (!observability) {
-    throw new HTTPException$2(500, { message: "Observability storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Observability storage domain is not available" });
   }
   return observability;
 }
 function assertObservabilityDeltaSupported(observabilityStore, endpoint) {
   if (!coreFeatures.has(OBSERVABILITY_DELTA_POLLING_FEATURE)) {
-    throw new HTTPException$2(501, {
+    throw new HTTPException$1(501, {
       message: `${OBSERVABILITY_DELTA_POLLING_UPGRADE_MESSAGE} (endpoint: ${endpoint})`
     });
   }
   if (getFeatures(observabilityStore)?.includes(OBSERVABILITY_DELTA_POLLING_STORAGE_FEATURE)) {
     return;
   }
-  throw new HTTPException$2(501, {
+  throw new HTTPException$1(501, {
     message: `Delta polling is not supported by the configured observability store for ${endpoint}`
   });
 }
@@ -36562,16 +36150,16 @@ var NEW_ROUTE_DEFS = {
 function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
   const unwrapDefault = (schema) => {
     const zodSchema = schema;
-    return zodSchema instanceof z$1.ZodDefault ? zodSchema.unwrap() : zodSchema;
+    return zodSchema instanceof z.ZodDefault ? zodSchema.unwrap() : zodSchema;
   };
   const paginationShape = paginationArgsSchema.shape;
   const orderByShape = orderBySchema.shape;
   const pageSchema = unwrapDefault(paginationShape.page);
   const perPageSchema = unwrapDefault(paginationShape.perPage);
-  const fieldSchema = orderByShape.field ? unwrapDefault(orderByShape.field) : z$1.never().optional();
-  const directionSchema = orderByShape.direction ? unwrapDefault(orderByShape.direction) : z$1.never().optional();
+  const fieldSchema = orderByShape.field ? unwrapDefault(orderByShape.field) : z.never().optional();
+  const directionSchema = orderByShape.direction ? unwrapDefault(orderByShape.direction) : z.never().optional();
   return wrapSchemaForQueryParams(
-    z$1.object({
+    z.object({
       ...filterSchema.shape,
       page: pageSchema,
       perPage: perPageSchema,
@@ -36591,14 +36179,14 @@ function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
       if (hasPagination) {
         if (value.page !== void 0) {
           ctx.addIssue({
-            code: z$1.ZodIssueCode.custom,
+            code: z.ZodIssueCode.custom,
             path: ["page"],
             message: "`page` is not allowed when `mode=delta`"
           });
         }
         if (value.perPage !== void 0) {
           ctx.addIssue({
-            code: z$1.ZodIssueCode.custom,
+            code: z.ZodIssueCode.custom,
             path: ["perPage"],
             message: "`perPage` is not allowed when `mode=delta`"
           });
@@ -36607,14 +36195,14 @@ function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
       if (hasOrderBy) {
         if (value.field !== void 0) {
           ctx.addIssue({
-            code: z$1.ZodIssueCode.custom,
+            code: z.ZodIssueCode.custom,
             path: ["field"],
             message: "`field` is not allowed when `mode=delta`"
           });
         }
         if (value.direction !== void 0) {
           ctx.addIssue({
-            code: z$1.ZodIssueCode.custom,
+            code: z.ZodIssueCode.custom,
             path: ["direction"],
             message: "`direction` is not allowed when `mode=delta`"
           });
@@ -36624,14 +36212,14 @@ function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
     }
     if (hasAfter) {
       ctx.addIssue({
-        code: z$1.ZodIssueCode.custom,
+        code: z.ZodIssueCode.custom,
         path: ["after"],
         message: "`after` is only allowed when `mode=delta`"
       });
     }
     if (hasLimit) {
       ctx.addIssue({
-        code: z$1.ZodIssueCode.custom,
+        code: z.ZodIssueCode.custom,
         path: ["limit"],
         message: "`limit` is only allowed when `mode=delta`"
       });
@@ -36654,24 +36242,24 @@ var EntityType = /* @__PURE__ */ ((EntityType2) => {
   EntityType2["MEMORY"] = "memory";
   return EntityType2;
 })(EntityType || {});
-z$1.date().describe("Database record creation time");
-var updatedAtField = z$1.date().describe("Database record last update time");
+z.date().describe("Database record creation time");
+var updatedAtField = z.date().describe("Database record last update time");
 ({
   updatedAt: updatedAtField.nullable()
 });
-var paginationArgsSchema2 = z$1.object({
-  page: z$1.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
-  perPage: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
+var paginationArgsSchema2 = z.object({
+  page: z.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
+  perPage: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
 }).describe("Pagination options for list queries");
-var paginationInfoSchema = z$1.object({
-  total: z$1.number().describe("Total number of items available"),
-  page: z$1.number().describe("Current page"),
-  perPage: z$1.union([z$1.number(), z$1.literal(false)]).describe("Number of items per page, or false if pagination is disabled"),
-  hasMore: z$1.boolean().describe("True if more pages are available")
+var paginationInfoSchema = z.object({
+  total: z.number().describe("Total number of items available"),
+  page: z.number().describe("Current page"),
+  perPage: z.union([z.number(), z.literal(false)]).describe("Number of items per page, or false if pagination is disabled"),
+  hasMore: z.boolean().describe("True if more pages are available")
 });
-var deltaCursorSchema = z$1.string().min(1).describe("Opaque cursor value for incremental polling");
-var listModeSchema = z$1.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
-var deltaLimitSchema = z$1.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
+var deltaCursorSchema = z.string().min(1).describe("Opaque cursor value for incremental polling");
+var listModeSchema = z.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
+var deltaLimitSchema = z.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
 var defaultPaginationArgs = {
   page: 0,
   perPage: 10
@@ -36704,59 +36292,59 @@ function normalizeObservabilityListArgs(value, defaults) {
     limit: value.limit ?? defaults.limit ?? defaultDeltaLimit
   };
 }
-var deltaInfoSchema = z$1.object({
-  limit: z$1.number().describe("Maximum number of updates requested for this delta poll"),
-  hasMore: z$1.boolean().describe("True when more matching updates remain after this response")
+var deltaInfoSchema = z.object({
+  limit: z.number().describe("Maximum number of updates requested for this delta poll"),
+  hasMore: z.boolean().describe("True when more matching updates remain after this response")
 }).describe("Incremental polling metadata");
-var dateRangeSchema = z$1.object({
-  start: z$1.coerce.date().optional().describe("Start of date range (inclusive by default)"),
-  end: z$1.coerce.date().optional().describe("End of date range (inclusive by default)"),
-  startExclusive: z$1.boolean().optional().describe("When true, excludes the start date from results (uses > instead of >=)"),
-  endExclusive: z$1.boolean().optional().describe("When true, excludes the end date from results (uses < instead of <=)")
+var dateRangeSchema = z.object({
+  start: z.coerce.date().optional().describe("Start of date range (inclusive by default)"),
+  end: z.coerce.date().optional().describe("End of date range (inclusive by default)"),
+  startExclusive: z.boolean().optional().describe("When true, excludes the start date from results (uses > instead of >=)"),
+  endExclusive: z.boolean().optional().describe("When true, excludes the end date from results (uses < instead of <=)")
 }).describe("Date range filter for timestamps");
-var sortDirectionSchema = z$1.enum(["ASC", "DESC"]).describe("Sort direction: 'ASC' | 'DESC'");
-var aggregationTypeSchema = z$1.enum(["sum", "avg", "min", "max", "count", "count_distinct", "last"]).describe("Aggregation function");
-var aggregationIntervalSchema = z$1.enum(["1m", "5m", "15m", "1h", "1d"]).describe("Time bucket interval");
-var comparePeriodSchema = z$1.enum(["previous_period", "previous_day", "previous_week"]).describe("Comparison period for aggregate queries");
-var groupBySchema = z$1.array(z$1.string()).min(1).describe("Fields to group by");
-var percentilesSchema = z$1.array(z$1.number().min(0).max(1)).min(1).describe("Percentile values (0-1)");
+var sortDirectionSchema = z.enum(["ASC", "DESC"]).describe("Sort direction: 'ASC' | 'DESC'");
+var aggregationTypeSchema = z.enum(["sum", "avg", "min", "max", "count", "count_distinct", "last"]).describe("Aggregation function");
+var aggregationIntervalSchema = z.enum(["1m", "5m", "15m", "1h", "1d"]).describe("Time bucket interval");
+var comparePeriodSchema = z.enum(["previous_period", "previous_day", "previous_week"]).describe("Comparison period for aggregate queries");
+var groupBySchema = z.array(z.string()).min(1).describe("Fields to group by");
+var percentilesSchema = z.array(z.number().min(0).max(1)).min(1).describe("Percentile values (0-1)");
 var aggregateResponseFields = {
-  value: z$1.number().nullable().describe("Aggregated value"),
-  previousValue: z$1.number().nullable().optional().describe("Value from comparison period"),
-  changePercent: z$1.number().nullable().optional().describe("Percentage change from comparison period")
+  value: z.number().nullable().describe("Aggregated value"),
+  previousValue: z.number().nullable().optional().describe("Value from comparison period"),
+  changePercent: z.number().nullable().optional().describe("Percentage change from comparison period")
 };
-var dimensionsField = z$1.record(z$1.string(), z$1.string().nullable()).describe("Dimension values for this group");
-var aggregatedValueField = z$1.number().describe("Aggregated value");
-var bucketTimestampField = z$1.date().describe("Bucket timestamp");
-var percentileField = z$1.number().describe("Percentile value");
-var percentileBucketValueField = z$1.number().describe("Percentile value at this bucket");
-var entityTypeField = z$1.nativeEnum(EntityType).describe(`Entity type (e.g., 'agent' | 'processor' | 'tool' | 'workflow')`);
-var entityIdField = z$1.string().describe('ID of the entity (e.g., "weatherAgent", "orderWorkflow")');
-var entityNameField = z$1.string().describe("Name of the entity");
-var userIdField = z$1.string().describe("Human end-user who triggered execution");
-var organizationIdField = z$1.string().describe("Multi-tenant organization/account");
-var resourceIdField = z$1.string().describe("Broader resource context (Mastra memory compatibility)");
-var runIdField = z$1.string().describe("Unique execution run identifier");
-var sessionIdField = z$1.string().describe("Session identifier for grouping traces");
-var threadIdField = z$1.string().describe("Conversation thread identifier");
-var requestIdField = z$1.string().describe("HTTP request ID for log correlation");
-var environmentField = z$1.string().describe(`Environment (e.g., "production" | "staging" | "development")`);
-var sourceField = z$1.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
-var executionSourceField = z$1.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
-var serviceNameField = z$1.string().describe("Name of the service");
-var parentEntityTypeField = z$1.nativeEnum(EntityType).describe("Entity type of the parent entity");
-var parentEntityIdField = z$1.string().describe("ID of the parent entity");
-var parentEntityNameField = z$1.string().describe("Name of the parent entity");
-var rootEntityTypeField = z$1.nativeEnum(EntityType).describe("Entity type of the root entity");
-var rootEntityIdField = z$1.string().describe("ID of the root entity");
-var rootEntityNameField = z$1.string().describe("Name of the root entity");
-var entityVersionIdField = z$1.string().describe("Version ID of the entity that produced this signal (e.g., agent version, workflow version)");
-var parentEntityVersionIdField = z$1.string().describe("Version ID of the parent entity that produced this signal");
-var rootEntityVersionIdField = z$1.string().describe("Version ID of the root entity that produced this signal");
-var experimentIdField = z$1.string().describe("Experiment or eval run identifier");
-var scopeField = z$1.record(z$1.string(), z$1.unknown()).describe('Arbitrary package/app version info (e.g., {"core": "1.0.0", "memory": "1.0.0", "gitSha": "abcd1234"})');
-var metadataField = z$1.record(z$1.string(), z$1.unknown()).describe("User-defined metadata for custom filtering");
-var tagsField = z$1.array(z$1.string()).describe("Labels for filtering");
+var dimensionsField = z.record(z.string(), z.string().nullable()).describe("Dimension values for this group");
+var aggregatedValueField = z.number().describe("Aggregated value");
+var bucketTimestampField = z.date().describe("Bucket timestamp");
+var percentileField = z.number().describe("Percentile value");
+var percentileBucketValueField = z.number().describe("Percentile value at this bucket");
+var entityTypeField = z.nativeEnum(EntityType).describe(`Entity type (e.g., 'agent' | 'processor' | 'tool' | 'workflow')`);
+var entityIdField = z.string().describe('ID of the entity (e.g., "weatherAgent", "orderWorkflow")');
+var entityNameField = z.string().describe("Name of the entity");
+var userIdField = z.string().describe("Human end-user who triggered execution");
+var organizationIdField = z.string().describe("Multi-tenant organization/account");
+var resourceIdField = z.string().describe("Broader resource context (Mastra memory compatibility)");
+var runIdField = z.string().describe("Unique execution run identifier");
+var sessionIdField = z.string().describe("Session identifier for grouping traces");
+var threadIdField = z.string().describe("Conversation thread identifier");
+var requestIdField = z.string().describe("HTTP request ID for log correlation");
+var environmentField = z.string().describe(`Environment (e.g., "production" | "staging" | "development")`);
+var sourceField = z.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
+var executionSourceField = z.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
+var serviceNameField = z.string().describe("Name of the service");
+var parentEntityTypeField = z.nativeEnum(EntityType).describe("Entity type of the parent entity");
+var parentEntityIdField = z.string().describe("ID of the parent entity");
+var parentEntityNameField = z.string().describe("Name of the parent entity");
+var rootEntityTypeField = z.nativeEnum(EntityType).describe("Entity type of the root entity");
+var rootEntityIdField = z.string().describe("ID of the root entity");
+var rootEntityNameField = z.string().describe("Name of the root entity");
+var entityVersionIdField = z.string().describe("Version ID of the entity that produced this signal (e.g., agent version, workflow version)");
+var parentEntityVersionIdField = z.string().describe("Version ID of the parent entity that produced this signal");
+var rootEntityVersionIdField = z.string().describe("Version ID of the root entity that produced this signal");
+var experimentIdField = z.string().describe("Experiment or eval run identifier");
+var scopeField = z.record(z.string(), z.unknown()).describe('Arbitrary package/app version info (e.g., {"core": "1.0.0", "memory": "1.0.0", "gitSha": "abcd1234"})');
+var metadataField = z.record(z.string(), z.unknown()).describe("User-defined metadata for custom filtering");
+var tagsField = z.array(z.string()).describe("Labels for filtering");
 var contextFieldsBase = {
   // Entity identification
   entityType: entityTypeField.nullish(),
@@ -36800,8 +36388,8 @@ var contextFields = {
 });
 var commonFilterFields = {
   timestamp: dateRangeSchema.optional().describe("Filter by timestamp range"),
-  traceId: z$1.string().optional().describe("Filter by trace ID"),
-  spanId: z$1.string().optional().describe("Filter by span ID"),
+  traceId: z.string().optional().describe("Filter by trace ID"),
+  spanId: z.string().optional().describe("Filter by span ID"),
   entityType: entityTypeField.optional(),
   entityName: entityNameField.optional(),
   entityVersionId: entityVersionIdField.optional(),
@@ -36822,16 +36410,16 @@ var commonFilterFields = {
   threadId: threadIdField.optional(),
   requestId: requestIdField.optional(),
   executionSource: executionSourceField.optional(),
-  tags: z$1.array(z$1.string()).optional().describe("Filter by tags (must have all specified tags)")
+  tags: z.array(z.string()).optional().describe("Filter by tags (must have all specified tags)")
 };
-var traceIdField = z$1.string().describe("Unique trace identifier");
-var spanIdField = z$1.string().describe("Unique span identifier within a trace");
-var logLevelSchema = z$1.enum(["debug", "info", "warn", "error", "fatal"]);
-var messageField = z$1.string().describe("Log message");
-var logDataField = z$1.record(z$1.string(), z$1.unknown()).describe("Structured data attached to the log");
-var logRecordSchema = z$1.object({
-  logId: z$1.string().nullish().describe("Unique id for this log event"),
-  timestamp: z$1.date().describe("When the log was created"),
+var traceIdField = z.string().describe("Unique trace identifier");
+var spanIdField = z.string().describe("Unique span identifier within a trace");
+var logLevelSchema = z.enum(["debug", "info", "warn", "error", "fatal"]);
+var messageField = z.string().describe("Log message");
+var logDataField = z.record(z.string(), z.unknown()).describe("Structured data attached to the log");
+var logRecordSchema = z.object({
+  logId: z.string().nullish().describe("Unique id for this log event"),
+  timestamp: z.date().describe("When the log was created"),
   level: logLevelSchema.describe("Log severity level"),
   message: messageField,
   data: logDataField.nullish(),
@@ -36843,34 +36431,34 @@ var logRecordSchema = z$1.object({
   /**
    * @deprecated Use `executionSource` instead.
    */
-  source: z$1.string().nullish().describe("Execution source"),
+  source: z.string().nullish().describe("Execution source"),
   metadata: metadataField.nullish()
 }).describe("Log record as stored in the database");
-z$1.object({
+z.object({
   level: logLevelSchema,
   message: messageField,
   data: logDataField.optional(),
   tags: tagsField.optional()
 }).describe("User-provided log input");
 var createLogRecordSchema = logRecordSchema;
-z$1.object({
-  logs: z$1.array(createLogRecordSchema)
+z.object({
+  logs: z.array(createLogRecordSchema)
 }).describe("Arguments for batch creating logs");
-var logsFilterSchema = z$1.object({
+var logsFilterSchema = z.object({
   ...commonFilterFields,
   // Log-specific filters
   /**
    * @deprecated Use `executionSource` instead.
    */
-  source: z$1.string().optional().describe("Filter by execution source"),
-  level: z$1.union([logLevelSchema, z$1.array(logLevelSchema)]).optional().describe("Filter by log level(s)")
+  source: z.string().optional().describe("Filter by execution source"),
+  level: z.union([logLevelSchema, z.array(logLevelSchema)]).optional().describe("Filter by log level(s)")
 }).describe("Filters for querying logs");
-var logsOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
-var logsOrderBySchema = z$1.object({
+var logsOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+var logsOrderBySchema = z.object({
   field: logsOrderByFieldSchema.default("timestamp").describe("Field to order by"),
   direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
   mode: listModeSchema.optional(),
   filters: logsFilterSchema.optional().describe("Optional filters to apply"),
   pagination: paginationArgsSchema2.optional(),
@@ -36882,21 +36470,21 @@ z$1.object({
     orderBy: { field: "timestamp", direction: "DESC" }
   })
 ).describe("Arguments for listing logs");
-var listLogsResponseSchema$1 = z$1.object({
+var listLogsResponseSchema$1 = z.object({
   pagination: paginationInfoSchema.optional(),
   delta: deltaInfoSchema.optional(),
   deltaCursor: deltaCursorSchema.optional(),
-  logs: z$1.array(logRecordSchema)
+  logs: z.array(logRecordSchema)
 }).describe("Response from listing logs");
-var scorerIdField = z$1.string().describe("Identifier of the scorer (e.g., relevance, accuracy)");
-var scorerNameField = z$1.string().describe("Display name of the scorer");
-var scorerVersionField = z$1.string().describe("Version of the scorer");
-var scoreSourceField = z$1.string().describe("How the score was produced (e.g., manual, automated, experiment)");
-var scoreValueField = z$1.number().describe("Score value (range defined by scorer)");
-var scoreReasonField = z$1.string().describe("Explanation for the score");
-var scoreRecordSchema = z$1.object({
-  scoreId: z$1.string().nullish().describe("Unique id for this score event"),
-  timestamp: z$1.date().describe("When the score was recorded"),
+var scorerIdField = z.string().describe("Identifier of the scorer (e.g., relevance, accuracy)");
+var scorerNameField = z.string().describe("Display name of the scorer");
+var scorerVersionField = z.string().describe("Version of the scorer");
+var scoreSourceField = z.string().describe("How the score was produced (e.g., manual, automated, experiment)");
+var scoreValueField = z.number().describe("Score value (range defined by scorer)");
+var scoreReasonField = z.string().describe("Explanation for the score");
+var scoreRecordSchema = z.object({
+  scoreId: z.string().nullish().describe("Unique id for this score event"),
+  timestamp: z.date().describe("When the score was recorded"),
   // Target
   traceId: traceIdField.nullish().describe("Trace that anchors the scored target when available"),
   spanId: spanIdField.nullish().describe("Span ID this score applies to"),
@@ -36914,11 +36502,11 @@ var scoreRecordSchema = z$1.object({
   // Context (entity hierarchy, identity, correlation, deployment, experimentation)
   ...contextFields,
   /** Trace ID of the scoring run (links to trace that generated this score) */
-  scoreTraceId: z$1.string().nullish().describe("Trace ID of the scoring run for debugging score generation"),
+  scoreTraceId: z.string().nullish().describe("Trace ID of the scoring run for debugging score generation"),
   // User-defined metadata (context fields stored here)
-  metadata: z$1.record(z$1.string(), z$1.unknown()).nullish().describe("User-defined metadata")
+  metadata: z.record(z.string(), z.unknown()).nullish().describe("User-defined metadata")
 }).describe("Score record as stored in the database");
-z$1.object({
+z.object({
   scorerId: scorerIdField,
   scorerName: scorerNameField.optional(),
   scorerVersion: scorerVersionField.optional(),
@@ -36929,38 +36517,38 @@ z$1.object({
   source: scoreSourceField.optional(),
   score: scoreValueField,
   reason: scoreReasonField.optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional scorer-specific metadata"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional scorer-specific metadata"),
   experimentId: experimentIdField.optional(),
-  scoreTraceId: z$1.string().optional().describe("Trace ID of the scoring run for debugging score generation"),
+  scoreTraceId: z.string().optional().describe("Trace ID of the scoring run for debugging score generation"),
   targetEntityType: entityTypeField.optional().describe("Entity type the scorer evaluated when known")
 }).describe("User-provided score input");
 var createScoreRecordSchema = scoreRecordSchema;
-z$1.object({
+z.object({
   score: createScoreRecordSchema
 }).describe("Arguments for creating a score");
-var createScoreBodySchema = z$1.object({
+var createScoreBodySchema = z.object({
   score: createScoreRecordSchema.omit({ timestamp: true })
 }).describe("Arguments for creating a score");
-var createScoreResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from creating a score");
-z$1.object({
-  scores: z$1.array(createScoreRecordSchema)
+var createScoreResponseSchema = z.object({ success: z.boolean() }).describe("Response from creating a score");
+z.object({
+  scores: z.array(createScoreRecordSchema)
 }).describe("Arguments for batch recording scores");
-var scoresFilterSchema = z$1.object({
+var scoresFilterSchema = z.object({
   ...commonFilterFields,
   // Score-specific filters
-  scorerId: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional().describe("Filter by scorer ID(s)"),
+  scorerId: z.union([z.string(), z.array(z.string())]).optional().describe("Filter by scorer ID(s)"),
   scoreSource: scoreSourceField.optional().describe("Filter by how the score was produced"),
   /**
    * @deprecated Use `scoreSource` instead.
    */
   source: scoreSourceField.optional().describe("Filter by how the score was produced")
 }).describe("Filters for querying scores");
-var scoresOrderByFieldSchema = z$1.enum(["timestamp", "score"]).describe("Field to order by: 'timestamp' | 'score'");
-var scoresOrderBySchema = z$1.object({
+var scoresOrderByFieldSchema = z.enum(["timestamp", "score"]).describe("Field to order by: 'timestamp' | 'score'");
+var scoresOrderBySchema = z.object({
   field: scoresOrderByFieldSchema.default("timestamp").describe("Field to order by"),
   direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
   mode: listModeSchema.optional(),
   filters: scoresFilterSchema.optional(),
   pagination: paginationArgsSchema2.optional(),
@@ -36972,36 +36560,36 @@ z$1.object({
     orderBy: { field: "timestamp", direction: "DESC" }
   })
 ).describe("Arguments for listing scores");
-var listScoresResponseSchema = z$1.object({
+var listScoresResponseSchema = z.object({
   pagination: paginationInfoSchema.optional(),
   delta: deltaInfoSchema.optional(),
   deltaCursor: deltaCursorSchema.optional(),
-  scores: z$1.array(scoreRecordSchema)
+  scores: z.array(scoreRecordSchema)
 }).describe("Response from listing scores");
-var getScoreAggregateArgsSchema = z$1.object({
+var getScoreAggregateArgsSchema = z.object({
   scorerId: scorerIdField,
   scoreSource: scoreSourceField.optional(),
   aggregation: aggregationTypeSchema,
   filters: scoresFilterSchema.optional(),
   comparePeriod: comparePeriodSchema.optional()
 }).describe("Arguments for getting a score aggregate");
-var getScoreAggregateResponseSchema = z$1.object(aggregateResponseFields);
-var getScoreBreakdownArgsSchema = z$1.object({
+var getScoreAggregateResponseSchema = z.object(aggregateResponseFields);
+var getScoreBreakdownArgsSchema = z.object({
   scorerId: scorerIdField,
   scoreSource: scoreSourceField.optional(),
   groupBy: groupBySchema,
   aggregation: aggregationTypeSchema,
   filters: scoresFilterSchema.optional()
 }).describe("Arguments for getting a score breakdown");
-var getScoreBreakdownResponseSchema = z$1.object({
-  groups: z$1.array(
-    z$1.object({
+var getScoreBreakdownResponseSchema = z.object({
+  groups: z.array(
+    z.object({
       dimensions: dimensionsField,
       value: aggregatedValueField
     })
   )
 });
-var getScoreTimeSeriesArgsSchema = z$1.object({
+var getScoreTimeSeriesArgsSchema = z.object({
   scorerId: scorerIdField,
   scoreSource: scoreSourceField.optional(),
   interval: aggregationIntervalSchema,
@@ -37009,12 +36597,12 @@ var getScoreTimeSeriesArgsSchema = z$1.object({
   filters: scoresFilterSchema.optional(),
   groupBy: groupBySchema.optional()
 }).describe("Arguments for getting score time series");
-var getScoreTimeSeriesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
-      name: z$1.string().describe("Series name (scorer ID or group key)"),
-      points: z$1.array(
-        z$1.object({
+var getScoreTimeSeriesResponseSchema = z.object({
+  series: z.array(
+    z.object({
+      name: z.string().describe("Series name (scorer ID or group key)"),
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: aggregatedValueField
         })
@@ -37022,19 +36610,19 @@ var getScoreTimeSeriesResponseSchema = z$1.object({
     })
   )
 });
-var getScorePercentilesArgsSchema = z$1.object({
+var getScorePercentilesArgsSchema = z.object({
   scorerId: scorerIdField,
   scoreSource: scoreSourceField.optional(),
   percentiles: percentilesSchema,
   interval: aggregationIntervalSchema,
   filters: scoresFilterSchema.optional()
 }).describe("Arguments for getting score percentiles");
-var getScorePercentilesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
+var getScorePercentilesResponseSchema = z.object({
+  series: z.array(
+    z.object({
       percentile: percentileField,
-      points: z$1.array(
-        z$1.object({
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: percentileBucketValueField
         })
@@ -37042,11 +36630,11 @@ var getScorePercentilesResponseSchema = z$1.object({
     })
   )
 });
-var feedbackSourceField = z$1.string().describe("Source of feedback (e.g., 'user', 'system', 'manual')");
-var feedbackTypeField = z$1.string().describe("Type of feedback (e.g., 'thumbs', 'rating', 'correction')");
-var feedbackValueField = z$1.union([z$1.number(), z$1.string()]).describe("Feedback value (rating number or correction text)");
-var feedbackCommentField = z$1.string().describe("Additional comment or context");
-var feedbackUserIdField = z$1.string().describe("User who provided the feedback");
+var feedbackSourceField = z.string().describe("Source of feedback (e.g., 'user', 'system', 'manual')");
+var feedbackTypeField = z.string().describe("Type of feedback (e.g., 'thumbs', 'rating', 'correction')");
+var feedbackValueField = z.union([z.number(), z.string()]).describe("Feedback value (rating number or correction text)");
+var feedbackCommentField = z.string().describe("Additional comment or context");
+var feedbackUserIdField = z.string().describe("User who provided the feedback");
 function normalizeLegacyFeedbackActor(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     return input;
@@ -37058,9 +36646,9 @@ function normalizeLegacyFeedbackActor(input) {
   }
   return record;
 }
-var feedbackRecordObjectSchema = z$1.object({
-  feedbackId: z$1.string().nullish().describe("Unique id for this feedback event"),
-  timestamp: z$1.date().describe("When the feedback was recorded"),
+var feedbackRecordObjectSchema = z.object({
+  feedbackId: z.string().nullish().describe("Unique id for this feedback event"),
+  timestamp: z.date().describe("When the feedback was recorded"),
   // Target
   traceId: traceIdField.nullish().describe("Trace that anchors the feedback target when available"),
   spanId: spanIdField.nullish().describe("Span ID this feedback applies to"),
@@ -37078,12 +36666,12 @@ var feedbackRecordObjectSchema = z$1.object({
   // Context (entity hierarchy, identity, correlation, deployment, experimentation)
   ...contextFields,
   // Source linkage (e.g. dataset item result ID)
-  sourceId: z$1.string().nullish().describe("ID of the source record this feedback is linked to (e.g. experiment result ID)"),
+  sourceId: z.string().nullish().describe("ID of the source record this feedback is linked to (e.g. experiment result ID)"),
   // User-defined metadata (context fields stored here)
-  metadata: z$1.record(z$1.string(), z$1.unknown()).nullish().describe("User-defined metadata")
+  metadata: z.record(z.string(), z.unknown()).nullish().describe("User-defined metadata")
 });
-var feedbackRecordSchema = z$1.object(feedbackRecordObjectSchema.shape).describe("Feedback record as stored in the database");
-var feedbackInputObjectSchema = z$1.object({
+var feedbackRecordSchema = z.object(feedbackRecordObjectSchema.shape).describe("Feedback record as stored in the database");
+var feedbackInputObjectSchema = z.object({
   feedbackSource: feedbackSourceField.optional(),
   /**
    * @deprecated Use `feedbackSource` instead.
@@ -37097,25 +36685,25 @@ var feedbackInputObjectSchema = z$1.object({
    * @deprecated Use `feedbackUserId` instead.
    */
   userId: feedbackUserIdField.optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional feedback-specific metadata"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Additional feedback-specific metadata"),
   experimentId: experimentIdField.optional(),
-  sourceId: z$1.string().optional().describe("ID of the source record this feedback is linked to")
+  sourceId: z.string().optional().describe("ID of the source record this feedback is linked to")
 });
-z$1.object(feedbackInputObjectSchema.shape).describe("User-provided feedback input");
-z$1.object({
-  feedback: z$1.preprocess(normalizeLegacyFeedbackActor, feedbackRecordObjectSchema)
+z.object(feedbackInputObjectSchema.shape).describe("User-provided feedback input");
+z.object({
+  feedback: z.preprocess(normalizeLegacyFeedbackActor, feedbackRecordObjectSchema)
 }).describe("Arguments for creating feedback");
-var createFeedbackBodySchema = z$1.object({
+var createFeedbackBodySchema = z.object({
   feedback: feedbackRecordObjectSchema.omit({ timestamp: true })
 }).describe("Arguments for creating feedback");
-var createFeedbackResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from creating feedback");
-z$1.object({
-  feedbacks: z$1.array(z$1.preprocess(normalizeLegacyFeedbackActor, feedbackRecordObjectSchema))
+var createFeedbackResponseSchema = z.object({ success: z.boolean() }).describe("Response from creating feedback");
+z.object({
+  feedbacks: z.array(z.preprocess(normalizeLegacyFeedbackActor, feedbackRecordObjectSchema))
 }).describe("Arguments for batch recording feedback");
-var feedbackFilterObjectSchema = z$1.object({
+var feedbackFilterObjectSchema = z.object({
   ...commonFilterFields,
   // Feedback-specific filters
-  feedbackType: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional().describe("Filter by feedback type(s)"),
+  feedbackType: z.union([z.string(), z.array(z.string())]).optional().describe("Filter by feedback type(s)"),
   feedbackSource: feedbackSourceField.optional(),
   /**
    * @deprecated Use `feedbackSource` instead.
@@ -37123,15 +36711,15 @@ var feedbackFilterObjectSchema = z$1.object({
   source: feedbackSourceField.optional(),
   feedbackUserId: feedbackUserIdField.optional()
 });
-var feedbackFilterSchema = z$1.object(feedbackFilterObjectSchema.shape).describe("Filters for querying feedback");
-var feedbackOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
-var feedbackOrderBySchema = z$1.object({
+var feedbackFilterSchema = z.object(feedbackFilterObjectSchema.shape).describe("Filters for querying feedback");
+var feedbackOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+var feedbackOrderBySchema = z.object({
   field: feedbackOrderByFieldSchema.default("timestamp").describe("Field to order by"),
   direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
   mode: listModeSchema.optional(),
-  filters: z$1.preprocess(normalizeLegacyFeedbackActor, feedbackFilterObjectSchema).optional(),
+  filters: z.preprocess(normalizeLegacyFeedbackActor, feedbackFilterObjectSchema).optional(),
   pagination: paginationArgsSchema2.optional(),
   orderBy: feedbackOrderBySchema.optional(),
   after: deltaCursorSchema.optional(),
@@ -37141,36 +36729,36 @@ z$1.object({
     orderBy: { field: "timestamp", direction: "DESC" }
   })
 ).describe("Arguments for listing feedback");
-var listFeedbackResponseSchema = z$1.object({
+var listFeedbackResponseSchema = z.object({
   pagination: paginationInfoSchema.optional(),
   delta: deltaInfoSchema.optional(),
   deltaCursor: deltaCursorSchema.optional(),
-  feedback: z$1.array(feedbackRecordSchema)
+  feedback: z.array(feedbackRecordSchema)
 }).describe("Response from listing feedback");
-var getFeedbackAggregateArgsSchema = z$1.object({
+var getFeedbackAggregateArgsSchema = z.object({
   feedbackType: feedbackTypeField,
   feedbackSource: feedbackSourceField.optional(),
   aggregation: aggregationTypeSchema,
   filters: feedbackFilterSchema.optional(),
   comparePeriod: comparePeriodSchema.optional()
 }).describe("Arguments for getting a feedback aggregate over numeric values");
-var getFeedbackAggregateResponseSchema = z$1.object(aggregateResponseFields);
-var getFeedbackBreakdownArgsSchema = z$1.object({
+var getFeedbackAggregateResponseSchema = z.object(aggregateResponseFields);
+var getFeedbackBreakdownArgsSchema = z.object({
   feedbackType: feedbackTypeField,
   feedbackSource: feedbackSourceField.optional(),
   groupBy: groupBySchema,
   aggregation: aggregationTypeSchema,
   filters: feedbackFilterSchema.optional()
 }).describe("Arguments for getting a feedback breakdown over numeric values");
-var getFeedbackBreakdownResponseSchema = z$1.object({
-  groups: z$1.array(
-    z$1.object({
+var getFeedbackBreakdownResponseSchema = z.object({
+  groups: z.array(
+    z.object({
       dimensions: dimensionsField,
       value: aggregatedValueField
     })
   )
 });
-var getFeedbackTimeSeriesArgsSchema = z$1.object({
+var getFeedbackTimeSeriesArgsSchema = z.object({
   feedbackType: feedbackTypeField,
   feedbackSource: feedbackSourceField.optional(),
   interval: aggregationIntervalSchema,
@@ -37178,12 +36766,12 @@ var getFeedbackTimeSeriesArgsSchema = z$1.object({
   filters: feedbackFilterSchema.optional(),
   groupBy: groupBySchema.optional()
 }).describe("Arguments for getting feedback time series over numeric values");
-var getFeedbackTimeSeriesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
-      name: z$1.string().describe("Series name (feedback type or group key)"),
-      points: z$1.array(
-        z$1.object({
+var getFeedbackTimeSeriesResponseSchema = z.object({
+  series: z.array(
+    z.object({
+      name: z.string().describe("Series name (feedback type or group key)"),
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: aggregatedValueField
         })
@@ -37191,19 +36779,19 @@ var getFeedbackTimeSeriesResponseSchema = z$1.object({
     })
   )
 });
-var getFeedbackPercentilesArgsSchema = z$1.object({
+var getFeedbackPercentilesArgsSchema = z.object({
   feedbackType: feedbackTypeField,
   feedbackSource: feedbackSourceField.optional(),
   percentiles: percentilesSchema,
   interval: aggregationIntervalSchema,
   filters: feedbackFilterSchema.optional()
 }).describe("Arguments for getting feedback percentiles over numeric values");
-var getFeedbackPercentilesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
+var getFeedbackPercentilesResponseSchema = z.object({
+  series: z.array(
+    z.object({
       percentile: percentileField,
-      points: z$1.array(
-        z$1.object({
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: percentileBucketValueField
         })
@@ -37211,18 +36799,18 @@ var getFeedbackPercentilesResponseSchema = z$1.object({
     })
   )
 });
-z$1.enum(["counter", "gauge", "histogram"]);
-var metricNameField = z$1.string().describe("Metric name (e.g., mastra_agent_duration_ms)");
-var metricValueField = z$1.number().describe("Metric value");
-var labelsField = z$1.record(z$1.string(), z$1.string()).describe("Metric labels for dimensional filtering");
-var providerField = z$1.string().describe("Model provider");
-var modelField = z$1.string().describe("Model");
-var estimatedCostField = z$1.number().describe("Estimated cost");
-var costUnitField = z$1.string().describe("Unit for the estimated cost (e.g., usd)");
-var costMetadField = z$1.record(z$1.string(), z$1.unknown()).nullish().describe("Structured costing metadata");
-var metricRecordSchema = z$1.object({
-  metricId: z$1.string().nullish().describe("Unique id for this metric event"),
-  timestamp: z$1.date().describe("When the metric was recorded"),
+z.enum(["counter", "gauge", "histogram"]);
+var metricNameField = z.string().describe("Metric name (e.g., mastra_agent_duration_ms)");
+var metricValueField = z.number().describe("Metric value");
+var labelsField = z.record(z.string(), z.string()).describe("Metric labels for dimensional filtering");
+var providerField = z.string().describe("Model provider");
+var modelField = z.string().describe("Model");
+var estimatedCostField = z.number().describe("Estimated cost");
+var costUnitField = z.string().describe("Unit for the estimated cost (e.g., usd)");
+var costMetadField = z.record(z.string(), z.unknown()).nullish().describe("Structured costing metadata");
+var metricRecordSchema = z.object({
+  metricId: z.string().nullish().describe("Unique id for this metric event"),
+  timestamp: z.date().describe("When the metric was recorded"),
   name: metricNameField,
   value: metricValueField,
   // Correlation
@@ -37233,7 +36821,7 @@ var metricRecordSchema = z$1.object({
   /**
    * @deprecated Use `executionSource` instead.
    */
-  source: z$1.string().nullish().describe("Execution source"),
+  source: z.string().nullish().describe("Execution source"),
   // Canonical costing fields
   provider: providerField.nullish(),
   model: modelField.nullish(),
@@ -37246,41 +36834,41 @@ var metricRecordSchema = z$1.object({
   // User-defined metadata
   metadata: metadataField.nullish()
 }).describe("Metric record as stored in the database");
-z$1.object({
+z.object({
   name: metricNameField,
   value: metricValueField,
   labels: labelsField.optional()
 }).describe("User-provided metric input");
 var createMetricRecordSchema = metricRecordSchema;
-z$1.object({
-  metrics: z$1.array(createMetricRecordSchema)
+z.object({
+  metrics: z.array(createMetricRecordSchema)
 }).describe("Arguments for batch recording metrics");
-z$1.object({
+z.object({
   type: aggregationTypeSchema,
   interval: aggregationIntervalSchema.optional(),
   groupBy: groupBySchema.optional()
 }).describe("Metrics aggregation configuration");
-var metricsFilterSchema = z$1.object({
+var metricsFilterSchema = z.object({
   ...commonFilterFields,
   // Metric identification
-  name: z$1.array(z$1.string()).nonempty().optional().describe("Filter by metric name(s)"),
+  name: z.array(z.string()).nonempty().optional().describe("Filter by metric name(s)"),
   /**
    * @deprecated Use `executionSource` instead.
    */
-  source: z$1.string().optional().describe("Filter by execution source"),
+  source: z.string().optional().describe("Filter by execution source"),
   // Canonical costing filters
   provider: providerField.optional(),
   model: modelField.optional(),
   costUnit: costUnitField.optional(),
   // Label filters (exact match on label values)
-  labels: z$1.record(z$1.string(), z$1.string()).optional().describe("Exact match on label key-value pairs")
+  labels: z.record(z.string(), z.string()).optional().describe("Exact match on label key-value pairs")
 }).describe("Filters for querying metrics");
-var metricsOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
-var metricsOrderBySchema = z$1.object({
+var metricsOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+var metricsOrderBySchema = z.object({
   field: metricsOrderByFieldSchema.default("timestamp").describe("Field to order by"),
   direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
   mode: listModeSchema.optional(),
   filters: metricsFilterSchema.optional(),
   pagination: paginationArgsSchema2.optional(),
@@ -37292,11 +36880,11 @@ z$1.object({
     orderBy: { field: "timestamp", direction: "DESC" }
   })
 ).describe("Arguments for listing metrics");
-var listMetricsResponseSchema = z$1.object({
+var listMetricsResponseSchema = z.object({
   pagination: paginationInfoSchema.optional(),
   delta: deltaInfoSchema.optional(),
   deltaCursor: deltaCursorSchema.optional(),
-  metrics: z$1.array(metricRecordSchema)
+  metrics: z.array(metricRecordSchema)
 }).describe("Response from listing metrics");
 var METRIC_DISTINCT_COLUMNS = [
   "entityType",
@@ -37314,7 +36902,7 @@ var METRIC_DISTINCT_COLUMNS = [
   "threadId",
   "resourceId"
 ];
-var distinctColumnSchema = z$1.enum(METRIC_DISTINCT_COLUMNS).optional().describe(
+var distinctColumnSchema = z.enum(METRIC_DISTINCT_COLUMNS).optional().describe(
   "Column to apply count_distinct over (required when aggregation is 'count_distinct'). Restricted to allowlisted metric dimensions."
 );
 var requireDistinctColumnRefinement = {
@@ -37324,76 +36912,76 @@ var requireDistinctColumnRefinement = {
     path: ["distinctColumn"]
   }
 };
-var getMetricAggregateArgsSchema = z$1.object({
-  name: z$1.array(z$1.string()).nonempty().describe("Metric name(s) to aggregate"),
+var getMetricAggregateArgsSchema = z.object({
+  name: z.array(z.string()).nonempty().describe("Metric name(s) to aggregate"),
   aggregation: aggregationTypeSchema,
   distinctColumn: distinctColumnSchema,
   filters: metricsFilterSchema.optional(),
   comparePeriod: comparePeriodSchema.optional()
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting a metric aggregate");
-var getMetricAggregateResponseSchema = z$1.object({
+var getMetricAggregateResponseSchema = z.object({
   ...aggregateResponseFields,
-  estimatedCost: z$1.number().nullable().optional().describe("Aggregated estimated cost from the same filtered row set"),
-  costUnit: z$1.string().nullable().optional().describe("Shared cost unit for the aggregated rows, or null when mixed/unknown"),
-  previousEstimatedCost: z$1.number().nullable().optional().describe("Aggregated estimated cost from the comparison period"),
-  costChangePercent: z$1.number().nullable().optional().describe("Percentage change in estimated cost from comparison period")
+  estimatedCost: z.number().nullable().optional().describe("Aggregated estimated cost from the same filtered row set"),
+  costUnit: z.string().nullable().optional().describe("Shared cost unit for the aggregated rows, or null when mixed/unknown"),
+  previousEstimatedCost: z.number().nullable().optional().describe("Aggregated estimated cost from the comparison period"),
+  costChangePercent: z.number().nullable().optional().describe("Percentage change in estimated cost from comparison period")
 });
-var getMetricBreakdownArgsSchema = z$1.object({
-  name: z$1.array(z$1.string()).nonempty().describe("Metric name(s) to break down"),
+var getMetricBreakdownArgsSchema = z.object({
+  name: z.array(z.string()).nonempty().describe("Metric name(s) to break down"),
   groupBy: groupBySchema,
   aggregation: aggregationTypeSchema,
   distinctColumn: distinctColumnSchema,
   filters: metricsFilterSchema.optional(),
-  limit: z$1.number().int().positive().max(1e3).optional().describe("Maximum number of groups to return (server-side TopK). Required for high-cardinality groupBy."),
+  limit: z.number().int().positive().max(1e3).optional().describe("Maximum number of groups to return (server-side TopK). Required for high-cardinality groupBy."),
   orderDirection: sortDirectionSchema.optional().describe(
     "Sort direction for the aggregated value (defaults to 'DESC' at the storage layer; pairs with limit for top/bottom-N)."
   )
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting a metric breakdown");
-var getMetricBreakdownResponseSchema = z$1.object({
-  groups: z$1.array(
-    z$1.object({
+var getMetricBreakdownResponseSchema = z.object({
+  groups: z.array(
+    z.object({
       dimensions: dimensionsField,
       value: aggregatedValueField,
-      estimatedCost: z$1.number().nullable().optional().describe("Summed estimated cost for this group"),
-      costUnit: z$1.string().nullable().optional().describe("Shared cost unit for this group, or null when mixed/unknown")
+      estimatedCost: z.number().nullable().optional().describe("Summed estimated cost for this group"),
+      costUnit: z.string().nullable().optional().describe("Shared cost unit for this group, or null when mixed/unknown")
     })
   )
 });
-var getMetricTimeSeriesArgsSchema = z$1.object({
-  name: z$1.array(z$1.string()).nonempty().describe("Metric name(s)"),
+var getMetricTimeSeriesArgsSchema = z.object({
+  name: z.array(z.string()).nonempty().describe("Metric name(s)"),
   interval: aggregationIntervalSchema,
   aggregation: aggregationTypeSchema,
   distinctColumn: distinctColumnSchema,
   filters: metricsFilterSchema.optional(),
   groupBy: groupBySchema.optional()
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting metric time series");
-var getMetricTimeSeriesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
-      name: z$1.string().describe("Series name (metric name or group key)"),
-      costUnit: z$1.string().nullable().optional().describe("Shared cost unit for this series, or null when mixed/unknown"),
-      points: z$1.array(
-        z$1.object({
+var getMetricTimeSeriesResponseSchema = z.object({
+  series: z.array(
+    z.object({
+      name: z.string().describe("Series name (metric name or group key)"),
+      costUnit: z.string().nullable().optional().describe("Shared cost unit for this series, or null when mixed/unknown"),
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: aggregatedValueField,
-          estimatedCost: z$1.number().nullable().optional().describe("Summed estimated cost in this bucket")
+          estimatedCost: z.number().nullable().optional().describe("Summed estimated cost in this bucket")
         })
       )
     })
   )
 });
-var getMetricPercentilesArgsSchema = z$1.object({
-  name: z$1.string().describe("Metric name"),
+var getMetricPercentilesArgsSchema = z.object({
+  name: z.string().describe("Metric name"),
   percentiles: percentilesSchema,
   interval: aggregationIntervalSchema,
   filters: metricsFilterSchema.optional()
 }).describe("Arguments for getting metric percentiles");
-var getMetricPercentilesResponseSchema = z$1.object({
-  series: z$1.array(
-    z$1.object({
+var getMetricPercentilesResponseSchema = z.object({
+  series: z.array(
+    z.object({
       percentile: percentileField,
-      points: z$1.array(
-        z$1.object({
+      points: z.array(
+        z.object({
           timestamp: bucketTimestampField,
           value: percentileBucketValueField
         })
@@ -37401,51 +36989,51 @@ var getMetricPercentilesResponseSchema = z$1.object({
     })
   )
 });
-var getMetricNamesArgsSchema = z$1.object({
-  prefix: z$1.string().optional().describe("Filter metric names by prefix"),
-  limit: z$1.coerce.number().int().min(1).optional().describe("Maximum number of names to return")
+var getMetricNamesArgsSchema = z.object({
+  prefix: z.string().optional().describe("Filter metric names by prefix"),
+  limit: z.coerce.number().int().min(1).optional().describe("Maximum number of names to return")
 }).describe("Arguments for getting metric names");
-var getMetricNamesResponseSchema = z$1.object({
-  names: z$1.array(z$1.string()).describe("Distinct metric names")
+var getMetricNamesResponseSchema = z.object({
+  names: z.array(z.string()).describe("Distinct metric names")
 });
-var getMetricLabelKeysArgsSchema = z$1.object({
-  metricName: z$1.string().describe("Metric name to get label keys for")
+var getMetricLabelKeysArgsSchema = z.object({
+  metricName: z.string().describe("Metric name to get label keys for")
 }).describe("Arguments for getting metric label keys");
-var getMetricLabelKeysResponseSchema = z$1.object({
-  keys: z$1.array(z$1.string()).describe("Distinct label keys for the metric")
+var getMetricLabelKeysResponseSchema = z.object({
+  keys: z.array(z.string()).describe("Distinct label keys for the metric")
 });
-var getMetricLabelValuesArgsSchema = z$1.object({
-  metricName: z$1.string().describe("Metric name"),
-  labelKey: z$1.string().describe("Label key to get values for"),
-  prefix: z$1.string().optional().describe("Filter values by prefix"),
-  limit: z$1.coerce.number().int().min(1).optional().describe("Maximum number of values to return")
+var getMetricLabelValuesArgsSchema = z.object({
+  metricName: z.string().describe("Metric name"),
+  labelKey: z.string().describe("Label key to get values for"),
+  prefix: z.string().optional().describe("Filter values by prefix"),
+  limit: z.coerce.number().int().min(1).optional().describe("Maximum number of values to return")
 }).describe("Arguments for getting label values");
-var getMetricLabelValuesResponseSchema = z$1.object({
-  values: z$1.array(z$1.string()).describe("Distinct label values")
+var getMetricLabelValuesResponseSchema = z.object({
+  values: z.array(z.string()).describe("Distinct label values")
 });
-z$1.object({}).describe("Arguments for getting entity types");
-var getEntityTypesResponseSchema = z$1.object({
-  entityTypes: z$1.array(entityTypeField).describe("Distinct entity types")
+z.object({}).describe("Arguments for getting entity types");
+var getEntityTypesResponseSchema = z.object({
+  entityTypes: z.array(entityTypeField).describe("Distinct entity types")
 });
-var getEntityNamesArgsSchema = z$1.object({
+var getEntityNamesArgsSchema = z.object({
   entityType: entityTypeField.optional().describe("Optional entity type filter")
 }).describe("Arguments for getting entity names");
-var getEntityNamesResponseSchema = z$1.object({
-  names: z$1.array(z$1.string()).describe("Distinct entity names")
+var getEntityNamesResponseSchema = z.object({
+  names: z.array(z.string()).describe("Distinct entity names")
 });
-z$1.object({}).describe("Arguments for getting service names");
-var getServiceNamesResponseSchema = z$1.object({
-  serviceNames: z$1.array(z$1.string()).describe("Distinct service names")
+z.object({}).describe("Arguments for getting service names");
+var getServiceNamesResponseSchema = z.object({
+  serviceNames: z.array(z.string()).describe("Distinct service names")
 });
-z$1.object({}).describe("Arguments for getting environments");
-var getEnvironmentsResponseSchema = z$1.object({
-  environments: z$1.array(z$1.string()).describe("Distinct environments")
+z.object({}).describe("Arguments for getting environments");
+var getEnvironmentsResponseSchema = z.object({
+  environments: z.array(z.string()).describe("Distinct environments")
 });
-var getTagsArgsSchema = z$1.object({
+var getTagsArgsSchema = z.object({
   entityType: entityTypeField.optional().describe("Optional entity type filter")
 }).describe("Arguments for getting tags");
-var getTagsResponseSchema = z$1.object({
-  tags: z$1.array(z$1.string()).describe("Distinct tags")
+var getTagsResponseSchema = z.object({
+  tags: z.array(z.string()).describe("Distinct tags")
 });
 function createNewRoute(def, config) {
   const { handler, ...schemas } = config;
@@ -37458,7 +37046,7 @@ function createNewRoute(def, config) {
     handler: (async (params) => {
       try {
         if (!coreFeatures.has("observability:v1.13.2")) {
-          throw new HTTPException$2(501, {
+          throw new HTTPException$1(501, {
             message: "New observability endpoints require @mastra/core >= 1.13.2, please upgrade."
           });
         }
@@ -37525,8 +37113,8 @@ var CREATE_SCORE = createNewRoute(NEW_ROUTE_DEFS.CREATE_SCORE, {
   }
 });
 var GET_SCORE = createNewRoute(NEW_ROUTE_DEFS.GET_SCORE, {
-  pathParamSchema: z$1.object({ scoreId: z$1.string() }),
-  responseSchema: z$1.object({ score: scoreRecordSchema.nullable() }),
+  pathParamSchema: z.object({ scoreId: z.string() }),
+  responseSchema: z.object({ score: scoreRecordSchema.nullable() }),
   handler: async ({ mastra, scoreId }) => {
     const observabilityStore = await getObservabilityStore(mastra);
     const score = await observabilityStore.getScoreById(scoreId);
@@ -37801,13 +37389,13 @@ var NEW_ROUTES = {
 
 // src/server/handlers/observability-storage-schemas.ts
 var ns = coreStorage;
-var fallbackEmptyObject = z$1.object({});
-var fallbackBranchArgs = z$1.object({
-  traceId: z$1.unknown(),
-  spanId: z$1.unknown(),
-  depth: z$1.unknown()
+var fallbackEmptyObject = z.object({});
+var fallbackBranchArgs = z.object({
+  traceId: z.unknown(),
+  spanId: z.unknown(),
+  depth: z.unknown()
 });
-var fallbackSchema = z$1.unknown();
+var fallbackSchema = z.unknown();
 var branchesFilterSchema = ns.branchesFilterSchema ?? fallbackEmptyObject;
 var branchesOrderBySchema = ns.branchesOrderBySchema ?? fallbackEmptyObject;
 var getBranchArgsSchema = ns.getBranchArgsSchema ?? fallbackBranchArgs;
@@ -37857,13 +37445,13 @@ __export(observability_exports, {
   NEW_ROUTES: () => NEW_ROUTES,
   SCORE_TRACES_ROUTE: () => SCORE_TRACES_ROUTE
 });
-var legacyQueryParamsSchema = z$1.object({
+var legacyQueryParamsSchema = z.object({
   // Old: dateRange was in pagination, now it's startedAt in filters
   dateRange: dateRangeSchema$1.optional(),
   // Old: name matched span names like "agent run: 'myAgent'"
-  name: z$1.string().optional(),
+  name: z.string().optional(),
   // entityType needs preprocessing to handle legacy 'workflow' value
-  entityType: z$1.preprocess((val) => val === "workflow" ? "workflow_run" : val, z$1.string().optional())
+  entityType: z.preprocess((val) => val === "workflow" ? "workflow_run" : val, z.string().optional())
 });
 function transformLegacyParams(params) {
   const result = { ...params };
@@ -37892,7 +37480,7 @@ async function getScoresStore(mastra) {
   const storage = getStorage(mastra);
   const scores = await storage.getStore("scores");
   if (!scores) {
-    throw new HTTPException$2(500, { message: "Scores storage domain is not available" });
+    throw new HTTPException$1(500, { message: "Scores storage domain is not available" });
   }
   return scores;
 }
@@ -37906,7 +37494,7 @@ var LIST_TRACES_ROUTE = createRoute$1({
   queryParamSchema: createObservabilityListQuerySchema(
     tracesFilterSchema.extend({
       ...legacyQueryParamsSchema.shape,
-      entityType: z$1.preprocess(
+      entityType: z.preprocess(
         (value) => value === "workflow" ? "workflow_run" : value,
         tracesFilterSchema.shape.entityType
       )
@@ -38014,7 +37602,7 @@ var GET_BRANCH_ROUTE = createRoute$1({
       const observabilityStore = await getObservabilityStore(mastra);
       const branch = await observabilityStore.getBranch({ traceId, spanId, depth });
       if (!branch) {
-        throw new HTTPException$2(404, { message: `Branch not found for span '${spanId}' in trace '${traceId}'` });
+        throw new HTTPException$1(404, { message: `Branch not found for span '${spanId}' in trace '${traceId}'` });
       }
       return branch;
     } catch (error) {
@@ -38037,7 +37625,7 @@ var GET_TRACE_ROUTE = createRoute$1({
       const observabilityStore = await getObservabilityStore(mastra);
       const trace = await observabilityStore.getTrace({ traceId });
       if (!trace) {
-        throw new HTTPException$2(404, { message: `Trace with ID '${traceId}' not found` });
+        throw new HTTPException$1(404, { message: `Trace with ID '${traceId}' not found` });
       }
       return trace;
     } catch (error) {
@@ -38060,7 +37648,7 @@ var GET_TRACE_LIGHT_ROUTE = createRoute$1({
       const observabilityStore = await getObservabilityStore(mastra);
       const trace = await observabilityStore.getTraceLight({ traceId });
       if (!trace) {
-        throw new HTTPException$2(404, { message: `Trace with ID '${traceId}' not found` });
+        throw new HTTPException$1(404, { message: `Trace with ID '${traceId}' not found` });
       }
       return trace;
     } catch (error) {
@@ -38083,7 +37671,7 @@ var GET_SPAN_ROUTE = createRoute$1({
       const observabilityStore = await getObservabilityStore(mastra);
       const span = await observabilityStore.getSpan({ traceId, spanId });
       if (!span) {
-        throw new HTTPException$2(404, { message: `Span not found` });
+        throw new HTTPException$1(404, { message: `Span not found` });
       }
       return span;
     } catch (error) {
@@ -38096,11 +37684,11 @@ var GET_TRACE_TRAJECTORY_ROUTE = createRoute$1({
   path: "/observability/traces/:traceId/trajectory",
   responseType: "json",
   pathParamSchema: getTraceArgsSchema,
-  responseSchema: z$1.object({
-    steps: z$1.array(z$1.unknown()),
-    totalDurationMs: z$1.number().optional(),
-    rawOutput: z$1.unknown().optional(),
-    rawWorkflowResult: z$1.unknown().optional()
+  responseSchema: z.object({
+    steps: z.array(z.unknown()),
+    totalDurationMs: z.number().optional(),
+    rawOutput: z.unknown().optional(),
+    rawWorkflowResult: z.unknown().optional()
   }),
   summary: "Extract trajectory from trace",
   description: "Extracts a structured trajectory (ordered steps) from a trace by analyzing its spans",
@@ -38111,7 +37699,7 @@ var GET_TRACE_TRAJECTORY_ROUTE = createRoute$1({
       const observabilityStore = await getObservabilityStore(mastra);
       const trace = await observabilityStore.getTrace({ traceId });
       if (!trace) {
-        throw new HTTPException$2(404, { message: `Trace with ID '${traceId}' not found` });
+        throw new HTTPException$1(404, { message: `Trace with ID '${traceId}' not found` });
       }
       const trajectory = extractTrajectoryFromTrace(trace.spans);
       return trajectory;
@@ -38136,7 +37724,7 @@ var SCORE_TRACES_ROUTE = createRoute$1({
       const { scorerName, targets } = params;
       const scorer = mastra.getScorerById(scorerName);
       if (!scorer) {
-        throw new HTTPException$2(404, { message: `Scorer '${scorerName}' not found` });
+        throw new HTTPException$1(404, { message: `Scorer '${scorerName}' not found` });
       }
       scoreTraces({
         scorerId: scorer.config.id || scorer.config.name,
@@ -38256,15 +37844,15 @@ var CREATE_CONVERSATION_ROUTE = createRoute$1({
   handler: async ({ mastra, requestContext, agent_id, conversation_id, resource_id, title, metadata }) => {
     try {
       if (!mastra) {
-        throw new HTTPException$2(500, { message: "Mastra instance is required for conversations" });
+        throw new HTTPException$1(500, { message: "Mastra instance is required for conversations" });
       }
       const agent = await getAgentFromSystem$1({ mastra, agentId: agent_id });
       const memory = await agent.getMemory({ requestContext });
       if (!memory) {
-        throw new HTTPException$2(400, { message: `Agent "${agent.id}" does not have memory configured` });
+        throw new HTTPException$1(400, { message: `Agent "${agent.id}" does not have memory configured` });
       }
       if (!await getAgentMemoryStore({ agent, requestContext })) {
-        throw new HTTPException$2(400, { message: `Memory storage is not configured for agent "${agent.id}"` });
+        throw new HTTPException$1(400, { message: `Memory storage is not configured for agent "${agent.id}"` });
       }
       const threadId = conversation_id ?? randomUUID();
       const resourceId = getEffectiveResourceId(requestContext, resource_id) ?? threadId;
@@ -38295,7 +37883,7 @@ var GET_CONVERSATION_ROUTE = createRoute$1({
     try {
       const match = await findConversationThreadAcrossAgents({ mastra, conversationId, requestContext });
       if (!match) {
-        throw new HTTPException$2(404, { message: `Conversation ${conversationId} was not found` });
+        throw new HTTPException$1(404, { message: `Conversation ${conversationId} was not found` });
       }
       return buildConversationObject({ thread: match.thread });
     } catch (error) {
@@ -38318,7 +37906,7 @@ var GET_CONVERSATION_ITEMS_ROUTE = createRoute$1({
     try {
       const match = await findConversationThreadAcrossAgents({ mastra, conversationId, requestContext });
       if (!match) {
-        throw new HTTPException$2(404, { message: `Conversation ${conversationId} was not found` });
+        throw new HTTPException$1(404, { message: `Conversation ${conversationId} was not found` });
       }
       const { messages } = await match.memoryStore.listMessages({
         threadId: conversationId,
@@ -38346,7 +37934,7 @@ var DELETE_CONVERSATION_ROUTE = createRoute$1({
     try {
       const match = await findConversationThreadAcrossAgents({ mastra, conversationId, requestContext });
       if (!match) {
-        throw new HTTPException$2(404, { message: `Conversation ${conversationId} was not found` });
+        throw new HTTPException$1(404, { message: `Conversation ${conversationId} was not found` });
       }
       await match.memoryStore.deleteThread({ threadId: conversationId });
       return buildConversationDeleted(conversationId);
@@ -38357,21 +37945,21 @@ var DELETE_CONVERSATION_ROUTE = createRoute$1({
 });
 
 var listLogsQuerySchema = createPagePaginationSchema().extend({
-  fromDate: z$1.coerce.date().optional(),
-  toDate: z$1.coerce.date().optional(),
-  logLevel: z$1.enum(["debug", "info", "warn", "error", "silent"]).optional(),
-  filters: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional(),
-  transportId: z$1.string()
+  fromDate: z.coerce.date().optional(),
+  toDate: z.coerce.date().optional(),
+  logLevel: z.enum(["debug", "info", "warn", "error", "silent"]).optional(),
+  filters: z.union([z.string(), z.array(z.string())]).optional(),
+  transportId: z.string()
 });
-var listLogsResponseSchema = z$1.object({
-  logs: z$1.array(baseLogMessageSchema),
-  total: z$1.number(),
-  page: z$1.number(),
-  perPage: z$1.union([z$1.number(), z$1.literal(false)]),
-  hasMore: z$1.boolean()
+var listLogsResponseSchema = z.object({
+  logs: z.array(baseLogMessageSchema),
+  total: z.number(),
+  page: z.number(),
+  perPage: z.union([z.number(), z.literal(false)]),
+  hasMore: z.boolean()
 });
-var listLogTransportsResponseSchema = z$1.object({
-  transports: z$1.array(z$1.string())
+var listLogTransportsResponseSchema = z.object({
+  transports: z.array(z.string())
 });
 
 // src/server/handlers/logs.ts
@@ -38465,280 +38053,280 @@ var LIST_LOGS_BY_RUN_ID_ROUTE = createRoute$1({
 });
 
 // src/server/schemas/a2a.ts
-var a2aAgentIdPathParams = z$1.object({
-  agentId: z$1.string().describe("Unique identifier for the agent")
+var a2aAgentIdPathParams = z.object({
+  agentId: z.string().describe("Unique identifier for the agent")
 });
 a2aAgentIdPathParams.extend({
-  taskId: z$1.string().describe("Unique identifier for the task")
+  taskId: z.string().describe("Unique identifier for the task")
 });
-var pushNotificationAuthenticationInfoSchema = z$1.object({
-  schemes: z$1.array(z$1.string()).describe("Supported authentication schemes - e.g. Basic, Bearer"),
-  credentials: z$1.string().optional().describe("Optional credentials")
+var pushNotificationAuthenticationInfoSchema = z.object({
+  schemes: z.array(z.string()).describe("Supported authentication schemes - e.g. Basic, Bearer"),
+  credentials: z.string().optional().describe("Optional credentials")
 });
-var pushNotificationConfigSchema = z$1.object({
-  url: z$1.string().describe("URL for sending the push notifications"),
-  id: z$1.string().optional().describe("Push Notification ID - created by server to support multiple callbacks"),
-  token: z$1.string().optional().describe("Token unique to this task/session"),
+var pushNotificationConfigSchema = z.object({
+  url: z.string().describe("URL for sending the push notifications"),
+  id: z.string().optional().describe("Push Notification ID - created by server to support multiple callbacks"),
+  token: z.string().optional().describe("Token unique to this task/session"),
   authentication: pushNotificationAuthenticationInfoSchema.optional()
 });
-var messageSendConfigurationSchema = z$1.object({
-  acceptedOutputModes: z$1.array(z$1.string()).optional().describe("Accepted output modalities by the client"),
-  blocking: z$1.boolean().optional().describe("If the server should treat the client as a blocking request"),
-  historyLength: z$1.number().optional().describe("Number of recent messages to be retrieved"),
+var messageSendConfigurationSchema = z.object({
+  acceptedOutputModes: z.array(z.string()).optional().describe("Accepted output modalities by the client"),
+  blocking: z.boolean().optional().describe("If the server should treat the client as a blocking request"),
+  historyLength: z.number().optional().describe("Number of recent messages to be retrieved"),
   pushNotificationConfig: pushNotificationConfigSchema.optional()
 });
-var textPartSchema = z$1.object({
-  kind: z$1.literal("text").describe("Part type - text for TextParts"),
-  text: z$1.string().describe("Text content"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+var textPartSchema = z.object({
+  kind: z.literal("text").describe("Part type - text for TextParts"),
+  text: z.string().describe("Text content"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-var fileWithBytesSchema = z$1.object({
-  bytes: z$1.string().describe("base64 encoded content of the file"),
-  mimeType: z$1.string().optional().describe("Optional mimeType for the file"),
-  name: z$1.string().optional().describe("Optional name for the file")
+var fileWithBytesSchema = z.object({
+  bytes: z.string().describe("base64 encoded content of the file"),
+  mimeType: z.string().optional().describe("Optional mimeType for the file"),
+  name: z.string().optional().describe("Optional name for the file")
 });
-var fileWithUriSchema = z$1.object({
-  uri: z$1.string().describe("URL for the File content"),
-  mimeType: z$1.string().optional().describe("Optional mimeType for the file"),
-  name: z$1.string().optional().describe("Optional name for the file")
+var fileWithUriSchema = z.object({
+  uri: z.string().describe("URL for the File content"),
+  mimeType: z.string().optional().describe("Optional mimeType for the file"),
+  name: z.string().optional().describe("Optional name for the file")
 });
-var filePartSchema = z$1.object({
-  kind: z$1.literal("file").describe("Part type - file for FileParts"),
-  file: z$1.union([fileWithBytesSchema, fileWithUriSchema]).describe("File content either as url or bytes"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+var filePartSchema = z.object({
+  kind: z.literal("file").describe("Part type - file for FileParts"),
+  file: z.union([fileWithBytesSchema, fileWithUriSchema]).describe("File content either as url or bytes"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-var dataPartSchema = z$1.object({
-  kind: z$1.literal("data").describe("Part type - data for DataParts"),
-  data: z$1.record(z$1.string(), z$1.unknown()).describe("Structured data content"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+var dataPartSchema = z.object({
+  kind: z.literal("data").describe("Part type - data for DataParts"),
+  data: z.record(z.string(), z.unknown()).describe("Structured data content"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-var partSchema = z$1.union([textPartSchema, filePartSchema, dataPartSchema]);
-var messageSchema = z$1.object({
-  kind: z$1.literal("message").describe("Event type"),
-  messageId: z$1.string().describe("Identifier created by the message creator"),
-  role: z$1.enum(["user", "agent"]).describe("Message sender's role"),
-  parts: z$1.array(partSchema).describe("Message content"),
-  contextId: z$1.string().optional().describe("The context the message is associated with"),
-  taskId: z$1.string().optional().describe("Identifier of task the message is related to"),
-  referenceTaskIds: z$1.array(z$1.string()).optional().describe("List of tasks referenced as context by this message"),
-  extensions: z$1.array(z$1.string()).optional().describe("The URIs of extensions that are present or contributed to this Message"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Extension metadata")
+var partSchema = z.union([textPartSchema, filePartSchema, dataPartSchema]);
+var messageSchema = z.object({
+  kind: z.literal("message").describe("Event type"),
+  messageId: z.string().describe("Identifier created by the message creator"),
+  role: z.enum(["user", "agent"]).describe("Message sender's role"),
+  parts: z.array(partSchema).describe("Message content"),
+  contextId: z.string().optional().describe("The context the message is associated with"),
+  taskId: z.string().optional().describe("Identifier of task the message is related to"),
+  referenceTaskIds: z.array(z.string()).optional().describe("List of tasks referenced as context by this message"),
+  extensions: z.array(z.string()).optional().describe("The URIs of extensions that are present or contributed to this Message"),
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Extension metadata")
 });
-var messageSendParamsSchema$1 = z$1.object({
+var messageSendParamsSchema$1 = z.object({
   message: messageSchema,
   configuration: messageSendConfigurationSchema.optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Extension metadata")
+  metadata: z.record(z.string(), z.unknown()).optional().describe("Extension metadata")
 });
-var taskQueryParamsSchema = z$1.object({
-  id: z$1.string().describe("Task id"),
-  historyLength: z$1.number().optional().describe("Number of recent messages to be retrieved"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var taskQueryParamsSchema = z.object({
+  id: z.string().describe("Task id"),
+  historyLength: z.number().optional().describe("Number of recent messages to be retrieved"),
+  metadata: z.record(z.string(), z.unknown()).optional()
 });
-var taskIdParamsSchema = z$1.object({
-  id: z$1.string().describe("Task id"),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var taskIdParamsSchema = z.object({
+  id: z.string().describe("Task id"),
+  metadata: z.record(z.string(), z.unknown()).optional()
 });
 var taskResubscribeParamsSchema = taskIdParamsSchema;
-var setPushNotificationConfigParamsSchema = z$1.object({
-  taskId: z$1.string().describe("Task id"),
+var setPushNotificationConfigParamsSchema = z.object({
+  taskId: z.string().describe("Task id"),
   pushNotificationConfig: pushNotificationConfigSchema
 });
 var getPushNotificationConfigParamsSchema = taskIdParamsSchema.extend({
-  pushNotificationConfigId: z$1.string().optional().describe("Push notification config id")
+  pushNotificationConfigId: z.string().optional().describe("Push notification config id")
 });
 var listPushNotificationConfigParamsSchema = taskIdParamsSchema;
 var deletePushNotificationConfigParamsSchema = taskIdParamsSchema.extend({
-  pushNotificationConfigId: z$1.string().describe("Push notification config id")
+  pushNotificationConfigId: z.string().describe("Push notification config id")
 });
-z$1.object({
+z.object({
   message: messageSchema,
-  metadata: z$1.record(z$1.string(), z$1.any()).optional()
+  metadata: z.record(z.string(), z.any()).optional()
 });
-z$1.object({
-  id: z$1.string()
+z.object({
+  id: z.string()
 });
 var requestBaseSchema = {
-  jsonrpc: z$1.literal("2.0"),
-  id: z$1.union([z$1.string(), z$1.number()])
+  jsonrpc: z.literal("2.0"),
+  id: z.union([z.string(), z.number()])
 };
-var agentExecutionBodySchema = z$1.discriminatedUnion("method", [
-  z$1.object({
+var agentExecutionBodySchema = z.discriminatedUnion("method", [
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("message/send"),
+    method: z.literal("message/send"),
     params: messageSendParamsSchema$1
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("message/stream"),
+    method: z.literal("message/stream"),
     params: messageSendParamsSchema$1
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/get"),
+    method: z.literal("tasks/get"),
     params: taskQueryParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/cancel"),
+    method: z.literal("tasks/cancel"),
     params: taskIdParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/resubscribe"),
+    method: z.literal("tasks/resubscribe"),
     params: taskResubscribeParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/pushNotificationConfig/set"),
+    method: z.literal("tasks/pushNotificationConfig/set"),
     params: setPushNotificationConfigParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/pushNotificationConfig/get"),
+    method: z.literal("tasks/pushNotificationConfig/get"),
     params: getPushNotificationConfigParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/pushNotificationConfig/list"),
+    method: z.literal("tasks/pushNotificationConfig/list"),
     params: listPushNotificationConfigParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("tasks/pushNotificationConfig/delete"),
+    method: z.literal("tasks/pushNotificationConfig/delete"),
     params: deletePushNotificationConfigParamsSchema
   }),
-  z$1.object({
+  z.object({
     ...requestBaseSchema,
-    method: z$1.literal("agent/getAuthenticatedExtendedCard")
+    method: z.literal("agent/getAuthenticatedExtendedCard")
   })
 ]);
-var agentCardResponseSchema = z$1.object({
-  additionalInterfaces: z$1.array(z$1.unknown()).optional(),
-  name: z$1.string(),
-  description: z$1.string(),
-  url: z$1.string(),
-  protocolVersion: z$1.string(),
-  provider: z$1.object({
-    organization: z$1.string(),
-    url: z$1.string()
+var agentCardResponseSchema = z.object({
+  additionalInterfaces: z.array(z.unknown()).optional(),
+  name: z.string(),
+  description: z.string(),
+  url: z.string(),
+  protocolVersion: z.string(),
+  provider: z.object({
+    organization: z.string(),
+    url: z.string()
   }).optional(),
-  security: z$1.array(z$1.record(z$1.string(), z$1.array(z$1.string()))).optional(),
-  securitySchemes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  version: z$1.string(),
-  capabilities: z$1.object({
-    extensions: z$1.array(z$1.unknown()).optional(),
-    streaming: z$1.boolean().optional(),
-    pushNotifications: z$1.boolean().optional(),
-    stateTransitionHistory: z$1.boolean().optional()
+  security: z.array(z.record(z.string(), z.array(z.string()))).optional(),
+  securitySchemes: z.record(z.string(), z.unknown()).optional(),
+  version: z.string(),
+  capabilities: z.object({
+    extensions: z.array(z.unknown()).optional(),
+    streaming: z.boolean().optional(),
+    pushNotifications: z.boolean().optional(),
+    stateTransitionHistory: z.boolean().optional()
   }),
-  defaultInputModes: z$1.array(z$1.string()),
-  defaultOutputModes: z$1.array(z$1.string()),
-  supportsAuthenticatedExtendedCard: z$1.boolean().optional(),
-  signatures: z$1.array(
-    z$1.object({
-      protected: z$1.string(),
-      signature: z$1.string(),
-      header: z$1.record(z$1.string(), z$1.unknown()).optional()
+  defaultInputModes: z.array(z.string()),
+  defaultOutputModes: z.array(z.string()),
+  supportsAuthenticatedExtendedCard: z.boolean().optional(),
+  signatures: z.array(
+    z.object({
+      protected: z.string(),
+      signature: z.string(),
+      header: z.record(z.string(), z.unknown()).optional()
     })
   ).optional(),
-  skills: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      name: z$1.string(),
-      description: z$1.string(),
-      tags: z$1.array(z$1.string()).optional()
+  skills: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      description: z.string(),
+      tags: z.array(z.string()).optional()
     })
   )
 });
-z$1.unknown();
-var agentExecutionResponseSchema = z$1.unknown();
+z.unknown();
+var agentExecutionResponseSchema = z.unknown();
 
 // src/server/schemas/auth.ts
-var ssoConfigSchema = z$1.object({
-  provider: z$1.string(),
-  text: z$1.string(),
-  icon: z$1.string().optional(),
-  description: z$1.string().optional(),
-  url: z$1.string()
+var ssoConfigSchema = z.object({
+  provider: z.string(),
+  text: z.string(),
+  icon: z.string().optional(),
+  description: z.string().optional(),
+  url: z.string()
 });
-var loginConfigSchema = z$1.object({
-  type: z$1.enum(["sso", "credentials", "both"]),
+var loginConfigSchema = z.object({
+  type: z.enum(["sso", "credentials", "both"]),
   sso: ssoConfigSchema.optional(),
-  signUpEnabled: z$1.boolean().optional(),
-  description: z$1.string().optional()
+  signUpEnabled: z.boolean().optional(),
+  description: z.string().optional()
 }).nullable();
-var publicCapabilitiesSchema = z$1.object({
-  enabled: z$1.boolean(),
+var publicCapabilitiesSchema = z.object({
+  enabled: z.boolean(),
   login: loginConfigSchema
 });
-var authenticatedUserSchema = z$1.object({
-  id: z$1.string(),
-  email: z$1.string().optional(),
-  name: z$1.string().optional(),
-  avatarUrl: z$1.string().optional()
+var authenticatedUserSchema = z.object({
+  id: z.string(),
+  email: z.string().optional(),
+  name: z.string().optional(),
+  avatarUrl: z.string().optional()
 });
-var capabilityFlagsSchema = z$1.object({
-  user: z$1.boolean(),
-  session: z$1.boolean(),
-  sso: z$1.boolean(),
-  rbac: z$1.boolean(),
-  acl: z$1.boolean()
+var capabilityFlagsSchema = z.object({
+  user: z.boolean(),
+  session: z.boolean(),
+  sso: z.boolean(),
+  rbac: z.boolean(),
+  acl: z.boolean()
 });
-var userAccessSchema = z$1.object({
-  roles: z$1.array(z$1.string()),
-  permissions: z$1.array(z$1.string())
+var userAccessSchema = z.object({
+  roles: z.array(z.string()),
+  permissions: z.array(z.string())
 }).nullable();
 var authenticatedCapabilitiesSchema = publicCapabilitiesSchema.extend({
   user: authenticatedUserSchema,
   capabilities: capabilityFlagsSchema,
   access: userAccessSchema
 });
-var capabilitiesResponseSchema = z$1.union([authenticatedCapabilitiesSchema, publicCapabilitiesSchema]);
-var ssoLoginQuerySchema = z$1.object({
-  redirect_uri: z$1.string().optional()
+var capabilitiesResponseSchema = z.union([authenticatedCapabilitiesSchema, publicCapabilitiesSchema]);
+var ssoLoginQuerySchema = z.object({
+  redirect_uri: z.string().optional()
 });
-var ssoCallbackQuerySchema = z$1.object({
-  code: z$1.string(),
-  state: z$1.string().optional()
+var ssoCallbackQuerySchema = z.object({
+  code: z.string(),
+  state: z.string().optional()
 });
-z$1.object({
-  url: z$1.string()
+z.object({
+  url: z.string()
 });
-z$1.object({
-  success: z$1.boolean(),
+z.object({
+  success: z.boolean(),
   user: authenticatedUserSchema.optional(),
-  redirectTo: z$1.string().optional()
+  redirectTo: z.string().optional()
 });
-z$1.object({
-  success: z$1.boolean(),
-  redirectTo: z$1.string().optional()
+z.object({
+  success: z.boolean(),
+  redirectTo: z.string().optional()
 });
-var refreshResponseSchema = z$1.object({
-  success: z$1.boolean()
+var refreshResponseSchema = z.object({
+  success: z.boolean()
 });
-var currentUserResponseSchema = z$1.object({
-  id: z$1.string(),
-  email: z$1.string().optional(),
-  name: z$1.string().optional(),
-  avatarUrl: z$1.string().optional(),
-  roles: z$1.array(z$1.string()).optional(),
-  permissions: z$1.array(z$1.string()).optional()
+var currentUserResponseSchema = z.object({
+  id: z.string(),
+  email: z.string().optional(),
+  name: z.string().optional(),
+  avatarUrl: z.string().optional(),
+  roles: z.array(z.string()).optional(),
+  permissions: z.array(z.string()).optional()
 }).nullable();
-var credentialsSignInBodySchema = z$1.object({
-  email: z$1.string().email(),
-  password: z$1.string().min(1)
+var credentialsSignInBodySchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1)
 });
-var credentialsSignUpBodySchema = z$1.object({
-  email: z$1.string().email(),
-  password: z$1.string().min(1),
-  name: z$1.string().optional()
+var credentialsSignUpBodySchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+  name: z.string().optional()
 });
-z$1.object({
+z.object({
   user: authenticatedUserSchema,
-  token: z$1.string().optional()
+  token: z.string().optional()
 });
-var permissionPatternsResponseSchema = z$1.object({
-  patterns: z$1.array(z$1.string())
+var permissionPatternsResponseSchema = z.object({
+  patterns: z.array(z.string())
 });
 
 // src/server/auth/defaults.ts
@@ -39307,7 +38895,7 @@ var GET_SSO_LOGIN_ROUTE = createPublicRoute({
       const isStudio = isStudioRequest(request);
       const auth = getAuthProvider(mastra, isStudio);
       if (!auth || !implementsInterface(auth, "getLoginUrl")) {
-        throw new HTTPException$2(404, { message: "SSO not configured" });
+        throw new HTTPException$1(404, { message: "SSO not configured" });
       }
       const origin = getPublicOrigin(request);
       const raw = (routePrefix || "/api").trim();
@@ -39490,15 +39078,15 @@ var POST_REFRESH_ROUTE = createPublicRoute({
     try {
       const auth = getAuthProvider(mastra, isStudio);
       if (!auth || !implementsInterface(auth, "refreshSession") || !implementsInterface(auth, "getSessionIdFromRequest")) {
-        throw new HTTPException$2(404, { message: "Session refresh not configured" });
+        throw new HTTPException$1(404, { message: "Session refresh not configured" });
       }
       const sessionId = auth.getSessionIdFromRequest(request);
       if (!sessionId) {
-        throw new HTTPException$2(401, { message: "No session" });
+        throw new HTTPException$1(401, { message: "No session" });
       }
       const newSession = await auth.refreshSession(sessionId);
       if (!newSession) {
-        throw new HTTPException$2(401, { message: "Session expired" });
+        throw new HTTPException$1(401, { message: "Session expired" });
       }
       const headers = new Headers({ "Content-Type": "application/json" });
       if (implementsInterface(auth, "getSessionHeaders")) {
@@ -39512,7 +39100,7 @@ var POST_REFRESH_ROUTE = createPublicRoute({
         headers
       });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error refreshing session");
     }
   }
@@ -39531,7 +39119,7 @@ var POST_CREDENTIALS_SIGN_IN_ROUTE = createPublicRoute({
     try {
       const auth = getAuthProvider(mastra, isStudio);
       if (!auth || !implementsInterface(auth, "signIn")) {
-        throw new HTTPException$2(404, { message: "Credentials authentication not configured" });
+        throw new HTTPException$1(404, { message: "Credentials authentication not configured" });
       }
       const result = await auth.signIn(email, password, request);
       const user = result.user;
@@ -39554,8 +39142,8 @@ var POST_CREDENTIALS_SIGN_IN_ROUTE = createPublicRoute({
       }
       return new Response(responseBody, { status: 200, headers });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
-      throw new HTTPException$2(401, { message: "Invalid email or password" });
+      if (error instanceof HTTPException$1) throw error;
+      throw new HTTPException$1(401, { message: "Invalid email or password" });
     }
   }
 });
@@ -39573,7 +39161,7 @@ var POST_CREDENTIALS_SIGN_UP_ROUTE = createPublicRoute({
     try {
       const auth = getAuthProvider(mastra, isStudio);
       if (!auth || !implementsInterface(auth, "signUp")) {
-        throw new HTTPException$2(404, { message: "Credentials authentication not configured" });
+        throw new HTTPException$1(404, { message: "Credentials authentication not configured" });
       }
       const result = await auth.signUp(email, password, name, request);
       const user = result.user;
@@ -39596,17 +39184,17 @@ var POST_CREDENTIALS_SIGN_UP_ROUTE = createPublicRoute({
       }
       return new Response(responseBody, { status: 200, headers });
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       const mastra2 = ctx.mastra;
       mastra2?.getLogger?.()?.error("Sign-up error", {
         error: error instanceof Error ? { message: error.message, stack: error.stack } : error
       });
-      throw new HTTPException$2(400, { message: "Failed to create account" });
+      throw new HTTPException$1(400, { message: "Failed to create account" });
     }
   }
 });
-var rolePermissionsPathSchema = z$1.object({ roleId: z$1.string() });
-var rolePermissionsResponseSchema = z$1.object({ roleId: z$1.string(), permissions: z$1.array(z$1.string()) });
+var rolePermissionsPathSchema = z.object({ roleId: z.string() });
+var rolePermissionsResponseSchema = z.object({ roleId: z.string(), permissions: z.array(z.string()) });
 var GET_ROLE_PERMISSIONS_ROUTE = createRoute$1({
   method: "GET",
   path: "/auth/roles/:roleId/permissions",
@@ -39623,16 +39211,16 @@ var GET_ROLE_PERMISSIONS_ROUTE = createRoute$1({
       const callerPermissions = requestContext?.get(MASTRA_USER_PERMISSIONS_KEY) ?? [];
       const isAdmin = callerPermissions.some((p) => p === "*" || p === "*:*");
       if (!isAdmin) {
-        throw new HTTPException$2(403, { message: "Admin access required" });
+        throw new HTTPException$1(403, { message: "Admin access required" });
       }
       const rbac = getRBACProvider(mastra);
       if (!rbac?.getPermissionsForRole) {
-        throw new HTTPException$2(404, { message: "RBAC provider does not support role permission resolution" });
+        throw new HTTPException$1(404, { message: "RBAC provider does not support role permission resolution" });
       }
       const permissions = await rbac.getPermissionsForRole(roleId);
       return { roleId, permissions };
     } catch (error) {
-      if (error instanceof HTTPException$2) throw error;
+      if (error instanceof HTTPException$1) throw error;
       return handleError$2(error, "Error getting role permissions");
     }
   }
@@ -40190,57 +39778,57 @@ function createTaskContext({
 }
 
 // src/server/handlers/a2a.ts
-var messagePartSchema = z$1.discriminatedUnion("kind", [
-  z$1.object({
-    kind: z$1.literal("text"),
-    text: z$1.string(),
-    metadata: z$1.record(z$1.string(), z$1.any()).optional()
+var messagePartSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("text"),
+    text: z.string(),
+    metadata: z.record(z.string(), z.any()).optional()
   }),
-  z$1.object({
-    kind: z$1.literal("file"),
-    file: z$1.union([
-      z$1.object({
-        bytes: z$1.string(),
-        mimeType: z$1.string().optional(),
-        name: z$1.string().optional()
+  z.object({
+    kind: z.literal("file"),
+    file: z.union([
+      z.object({
+        bytes: z.string(),
+        mimeType: z.string().optional(),
+        name: z.string().optional()
       }),
-      z$1.object({
-        uri: z$1.string(),
-        mimeType: z$1.string().optional(),
-        name: z$1.string().optional()
+      z.object({
+        uri: z.string(),
+        mimeType: z.string().optional(),
+        name: z.string().optional()
       })
     ]),
-    metadata: z$1.record(z$1.string(), z$1.any()).optional()
+    metadata: z.record(z.string(), z.any()).optional()
   }),
-  z$1.object({
-    kind: z$1.literal("data"),
-    data: z$1.record(z$1.string(), z$1.any()),
-    metadata: z$1.record(z$1.string(), z$1.any()).optional()
+  z.object({
+    kind: z.literal("data"),
+    data: z.record(z.string(), z.any()),
+    metadata: z.record(z.string(), z.any()).optional()
   })
 ]);
-var messageSendParamsSchema = z$1.object({
-  message: z$1.object({
-    role: z$1.enum(["user", "agent"]),
-    parts: z$1.array(messagePartSchema),
-    kind: z$1.literal("message"),
-    messageId: z$1.string(),
-    contextId: z$1.string().optional(),
-    taskId: z$1.string().optional(),
-    referenceTaskIds: z$1.array(z$1.string()).optional(),
-    extensions: z$1.array(z$1.string()).optional(),
-    metadata: z$1.record(z$1.string(), z$1.any()).optional()
+var messageSendParamsSchema = z.object({
+  message: z.object({
+    role: z.enum(["user", "agent"]),
+    parts: z.array(messagePartSchema),
+    kind: z.literal("message"),
+    messageId: z.string(),
+    contextId: z.string().optional(),
+    taskId: z.string().optional(),
+    referenceTaskIds: z.array(z.string()).optional(),
+    extensions: z.array(z.string()).optional(),
+    metadata: z.record(z.string(), z.any()).optional()
   }),
-  configuration: z$1.object({
-    acceptedOutputModes: z$1.array(z$1.string()).optional(),
-    blocking: z$1.boolean().optional(),
-    historyLength: z$1.number().optional(),
-    pushNotificationConfig: z$1.object({
-      url: z$1.string(),
-      id: z$1.string().optional(),
-      token: z$1.string().optional(),
-      authentication: z$1.object({
-        schemes: z$1.array(z$1.string()),
-        credentials: z$1.string().optional()
+  configuration: z.object({
+    acceptedOutputModes: z.array(z.string()).optional(),
+    blocking: z.boolean().optional(),
+    historyLength: z.number().optional(),
+    pushNotificationConfig: z.object({
+      url: z.string(),
+      id: z.string().optional(),
+      token: z.string().optional(),
+      authentication: z.object({
+        schemes: z.array(z.string()),
+        credentials: z.string().optional()
       }).optional()
     }).optional()
   }).optional()
@@ -40320,7 +39908,7 @@ function validateMessageSendParams(params) {
   try {
     messageSendParamsSchema.parse(params);
   } catch (error) {
-    if (error instanceof z$1.ZodError) {
+    if (error instanceof z.ZodError) {
       throw MastraA2AError.invalidParams(error.issues[0].message);
     }
     throw error;
@@ -41287,7 +40875,7 @@ var AGENT_EXECUTION_ROUTE = createRoute$1({
   }
 });
 
-var workflowRunStatusSchema = z$1.enum([
+var workflowRunStatusSchema = z.enum([
   "running",
   "waiting",
   "suspended",
@@ -41300,99 +40888,99 @@ var workflowRunStatusSchema = z$1.enum([
   "paused",
   "skipped"
 ]);
-var workflowIdPathParams = z$1.object({
-  workflowId: z$1.string().describe("Unique identifier for the workflow")
+var workflowIdPathParams = z.object({
+  workflowId: z.string().describe("Unique identifier for the workflow")
 });
 var workflowRunPathParams = workflowIdPathParams.extend({
-  runId: z$1.string().describe("Unique identifier for the workflow run")
+  runId: z.string().describe("Unique identifier for the workflow run")
 });
-var serializedStepSchema = z$1.object({
-  id: z$1.string(),
-  description: z$1.string().optional(),
-  stateSchema: z$1.string().optional(),
-  inputSchema: z$1.string().optional(),
-  outputSchema: z$1.string().optional(),
-  resumeSchema: z$1.string().optional(),
-  suspendSchema: z$1.string().optional(),
-  component: z$1.string().optional(),
-  isWorkflow: z$1.boolean().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var serializedStepSchema = z.object({
+  id: z.string(),
+  description: z.string().optional(),
+  stateSchema: z.string().optional(),
+  inputSchema: z.string().optional(),
+  outputSchema: z.string().optional(),
+  resumeSchema: z.string().optional(),
+  suspendSchema: z.string().optional(),
+  component: z.string().optional(),
+  isWorkflow: z.boolean().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 });
-var serializedStepFlowEntrySchema = z$1.object({
-  type: z$1.enum(["step", "sleep", "sleepUntil", "waitForEvent", "parallel", "conditional", "loop", "foreach"])
+var serializedStepFlowEntrySchema = z.object({
+  type: z.enum(["step", "sleep", "sleepUntil", "waitForEvent", "parallel", "conditional", "loop", "foreach"])
 });
-var workflowInfoSchema = z$1.object({
-  steps: z$1.record(z$1.string(), serializedStepSchema),
-  allSteps: z$1.record(z$1.string(), serializedStepSchema),
-  name: z$1.string().optional(),
-  description: z$1.string().optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  stepGraph: z$1.array(serializedStepFlowEntrySchema),
-  inputSchema: z$1.string().optional(),
-  outputSchema: z$1.string().optional(),
-  stateSchema: z$1.string().optional(),
-  options: z$1.object({}).optional(),
-  isProcessorWorkflow: z$1.boolean().optional()
+var workflowInfoSchema = z.object({
+  steps: z.record(z.string(), serializedStepSchema),
+  allSteps: z.record(z.string(), serializedStepSchema),
+  name: z.string().optional(),
+  description: z.string().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  stepGraph: z.array(serializedStepFlowEntrySchema),
+  inputSchema: z.string().optional(),
+  outputSchema: z.string().optional(),
+  stateSchema: z.string().optional(),
+  options: z.object({}).optional(),
+  isProcessorWorkflow: z.boolean().optional()
 });
-var listWorkflowsResponseSchema = z$1.record(z$1.string(), workflowInfoSchema);
-var workflowRunSchema = z$1.object({
-  workflowName: z$1.string(),
-  runId: z$1.string(),
-  snapshot: z$1.union([z$1.record(z$1.string(), z$1.any()), z$1.string()]),
-  createdAt: z$1.date(),
-  updatedAt: z$1.date(),
-  resourceId: z$1.string().optional()
+var listWorkflowsResponseSchema = z.record(z.string(), workflowInfoSchema);
+var workflowRunSchema = z.object({
+  workflowName: z.string(),
+  runId: z.string(),
+  snapshot: z.union([z.record(z.string(), z.any()), z.string()]),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+  resourceId: z.string().optional()
 });
-var workflowRunsResponseSchema = z$1.object({
-  runs: z$1.array(workflowRunSchema),
-  total: z$1.number()
+var workflowRunsResponseSchema = z.object({
+  runs: z.array(workflowRunSchema),
+  total: z.number()
 });
 var listWorkflowRunsQuerySchema = createCombinedPaginationSchema().extend({
-  fromDate: z$1.coerce.date().optional(),
-  toDate: z$1.coerce.date().optional(),
-  resourceId: z$1.string().optional(),
+  fromDate: z.coerce.date().optional(),
+  toDate: z.coerce.date().optional(),
+  resourceId: z.string().optional(),
   status: workflowRunStatusSchema.optional()
 });
-var workflowExecutionBodySchema = z$1.object({
-  resourceId: z$1.string().optional(),
-  inputData: z$1.unknown().optional(),
-  initialState: z$1.unknown().optional(),
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+var workflowExecutionBodySchema = z.object({
+  resourceId: z.string().optional(),
+  inputData: z.unknown().optional(),
+  initialState: z.unknown().optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   tracingOptions: tracingOptionsSchema.optional(),
-  perStep: z$1.boolean().optional()
+  perStep: z.boolean().optional()
 });
 var streamLegacyWorkflowBodySchema = workflowExecutionBodySchema;
 var streamWorkflowBodySchema = workflowExecutionBodySchema.extend({
-  closeOnSuspend: z$1.boolean().optional()
+  closeOnSuspend: z.boolean().optional()
 });
-var resumeBodySchema = z$1.object({
-  step: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional(),
+var resumeBodySchema = z.object({
+  step: z.union([z.string(), z.array(z.string())]).optional(),
   // Optional - workflow can auto-resume all suspended steps
-  resumeData: z$1.unknown().optional(),
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  resumeData: z.unknown().optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   tracingOptions: tracingOptionsSchema.optional(),
-  perStep: z$1.boolean().optional(),
-  forEachIndex: z$1.number().int().nonnegative().optional()
+  perStep: z.boolean().optional(),
+  forEachIndex: z.number().int().nonnegative().optional()
 });
-var restartBodySchema = z$1.object({
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+var restartBodySchema = z.object({
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   tracingOptions: tracingOptionsSchema.optional()
 });
-var timeTravelBodySchema = z$1.object({
-  inputData: z$1.unknown().optional(),
-  resumeData: z$1.unknown().optional(),
-  initialState: z$1.unknown().optional(),
-  step: z$1.union([z$1.string(), z$1.array(z$1.string())]),
-  context: z$1.record(z$1.string(), z$1.any()).optional(),
-  nestedStepsContext: z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.any())).optional(),
-  requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+var timeTravelBodySchema = z.object({
+  inputData: z.unknown().optional(),
+  resumeData: z.unknown().optional(),
+  initialState: z.unknown().optional(),
+  step: z.union([z.string(), z.array(z.string())]),
+  context: z.record(z.string(), z.any()).optional(),
+  nestedStepsContext: z.record(z.string(), z.record(z.string(), z.any())).optional(),
+  requestContext: z.record(z.string(), z.unknown()).optional(),
   tracingOptions: tracingOptionsSchema.optional(),
-  perStep: z$1.boolean().optional()
+  perStep: z.boolean().optional()
 });
 var startAsyncWorkflowBodySchema = workflowExecutionBodySchema;
-z$1.object({
-  event: z$1.string(),
-  data: z$1.unknown()
+z.object({
+  event: z.string(),
+  data: z.unknown()
 });
 var VALID_WORKFLOW_RESULT_FIELDS = /* @__PURE__ */ new Set([
   "result",
@@ -41403,7 +40991,7 @@ var VALID_WORKFLOW_RESULT_FIELDS = /* @__PURE__ */ new Set([
   "serializedStepGraph"
 ]);
 var WORKFLOW_RESULT_FIELDS_ERROR = "Invalid field name. Available fields: result, error, payload, steps, activeStepsPath, serializedStepGraph";
-var createFieldsValidator = (description) => z$1.string().optional().refine(
+var createFieldsValidator = (description) => z.string().optional().refine(
   (value) => {
     if (!value) return true;
     const requestedFields = value.split(",").map((f) => f.trim());
@@ -41411,52 +40999,52 @@ var createFieldsValidator = (description) => z$1.string().optional().refine(
   },
   { message: WORKFLOW_RESULT_FIELDS_ERROR }
 ).describe(description);
-var withNestedWorkflowsField = z$1.enum(["true", "false"]).optional().describe("Whether to include nested workflow data in steps. Defaults to true. Set to false for better performance.");
-var workflowExecutionResultSchema = z$1.object({
+var withNestedWorkflowsField = z.enum(["true", "false"]).optional().describe("Whether to include nested workflow data in steps. Defaults to true. Set to false for better performance.");
+var workflowExecutionResultSchema = z.object({
   status: workflowRunStatusSchema.optional(),
-  result: z$1.unknown().optional(),
-  error: z$1.unknown().optional(),
-  payload: z$1.unknown().optional(),
-  initialState: z$1.unknown().optional(),
-  steps: z$1.record(z$1.string(), z$1.any()).optional(),
-  activeStepsPath: z$1.record(z$1.string(), z$1.array(z$1.number())).optional(),
-  serializedStepGraph: z$1.array(serializedStepFlowEntrySchema).optional()
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+  payload: z.unknown().optional(),
+  initialState: z.unknown().optional(),
+  steps: z.record(z.string(), z.any()).optional(),
+  activeStepsPath: z.record(z.string(), z.array(z.number())).optional(),
+  serializedStepGraph: z.array(serializedStepFlowEntrySchema).optional()
 });
-var workflowRunResultQuerySchema = z$1.object({
+var workflowRunResultQuerySchema = z.object({
   fields: createFieldsValidator(
     "Comma-separated list of fields to return. Available fields: result, error, payload, steps, activeStepsPath, serializedStepGraph. Metadata fields (runId, workflowName, resourceId, createdAt, updatedAt) and status are always included."
   ),
   withNestedWorkflows: withNestedWorkflowsField
 });
-var workflowRunResultSchema = z$1.object({
+var workflowRunResultSchema = z.object({
   // Metadata - always present
-  runId: z$1.string(),
-  workflowName: z$1.string(),
-  resourceId: z$1.string().optional(),
-  createdAt: z$1.date(),
-  updatedAt: z$1.date(),
+  runId: z.string(),
+  workflowName: z.string(),
+  resourceId: z.string().optional(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
   // Execution state
   status: workflowRunStatusSchema,
-  initialState: z$1.record(z$1.string(), z$1.any()).optional(),
-  result: z$1.unknown().optional(),
-  error: z$1.unknown().optional(),
-  payload: z$1.unknown().optional(),
-  steps: z$1.record(z$1.string(), z$1.any()).optional(),
+  initialState: z.record(z.string(), z.any()).optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+  payload: z.unknown().optional(),
+  steps: z.record(z.string(), z.any()).optional(),
   // Optional detailed fields
-  activeStepsPath: z$1.record(z$1.string(), z$1.array(z$1.number())).optional(),
-  serializedStepGraph: z$1.array(serializedStepFlowEntrySchema).optional()
+  activeStepsPath: z.record(z.string(), z.array(z.number())).optional(),
+  serializedStepGraph: z.array(serializedStepFlowEntrySchema).optional()
 });
 var workflowControlResponseSchema = messageResponseSchema;
-var createWorkflowRunResponseSchema = z$1.object({
-  runId: z$1.string()
+var createWorkflowRunResponseSchema = z.object({
+  runId: z.string()
 });
-var createWorkflowRunBodySchema = z$1.object({
-  resourceId: z$1.string().optional(),
-  disableScorers: z$1.boolean().optional()
+var createWorkflowRunBodySchema = z.object({
+  resourceId: z.string().optional(),
+  disableScorers: z.boolean().optional()
 });
-var observeWorkflowQuerySchema = z$1.object({
-  runId: z$1.string().describe("Unique identifier for the run"),
-  offset: z$1.coerce.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
+var observeWorkflowQuerySchema = z.object({
+  runId: z.string().describe("Unique identifier for the run"),
+  offset: z.coerce.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
 });
 
 // src/server/handlers/workflows.ts
@@ -41492,7 +41080,7 @@ __export(workflows_exports, {
 async function listWorkflowsFromSystem({ mastra, workflowId }) {
   const logger = mastra.getLogger();
   if (!workflowId) {
-    throw new HTTPException$2(400, { message: "Workflow ID is required" });
+    throw new HTTPException$1(400, { message: "Workflow ID is required" });
   }
   let workflow;
   workflow = WorkflowRegistry.getWorkflow(workflowId);
@@ -41521,7 +41109,7 @@ async function listWorkflowsFromSystem({ mastra, workflowId }) {
     }
   }
   if (!workflow) {
-    throw new HTTPException$2(404, { message: "Workflow not found" });
+    throw new HTTPException$1(404, { message: "Workflow not found" });
   }
   return { workflow };
 }
@@ -41529,8 +41117,8 @@ var LIST_WORKFLOWS_ROUTE = createRoute$1({
   method: "GET",
   path: "/workflows",
   responseType: "json",
-  queryParamSchema: z$1.object({
-    partial: z$1.string().optional()
+  queryParamSchema: z.object({
+    partial: z.string().optional()
   }),
   responseSchema: listWorkflowsResponseSchema,
   summary: "List all workflows",
@@ -41584,7 +41172,7 @@ var GET_WORKFLOW_BY_ID_ROUTE = createRoute$1({
   handler: (async ({ mastra, workflowId }) => {
     try {
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       return getWorkflowInfo(workflow);
@@ -41620,7 +41208,7 @@ var LIST_WORKFLOW_RUNS_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       let finalPage = page;
       let finalPerPage = perPage;
@@ -41631,14 +41219,14 @@ var LIST_WORKFLOW_RUNS_ROUTE = createRoute$1({
         finalPage = Math.floor(offset / finalPerPage);
       }
       if (finalPerPage !== void 0 && (typeof finalPerPage !== "number" || !Number.isInteger(finalPerPage) || finalPerPage <= 0)) {
-        throw new HTTPException$2(400, { message: "perPage must be a positive integer" });
+        throw new HTTPException$1(400, { message: "perPage must be a positive integer" });
       }
       if (finalPage !== void 0 && (!Number.isInteger(finalPage) || finalPage < 0)) {
-        throw new HTTPException$2(400, { message: "page must be a non-negative integer" });
+        throw new HTTPException$1(400, { message: "page must be a non-negative integer" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const workflowRuns = await workflow.listWorkflowRuns({
         fromDate: fromDate ? typeof fromDate === "string" ? new Date(fromDate) : fromDate : void 0,
@@ -41672,14 +41260,14 @@ var GET_WORKFLOW_RUN_BY_ID_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "Run ID is required" });
+        throw new HTTPException$1(400, { message: "Run ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const fieldList = fields ? fields.split(",").map((f) => f.trim()) : void 0;
       const run = await workflow.getWorkflowRunById(runId, {
@@ -41688,7 +41276,7 @@ var GET_WORKFLOW_RUN_BY_ID_ROUTE = createRoute$1({
         fields: fieldList
       });
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       return run;
@@ -41711,18 +41299,18 @@ var DELETE_WORKFLOW_RUN_BY_ID_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "Run ID is required" });
+        throw new HTTPException$1(400, { message: "Run ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       await workflow.deleteWorkflowRunById(runId);
@@ -41752,11 +41340,11 @@ var CREATE_WORKFLOW_RUN_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.createRun({ runId, resourceId: effectiveResourceId, disableScorers });
       return { runId: run.runId };
@@ -41780,14 +41368,14 @@ var STREAM_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to stream workflow" });
+        throw new HTTPException$1(400, { message: "runId required to stream workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const serverCache = mastra.getServerCache();
       const run = await workflow.createRun({ runId, resourceId: effectiveResourceId });
@@ -41821,18 +41409,18 @@ var RESUME_STREAM_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to resume workflow" });
+        throw new HTTPException$1(400, { message: "runId required to resume workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -41867,11 +41455,11 @@ var START_ASYNC_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const _run = await workflow.createRun({ runId, resourceId: effectiveResourceId });
       const result = await _run.start({ ...params, requestContext });
@@ -41897,18 +41485,18 @@ var START_WORKFLOW_RUN_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to start run" });
+        throw new HTTPException$1(400, { message: "runId required to start run" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -41937,24 +41525,24 @@ var OBSERVE_STREAM_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to observe workflow stream" });
+        throw new HTTPException$1(400, { message: "runId required to observe workflow stream" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
       const serverCache = mastra.getServerCache();
       if (!serverCache) {
-        throw new HTTPException$2(500, { message: "Server cache not found" });
+        throw new HTTPException$1(500, { message: "Server cache not found" });
       }
       const startIndex = offset ?? 0;
       const cachedRunChunks = await serverCache.listFromTo(runId, startIndex);
@@ -41984,18 +41572,18 @@ var RESUME_ASYNC_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to resume workflow" });
+        throw new HTTPException$1(400, { message: "runId required to resume workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42022,18 +41610,18 @@ var RESUME_NO_WAIT_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to resume workflow" });
+        throw new HTTPException$1(400, { message: "runId required to resume workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42060,18 +41648,18 @@ var RESUME_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to resume workflow" });
+        throw new HTTPException$1(400, { message: "runId required to resume workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42098,18 +41686,18 @@ var RESTART_ASYNC_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to restart workflow" });
+        throw new HTTPException$1(400, { message: "runId required to restart workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42136,18 +41724,18 @@ var RESTART_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to restart workflow" });
+        throw new HTTPException$1(400, { message: "runId required to restart workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42171,11 +41759,11 @@ var RESTART_ALL_ACTIVE_WORKFLOW_RUNS_ASYNC_ROUTE = createRoute$1({
   handler: async ({ mastra, workflowId }) => {
     try {
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       await workflow.restartAllActiveWorkflowRuns();
       return { message: "All active workflow runs restarted" };
@@ -42197,11 +41785,11 @@ var RESTART_ALL_ACTIVE_WORKFLOW_RUNS_ROUTE = createRoute$1({
   handler: async ({ mastra, workflowId }) => {
     try {
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       void workflow.restartAllActiveWorkflowRuns();
       return { message: "All active workflow runs restarted" };
@@ -42226,18 +41814,18 @@ var TIME_TRAVEL_ASYNC_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to time travel workflow" });
+        throw new HTTPException$1(400, { message: "runId required to time travel workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42264,18 +41852,18 @@ var TIME_TRAVEL_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to time travel workflow" });
+        throw new HTTPException$1(400, { message: "runId required to time travel workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42301,18 +41889,18 @@ var TIME_TRAVEL_STREAM_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to time travel workflow stream" });
+        throw new HTTPException$1(400, { message: "runId required to time travel workflow stream" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const existingRun = await workflow.getWorkflowRunById(runId);
       if (!existingRun) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(existingRun, effectiveResourceId);
       const serverCache = mastra.getServerCache();
@@ -42345,18 +41933,18 @@ var CANCEL_WORKFLOW_RUN_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to cancel workflow run" });
+        throw new HTTPException$1(400, { message: "runId required to cancel workflow run" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
@@ -42383,14 +41971,14 @@ var STREAM_LEGACY_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, resourceId);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to resume workflow" });
+        throw new HTTPException$1(400, { message: "runId required to resume workflow" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const serverCache = mastra.getServerCache();
       const run = await workflow.createRun({ runId, resourceId: effectiveResourceId });
@@ -42425,29 +42013,29 @@ var OBSERVE_STREAM_LEGACY_WORKFLOW_ROUTE = createRoute$1({
     try {
       const effectiveResourceId = getEffectiveResourceId(requestContext, void 0);
       if (!workflowId) {
-        throw new HTTPException$2(400, { message: "Workflow ID is required" });
+        throw new HTTPException$1(400, { message: "Workflow ID is required" });
       }
       if (!runId) {
-        throw new HTTPException$2(400, { message: "runId required to observe workflow stream" });
+        throw new HTTPException$1(400, { message: "runId required to observe workflow stream" });
       }
       const { workflow } = await listWorkflowsFromSystem({ mastra, workflowId });
       if (!workflow) {
-        throw new HTTPException$2(404, { message: "Workflow not found" });
+        throw new HTTPException$1(404, { message: "Workflow not found" });
       }
       const run = await workflow.getWorkflowRunById(runId);
       if (!run) {
-        throw new HTTPException$2(404, { message: "Workflow run not found" });
+        throw new HTTPException$1(404, { message: "Workflow run not found" });
       }
       await validateRunOwnership(run, effectiveResourceId);
       const _run = await workflow.createRun({ runId, resourceId: run.resourceId });
       const serverCache = mastra.getServerCache();
       if (!serverCache) {
-        throw new HTTPException$2(500, { message: "Server cache not found" });
+        throw new HTTPException$1(500, { message: "Server cache not found" });
       }
       const cachedRunChunks = await serverCache.listFromTo(runId, 0);
       const result = _run.observeStreamLegacy();
       if (!result.stream) {
-        throw new HTTPException$2(500, { message: "Failed to create observe stream" });
+        throw new HTTPException$1(500, { message: "Failed to create observe stream" });
       }
       return createReplayStream({
         history: cachedRunChunks,
@@ -42458,19 +42046,19 @@ var OBSERVE_STREAM_LEGACY_WORKFLOW_ROUTE = createRoute$1({
     }
   }
 });
-var stepExecutionBodySchema = z$1.object({
-  stepId: z$1.string(),
-  executionPath: z$1.array(z$1.number().int().nonnegative()),
-  stepResults: z$1.record(z$1.string(), z$1.any()),
-  state: z$1.record(z$1.string(), z$1.any()),
-  requestContext: z$1.record(z$1.string(), z$1.any()),
-  input: z$1.any().optional(),
-  resumeData: z$1.any().optional(),
-  retryCount: z$1.number().int().nonnegative().optional(),
-  foreachIdx: z$1.number().int().nonnegative().optional(),
-  format: z$1.enum(["legacy", "vnext"]).optional(),
-  perStep: z$1.boolean().optional(),
-  validateInputs: z$1.boolean().optional()
+var stepExecutionBodySchema = z.object({
+  stepId: z.string(),
+  executionPath: z.array(z.number().int().nonnegative()),
+  stepResults: z.record(z.string(), z.any()),
+  state: z.record(z.string(), z.any()),
+  requestContext: z.record(z.string(), z.any()),
+  input: z.any().optional(),
+  resumeData: z.any().optional(),
+  retryCount: z.number().int().nonnegative().optional(),
+  foreachIdx: z.number().int().nonnegative().optional(),
+  format: z.enum(["legacy", "vnext"]).optional(),
+  perStep: z.boolean().optional(),
+  validateInputs: z.boolean().optional()
 });
 var strategyByMastra = /* @__PURE__ */ new WeakMap();
 async function getStepStrategy(mastra) {
@@ -42482,7 +42070,7 @@ async function getStepStrategy(mastra) {
   }
   return cached;
 }
-var stepExecutionResponseSchema = z$1.any();
+var stepExecutionResponseSchema = z.any();
 var EXECUTE_WORKFLOW_STEP_ROUTE = createRoute$1({
   method: "POST",
   path: "/workflows/:workflowId/runs/:runId/steps/execute",
@@ -42519,21 +42107,21 @@ var EXECUTE_WORKFLOW_STEP_ROUTE = createRoute$1({
     }
   })
 });
-var workflowEventSchema = z$1.object({
-  id: z$1.string(),
-  type: z$1.string(),
-  data: z$1.unknown(),
-  runId: z$1.string(),
-  createdAt: z$1.string(),
-  index: z$1.number().optional(),
-  deliveryAttempt: z$1.number().optional()
+var workflowEventSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  data: z.unknown(),
+  runId: z.string(),
+  createdAt: z.string(),
+  index: z.number().optional(),
+  deliveryAttempt: z.number().optional()
 });
-var receiveWorkflowEventBodySchema = z$1.object({
+var receiveWorkflowEventBodySchema = z.object({
   event: workflowEventSchema.passthrough()
 });
-var receiveWorkflowEventResponseSchema = z$1.object({
-  ok: z$1.boolean(),
-  retry: z$1.boolean().optional()
+var receiveWorkflowEventResponseSchema = z.object({
+  ok: z.boolean(),
+  retry: z.boolean().optional()
 });
 var RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute$1({
   method: "POST",
@@ -42554,7 +42142,7 @@ var RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute$1({
       const rawCreatedAt = event.createdAt;
       const createdAt = rawCreatedAt instanceof Date ? rawCreatedAt : new Date(rawCreatedAt);
       if (Number.isNaN(createdAt.getTime())) {
-        throw new HTTPException$2(400, { message: "Invalid createdAt" });
+        throw new HTTPException$1(400, { message: "Invalid createdAt" });
       }
       return await mastra.handleWorkflowEvent({ ...event, createdAt });
     } catch (error) {
@@ -42563,12 +42151,12 @@ var RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute$1({
   })
 });
 
-var actionIdPathParams = z$1.object({
-  actionId: z$1.string().describe("Unique identifier for the agent-builder action")
+var actionIdPathParams = z.object({
+  actionId: z.string().describe("Unique identifier for the agent-builder action")
 });
-var actionRunPathParams = z$1.object({
-  actionId: z$1.string().describe("Unique identifier for the agent-builder action"),
-  runId: z$1.string().describe("Unique identifier for the action run")
+var actionRunPathParams = z.object({
+  actionId: z.string().describe("Unique identifier for the agent-builder action"),
+  runId: z.string().describe("Unique identifier for the action run")
 });
 var streamAgentBuilderBodySchema = streamWorkflowBodySchema;
 var streamLegacyAgentBuilderBodySchema = streamLegacyWorkflowBodySchema;
@@ -42645,7 +42233,7 @@ var GET_AGENT_BUILDER_ACTION_BY_ID_ROUTE = createRoute$1({
     try {
       const agentBuilderWorkflows = await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, {
+        throw new HTTPException$1(400, {
           message: `Invalid agent-builder action: ${actionId}. Valid actions are: ${Object.keys(agentBuilderWorkflows).join(", ")}`
         });
       }
@@ -42676,7 +42264,7 @@ var LIST_AGENT_BUILDER_ACTION_RUNS_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Listing agent builder action runs", { actionId });
       return await LIST_WORKFLOW_RUNS_ROUTE.handler({
@@ -42708,7 +42296,7 @@ var GET_AGENT_BUILDER_ACTION_RUN_BY_ID_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Getting agent builder action run by ID", { actionId, runId });
       return await GET_WORKFLOW_RUN_BY_ID_ROUTE.handler({
@@ -42740,7 +42328,7 @@ var CREATE_AGENT_BUILDER_ACTION_RUN_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Creating agent builder action run", { actionId, runId });
       return await CREATE_WORKFLOW_RUN_ROUTE.handler({
@@ -42773,7 +42361,7 @@ var STREAM_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Streaming agent builder action", { actionId, runId });
       return await STREAM_WORKFLOW_ROUTE.handler({
@@ -42807,7 +42395,7 @@ var START_ASYNC_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Starting agent builder action asynchronously", { actionId, runId });
       return await START_ASYNC_WORKFLOW_ROUTE.handler({
@@ -42841,7 +42429,7 @@ var START_AGENT_BUILDER_ACTION_RUN_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Starting specific agent builder action run", { actionId, runId });
       return await START_WORKFLOW_RUN_ROUTE.handler({
@@ -42874,7 +42462,7 @@ var OBSERVE_STREAM_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Observing agent builder action stream", { actionId, runId });
       return await OBSERVE_STREAM_WORKFLOW_ROUTE.handler({
@@ -42907,7 +42495,7 @@ var RESUME_ASYNC_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Resuming agent builder action asynchronously", { actionId, runId, step });
       return await RESUME_ASYNC_WORKFLOW_ROUTE.handler({
@@ -42941,7 +42529,7 @@ var RESUME_NO_WAIT_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Resuming agent builder action without waiting", { actionId, runId, step });
       return await RESUME_NO_WAIT_WORKFLOW_ROUTE.handler({
@@ -42975,7 +42563,7 @@ var RESUME_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Resuming agent builder action", { actionId, runId, step });
       return await RESUME_WORKFLOW_ROUTE.handler({
@@ -43009,7 +42597,7 @@ var RESUME_STREAM_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Resuming agent builder action stream", { actionId, runId, step });
       return await RESUME_STREAM_WORKFLOW_ROUTE.handler({
@@ -43041,7 +42629,7 @@ var CANCEL_AGENT_BUILDER_ACTION_RUN_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Cancelling agent builder action run", { actionId, runId });
       return await CANCEL_WORKFLOW_RUN_ROUTE.handler({
@@ -43074,7 +42662,7 @@ var STREAM_LEGACY_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Streaming agent builder action (legacy)", { actionId, runId });
       return await STREAM_LEGACY_WORKFLOW_ROUTE.handler({
@@ -43107,7 +42695,7 @@ var OBSERVE_STREAM_LEGACY_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
     try {
       await registerAgentBuilderWorkflows(mastra);
       if (actionId && !WorkflowRegistry.isAgentBuilderWorkflow(actionId)) {
-        throw new HTTPException$2(400, { message: `Invalid agent-builder action: ${actionId}` });
+        throw new HTTPException$1(400, { message: `Invalid agent-builder action: ${actionId}` });
       }
       logger.info("Observing agent builder action stream (legacy)", { actionId, runId });
       return await OBSERVE_STREAM_LEGACY_WORKFLOW_ROUTE.handler({
@@ -43129,7 +42717,7 @@ function isReservedThreadMetadataKey(key) {
 function getAgentControllerOrThrow(mastra, controllerId) {
   const controller = mastra.getAgentController?.(controllerId);
   if (!controller) {
-    throw new HTTPException$2(404, { message: `agent controller "${controllerId}" not found` });
+    throw new HTTPException$1(404, { message: `agent controller "${controllerId}" not found` });
   }
   return controller;
 }
@@ -43139,187 +42727,187 @@ async function getSession(controller, resourceId, options) {
   const id = scope ? `${resourceId}::${scope}` : resourceId;
   return controller.createSession({ resourceId, id, ownerId: controller.id, tags, scope });
 }
-var controllerIdPathParams = z$1.object({ controllerId: z$1.string() });
-var sessionPathParams = z$1.object({ controllerId: z$1.string(), resourceId: z$1.string() });
-var sessionScopeQuerySchema = z$1.object({ sessionScope: z$1.string().optional() });
-var createSessionBodySchema = z$1.object({
-  resourceId: z$1.string(),
-  tags: z$1.record(z$1.string(), z$1.string()).optional(),
-  sessionScope: z$1.string().optional()
+var controllerIdPathParams = z.object({ controllerId: z.string() });
+var sessionPathParams = z.object({ controllerId: z.string(), resourceId: z.string() });
+var sessionScopeQuerySchema = z.object({ sessionScope: z.string().optional() });
+var createSessionBodySchema = z.object({
+  resourceId: z.string(),
+  tags: z.record(z.string(), z.string()).optional(),
+  sessionScope: z.string().optional()
 });
 var MAX_FILE_DATA_LENGTH = 14 * 1024 * 1024;
 var MAX_TOTAL_FILE_DATA_LENGTH = 28 * 1024 * 1024;
-var sendMessageBodySchema = z$1.object({
-  message: z$1.string(),
+var sendMessageBodySchema = z.object({
+  message: z.string(),
   // Optional attachments (e.g. pasted images). `data` is base64-encoded.
-  files: z$1.array(
-    z$1.object({
-      data: z$1.string().max(MAX_FILE_DATA_LENGTH),
-      mediaType: z$1.string(),
-      filename: z$1.string().optional()
+  files: z.array(
+    z.object({
+      data: z.string().max(MAX_FILE_DATA_LENGTH),
+      mediaType: z.string(),
+      filename: z.string().optional()
     })
   ).max(20).refine((files) => files.reduce((total, file) => total + file.data.length, 0) <= MAX_TOTAL_FILE_DATA_LENGTH, {
     message: "Total attachment size exceeds limit"
   }).optional()
 });
-var steerBodySchema = z$1.object({ message: z$1.string() });
-var toolApprovalBodySchema = z$1.object({
-  toolCallId: z$1.string(),
-  approved: z$1.boolean()
+var steerBodySchema = z.object({ message: z.string() });
+var toolApprovalBodySchema = z.object({
+  toolCallId: z.string(),
+  approved: z.boolean()
 });
-var toolSuspensionBodySchema = z$1.object({
-  toolCallId: z$1.string(),
+var toolSuspensionBodySchema = z.object({
+  toolCallId: z.string(),
   // Free-form resume payload. For ask_user this is a string (or string[] for
   // multi-select); for submit_plan it's `{ action, feedback? }`; for
   // request_access it's "Yes"/"No".
-  resumeData: z$1.any()
+  resumeData: z.any()
 });
-var switchModeBodySchema = z$1.object({ modeId: z$1.string() });
-var switchModelBodySchema = z$1.object({
-  modelId: z$1.string(),
-  scope: z$1.enum(["global", "thread"]).optional(),
-  modeId: z$1.string().optional()
+var switchModeBodySchema = z.object({ modeId: z.string() });
+var switchModelBodySchema = z.object({
+  modelId: z.string(),
+  scope: z.enum(["global", "thread"]).optional(),
+  modeId: z.string().optional()
 });
-var switchThreadBodySchema = z$1.object({ threadId: z$1.string() });
-var createThreadBodySchema = z$1.object({ title: z$1.string().optional() });
-var renameThreadBodySchema = z$1.object({ title: z$1.string() });
-var threadPathParams = z$1.object({ controllerId: z$1.string(), resourceId: z$1.string(), threadId: z$1.string() });
-var cloneThreadBodySchema = z$1.object({
-  sourceThreadId: z$1.string().optional(),
-  title: z$1.string().optional()
+var switchThreadBodySchema = z.object({ threadId: z.string() });
+var createThreadBodySchema = z.object({ title: z.string().optional() });
+var renameThreadBodySchema = z.object({ title: z.string() });
+var threadPathParams = z.object({ controllerId: z.string(), resourceId: z.string(), threadId: z.string() });
+var cloneThreadBodySchema = z.object({
+  sourceThreadId: z.string().optional(),
+  title: z.string().optional()
 });
-var listMessagesQuerySchema = z$1.object({ limit: z$1.coerce.number().optional(), sessionScope: z$1.string().optional() });
-var listThreadsQuerySchema = z$1.object({
-  limit: z$1.coerce.number().optional(),
-  sessionScope: z$1.string().optional(),
-  tags: z$1.preprocess((value) => {
+var listMessagesQuerySchema = z.object({ limit: z.coerce.number().optional(), sessionScope: z.string().optional() });
+var listThreadsQuerySchema = z.object({
+  limit: z.coerce.number().optional(),
+  sessionScope: z.string().optional(),
+  tags: z.preprocess((value) => {
     if (typeof value !== "string" || value.length === 0) return void 0;
     try {
       return JSON.parse(value);
     } catch {
       return void 0;
     }
-  }, z$1.record(z$1.string(), z$1.string()).optional()).optional()
+  }, z.record(z.string(), z.string()).optional()).optional()
 });
-var followUpBodySchema = z$1.object({ message: z$1.string() });
-var sendNotificationBodySchema = z$1.object({
-  source: z$1.string(),
-  kind: z$1.string(),
-  summary: z$1.string(),
-  priority: z$1.enum(["low", "medium", "high", "urgent"]).optional(),
-  payload: z$1.any().optional(),
-  sourceId: z$1.string().optional(),
-  dedupeKey: z$1.string().optional(),
-  coalesceKey: z$1.string().optional(),
-  attributes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-  metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+var followUpBodySchema = z.object({ message: z.string() });
+var sendNotificationBodySchema = z.object({
+  source: z.string(),
+  kind: z.string(),
+  summary: z.string(),
+  priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
+  payload: z.any().optional(),
+  sourceId: z.string().optional(),
+  dedupeKey: z.string().optional(),
+  coalesceKey: z.string().optional(),
+  attributes: z.record(z.string(), z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional()
 });
-var listAgentControllersResponseSchema = z$1.object({
-  agentControllers: z$1.array(z$1.object({ id: z$1.string() }))
+var listAgentControllersResponseSchema = z.object({
+  agentControllers: z.array(z.object({ id: z.string() }))
 });
-var createSessionResponseSchema = z$1.object({
-  controllerId: z$1.string(),
-  resourceId: z$1.string(),
-  threadId: z$1.string().optional()
+var createSessionResponseSchema = z.object({
+  controllerId: z.string(),
+  resourceId: z.string(),
+  threadId: z.string().optional()
 });
-var ackResponseSchema = z$1.object({ ok: z$1.boolean() });
-var omProgressSummarySchema = z$1.object({
-  status: z$1.string(),
-  pendingTokens: z$1.number(),
-  threshold: z$1.number(),
-  thresholdPercent: z$1.number(),
-  observationTokens: z$1.number(),
-  reflectionThreshold: z$1.number(),
-  reflectionThresholdPercent: z$1.number(),
+var ackResponseSchema = z.object({ ok: z.boolean() });
+var omProgressSummarySchema = z.object({
+  status: z.string(),
+  pendingTokens: z.number(),
+  threshold: z.number(),
+  thresholdPercent: z.number(),
+  observationTokens: z.number(),
+  reflectionThreshold: z.number(),
+  reflectionThresholdPercent: z.number(),
   /** Tokens the next observation will remove from the message window. */
-  projectedMessageRemoval: z$1.number(),
+  projectedMessageRemoval: z.number(),
   /** Tokens the next reflection is projected to save. */
-  projectedReflectionSavings: z$1.number()
+  projectedReflectionSavings: z.number()
 });
-var sessionSettingsSchema = z$1.object({
-  yolo: z$1.boolean(),
-  thinkingLevel: z$1.enum(["off", "low", "medium", "high", "xhigh"]),
-  notifications: z$1.enum(["off", "bell", "system", "both"]),
-  smartEditing: z$1.boolean()
+var sessionSettingsSchema = z.object({
+  yolo: z.boolean(),
+  thinkingLevel: z.enum(["off", "low", "medium", "high", "xhigh"]),
+  notifications: z.enum(["off", "bell", "system", "both"]),
+  smartEditing: z.boolean()
 });
-var sessionStateResponseSchema = z$1.object({
-  controllerId: z$1.string(),
-  resourceId: z$1.string(),
-  threadId: z$1.string().optional(),
-  modeId: z$1.string(),
-  modelId: z$1.string(),
+var sessionStateResponseSchema = z.object({
+  controllerId: z.string(),
+  resourceId: z.string(),
+  threadId: z.string().optional(),
+  modeId: z.string(),
+  modelId: z.string(),
   /** Whether the agent is currently executing a run (for initial UI hydration). */
-  running: z$1.boolean().optional(),
+  running: z.boolean().optional(),
   omProgress: omProgressSummarySchema.optional(),
-  tokenUsage: z$1.record(z$1.string(), z$1.unknown()).optional(),
+  tokenUsage: z.record(z.string(), z.unknown()).optional(),
   settings: sessionSettingsSchema.optional()
 });
-var listModesResponseSchema = z$1.object({
-  modes: z$1.array(z$1.object({ id: z$1.string(), name: z$1.string().optional() }))
+var listModesResponseSchema = z.object({
+  modes: z.array(z.object({ id: z.string(), name: z.string().optional() }))
 });
-var listThreadsResponseSchema = z$1.object({
-  threads: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      title: z$1.string().optional(),
-      updatedAt: z$1.string().optional(),
+var listThreadsResponseSchema = z.object({
+  threads: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string().optional(),
+      updatedAt: z.string().optional(),
       /** The session scoping tags stamped on this thread (e.g. `{ projectPath }`). */
-      tags: z$1.record(z$1.string(), z$1.string()).optional(),
+      tags: z.record(z.string(), z.string()).optional(),
       /** Whether a run is currently executing on this thread ('active') or not ('idle'). */
-      state: z$1.enum(["active", "idle"]).optional()
+      state: z.enum(["active", "idle"]).optional()
     })
   )
 });
-var threadResponseSchema = z$1.object({
-  id: z$1.string(),
-  title: z$1.string().optional(),
-  resourceId: z$1.string().optional(),
-  createdAt: z$1.string().optional(),
-  updatedAt: z$1.string().optional()
+var threadResponseSchema = z.object({
+  id: z.string(),
+  title: z.string().optional(),
+  resourceId: z.string().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional()
 });
-var messageContentSchema = z$1.object({
-  type: z$1.string()
+var messageContentSchema = z.object({
+  type: z.string()
 }).passthrough();
-var listMessagesResponseSchema = z$1.object({
-  messages: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      role: z$1.enum(["user", "assistant", "system"]),
-      content: z$1.array(messageContentSchema),
-      createdAt: z$1.string().optional()
+var listMessagesResponseSchema = z.object({
+  messages: z.array(
+    z.object({
+      id: z.string(),
+      role: z.enum(["user", "assistant", "system"]),
+      content: z.array(messageContentSchema),
+      createdAt: z.string().optional()
     })
   )
 });
-var listModelsResponseSchema = z$1.object({
-  models: z$1.array(
-    z$1.object({
-      id: z$1.string(),
-      provider: z$1.string(),
-      modelName: z$1.string(),
-      hasApiKey: z$1.boolean(),
-      useCount: z$1.number()
+var listModelsResponseSchema = z.object({
+  models: z.array(
+    z.object({
+      id: z.string(),
+      provider: z.string(),
+      modelName: z.string(),
+      hasApiKey: z.boolean(),
+      useCount: z.number()
     })
   )
 });
-var workspaceStatusResponseSchema = z$1.object({
-  hasWorkspace: z$1.boolean(),
-  isReady: z$1.boolean()
+var workspaceStatusResponseSchema = z.object({
+  hasWorkspace: z.boolean(),
+  isReady: z.boolean()
 });
-var omRecordResponseSchema = z$1.object({
-  record: z$1.any().optional()
+var omRecordResponseSchema = z.object({
+  record: z.any().optional()
 });
-var permissionPolicyEnum = z$1.enum(["allow", "ask", "deny"]);
-var toolCategoryEnum = z$1.enum(["read", "edit", "execute", "mcp", "other"]);
-var permissionRulesResponseSchema = z$1.object({
-  categories: z$1.record(z$1.string(), permissionPolicyEnum).optional(),
-  tools: z$1.record(z$1.string(), permissionPolicyEnum).optional()
+var permissionPolicyEnum = z.enum(["allow", "ask", "deny"]);
+var toolCategoryEnum = z.enum(["read", "edit", "execute", "mcp", "other"]);
+var permissionRulesResponseSchema = z.object({
+  categories: z.record(z.string(), permissionPolicyEnum).optional(),
+  tools: z.record(z.string(), permissionPolicyEnum).optional()
 });
-var setCategoryPermissionBodySchema = z$1.object({
+var setCategoryPermissionBodySchema = z.object({
   category: toolCategoryEnum,
   policy: permissionPolicyEnum
 });
-var setToolPermissionBodySchema = z$1.object({
-  toolName: z$1.string(),
+var setToolPermissionBodySchema = z.object({
+  toolName: z.string(),
   policy: permissionPolicyEnum
 });
 var LIST_AGENT_CONTROLLERS_ROUTE = createRoute$1({
@@ -43778,11 +43366,11 @@ var SEND_AGENT_CONTROLLER_NOTIFICATION_ROUTE = createRoute$1({
   pathParamSchema: sessionPathParams,
   queryParamSchema: sessionScopeQuerySchema,
   bodySchema: sendNotificationBodySchema,
-  responseSchema: z$1.object({
-    accepted: z$1.boolean(),
-    notificationId: z$1.string().optional(),
-    decision: z$1.string().optional(),
-    runId: z$1.string().optional()
+  responseSchema: z.object({
+    accepted: z.boolean(),
+    notificationId: z.string().optional(),
+    decision: z.string().optional(),
+    runId: z.string().optional()
   }),
   summary: "Send a notification signal to a session",
   description: "Delivers a notification to the session\u2019s current agent/thread. The agent\u2019s delivery policy determines whether the notification wakes an idle thread, is summarised, or is persisted for later.",
@@ -44078,7 +43666,7 @@ var SET_AGENT_CONTROLLER_RESOURCE_ID_ROUTE = createRoute$1({
   responseType: "json",
   pathParamSchema: sessionPathParams,
   queryParamSchema: sessionScopeQuerySchema,
-  bodySchema: z$1.object({ newResourceId: z$1.string() }),
+  bodySchema: z.object({ newResourceId: z.string() }),
   responseSchema: ackResponseSchema,
   summary: "Change the session resource ID",
   description: "Updates the session\u2019s resource identity (e.g. when a user logs in).",
@@ -44102,7 +43690,7 @@ var GET_AGENT_CONTROLLER_RESOURCE_IDS_ROUTE = createRoute$1({
   responseType: "json",
   pathParamSchema: sessionPathParams,
   queryParamSchema: sessionScopeQuerySchema,
-  responseSchema: z$1.object({ resourceIds: z$1.array(z$1.string()) }),
+  responseSchema: z.object({ resourceIds: z.array(z.string()) }),
   summary: "Get known resource IDs",
   description: "Lists the resource IDs known to this session (from threads).",
   tags: ["AgentController"],
@@ -44119,28 +43707,28 @@ var GET_AGENT_CONTROLLER_RESOURCE_IDS_ROUTE = createRoute$1({
     }
   }
 });
-var setGoalBodySchema = z$1.object({
-  objective: z$1.string(),
-  judgeModelId: z$1.string().optional(),
-  maxRuns: z$1.number().optional()
+var setGoalBodySchema = z.object({
+  objective: z.string(),
+  judgeModelId: z.string().optional(),
+  maxRuns: z.number().optional()
 });
-var updateGoalBodySchema = z$1.object({
-  judgeModelId: z$1.string().optional(),
-  maxRuns: z$1.number().optional(),
-  status: z$1.enum(["active", "paused", "done"]).optional()
+var updateGoalBodySchema = z.object({
+  judgeModelId: z.string().optional(),
+  maxRuns: z.number().optional(),
+  status: z.enum(["active", "paused", "done"]).optional()
 });
-var goalRecordSchema = z$1.object({
-  id: z$1.string().optional(),
-  objective: z$1.string(),
-  status: z$1.enum(["active", "paused", "done"]),
-  runsUsed: z$1.number(),
-  maxRuns: z$1.number().optional(),
-  judgeModelId: z$1.string().optional(),
-  startedAt: z$1.number(),
-  updatedAt: z$1.number(),
-  pausedReason: z$1.string().optional()
+var goalRecordSchema = z.object({
+  id: z.string().optional(),
+  objective: z.string(),
+  status: z.enum(["active", "paused", "done"]),
+  runsUsed: z.number(),
+  maxRuns: z.number().optional(),
+  judgeModelId: z.string().optional(),
+  startedAt: z.number(),
+  updatedAt: z.number(),
+  pausedReason: z.string().optional()
 });
-var goalResponseSchema = z$1.object({ goal: goalRecordSchema.optional() });
+var goalResponseSchema = z.object({ goal: goalRecordSchema.optional() });
 function getAgentForSession(controller, session) {
   return controller.getCurrentAgent(session);
 }
@@ -44188,7 +43776,7 @@ var SET_AGENT_CONTROLLER_GOAL_ROUTE = createRoute$1({
       const controller = getAgentControllerOrThrow(mastra, controllerId);
       const session = await getSession(controller, resourceId, { scope: sessionScope });
       const threadId = session.thread.getId();
-      if (!threadId) throw new HTTPException$2(400, { message: "session has no active thread" });
+      if (!threadId) throw new HTTPException$1(400, { message: "session has no active thread" });
       const agent = getAgentForSession(controller, session);
       const record = await agent.setObjective(objective, {
         threadId,
@@ -44220,7 +43808,7 @@ var UPDATE_AGENT_CONTROLLER_GOAL_ROUTE = createRoute$1({
       const controller = getAgentControllerOrThrow(mastra, controllerId);
       const session = await getSession(controller, resourceId, { scope: sessionScope });
       const threadId = session.thread.getId();
-      if (!threadId) throw new HTTPException$2(400, { message: "session has no active thread" });
+      if (!threadId) throw new HTTPException$1(400, { message: "session has no active thread" });
       const agent = getAgentForSession(controller, session);
       const record = await agent.updateObjectiveOptions({
         threadId,
@@ -44251,7 +43839,7 @@ var CLEAR_AGENT_CONTROLLER_GOAL_ROUTE = createRoute$1({
       const controller = getAgentControllerOrThrow(mastra, controllerId);
       const session = await getSession(controller, resourceId, { scope: sessionScope });
       const threadId = session.thread.getId();
-      if (!threadId) throw new HTTPException$2(400, { message: "session has no active thread" });
+      if (!threadId) throw new HTTPException$1(400, { message: "session has no active thread" });
       const agent = getAgentForSession(controller, session);
       await agent.clearObjective({ threadId });
       return { ok: true };
@@ -44334,7 +43922,7 @@ var SET_AGENT_CONTROLLER_TOOL_PERMISSION_ROUTE = createRoute$1({
     }
   }
 });
-var setSessionStateBodySchema = z$1.object({ state: z$1.record(z$1.string(), z$1.unknown()) });
+var setSessionStateBodySchema = z.object({ state: z.record(z.string(), z.unknown()) });
 var SET_AGENT_CONTROLLER_SESSION_STATE_ROUTE = createRoute$1({
   method: "PUT",
   path: "/agent-controller/:controllerId/sessions/:resourceId/state",
@@ -45054,2067 +44642,6 @@ var SERVER_ROUTES = [
   ...AGENT_CONTROLLER_ROUTES
 ];
 
-// src/compose.ts
-var compose = (middleware, onError, onNotFound) => {
-  return (context, next) => {
-    let index = -1;
-    return dispatch(0);
-    async function dispatch(i) {
-      if (i <= index) {
-        throw new Error("next() called multiple times");
-      }
-      index = i;
-      let res;
-      let isError = false;
-      let handler;
-      if (middleware[i]) {
-        handler = middleware[i][0][0];
-        context.req.routeIndex = i;
-      } else {
-        handler = i === middleware.length && next || void 0;
-      }
-      if (handler) {
-        try {
-          res = await handler(context, () => dispatch(i + 1));
-        } catch (err) {
-          if (err instanceof Error && onError) {
-            context.error = err;
-            res = await onError(err, context);
-            isError = true;
-          } else {
-            throw err;
-          }
-        }
-      } else {
-        if (context.finalized === false && onNotFound) {
-          res = await onNotFound(context);
-        }
-      }
-      if (res && (context.finalized === false || isError)) {
-        context.res = res;
-      }
-      return context;
-    }
-  };
-};
-
-// src/http-exception.ts
-var HTTPException = class extends Error {
-  res;
-  status;
-  /**
-   * Creates an instance of `HTTPException`.
-   * @param status - HTTP status code for the exception. Defaults to 500.
-   * @param options - Additional options for the exception.
-   */
-  constructor(status = 500, options) {
-    super(options?.message, { cause: options?.cause });
-    this.res = options?.res;
-    this.status = status;
-  }
-  /**
-   * Returns the response object associated with the exception.
-   * If a response object is not provided, a new response is created with the error message and status code.
-   * @returns The response object.
-   */
-  getResponse() {
-    if (this.res) {
-      const newResponse = new Response(this.res.body, {
-        status: this.status,
-        headers: this.res.headers
-      });
-      return newResponse;
-    }
-    return new Response(this.message, {
-      status: this.status
-    });
-  }
-};
-
-// src/request/constants.ts
-var GET_MATCH_RESULT = /* @__PURE__ */ Symbol();
-
-// src/utils/body.ts
-var parseBody = async (request, options = /* @__PURE__ */ Object.create(null)) => {
-  const { all = false, dot = false } = options;
-  const headers = request instanceof HonoRequest ? request.raw.headers : request.headers;
-  const contentType = headers.get("Content-Type");
-  if (contentType?.startsWith("multipart/form-data") || contentType?.startsWith("application/x-www-form-urlencoded")) {
-    return parseFormData(request, { all, dot });
-  }
-  return {};
-};
-async function parseFormData(request, options) {
-  const formData = await request.formData();
-  if (formData) {
-    return convertFormDataToBodyData(formData, options);
-  }
-  return {};
-}
-function convertFormDataToBodyData(formData, options) {
-  const form = /* @__PURE__ */ Object.create(null);
-  formData.forEach((value, key) => {
-    const shouldParseAllValues = options.all || key.endsWith("[]");
-    if (!shouldParseAllValues) {
-      form[key] = value;
-    } else {
-      handleParsingAllValues(form, key, value);
-    }
-  });
-  if (options.dot) {
-    Object.entries(form).forEach(([key, value]) => {
-      const shouldParseDotValues = key.includes(".");
-      if (shouldParseDotValues) {
-        handleParsingNestedValues(form, key, value);
-        delete form[key];
-      }
-    });
-  }
-  return form;
-}
-var handleParsingAllValues = (form, key, value) => {
-  if (form[key] !== void 0) {
-    if (Array.isArray(form[key])) {
-      form[key].push(value);
-    } else {
-      form[key] = [form[key], value];
-    }
-  } else {
-    if (!key.endsWith("[]")) {
-      form[key] = value;
-    } else {
-      form[key] = [value];
-    }
-  }
-};
-var handleParsingNestedValues = (form, key, value) => {
-  if (/(?:^|\.)__proto__\./.test(key)) {
-    return;
-  }
-  let nestedForm = form;
-  const keys = key.split(".");
-  keys.forEach((key2, index) => {
-    if (index === keys.length - 1) {
-      nestedForm[key2] = value;
-    } else {
-      if (!nestedForm[key2] || typeof nestedForm[key2] !== "object" || Array.isArray(nestedForm[key2]) || nestedForm[key2] instanceof File) {
-        nestedForm[key2] = /* @__PURE__ */ Object.create(null);
-      }
-      nestedForm = nestedForm[key2];
-    }
-  });
-};
-
-// src/utils/url.ts
-var splitPath = (path) => {
-  const paths = path.split("/");
-  if (paths[0] === "") {
-    paths.shift();
-  }
-  return paths;
-};
-var splitRoutingPath = (routePath) => {
-  const { groups, path } = extractGroupsFromPath(routePath);
-  const paths = splitPath(path);
-  return replaceGroupMarks(paths, groups);
-};
-var extractGroupsFromPath = (path) => {
-  const groups = [];
-  path = path.replace(/\{[^}]+\}/g, (match, index) => {
-    const mark = `@${index}`;
-    groups.push([mark, match]);
-    return mark;
-  });
-  return { groups, path };
-};
-var replaceGroupMarks = (paths, groups) => {
-  for (let i = groups.length - 1; i >= 0; i--) {
-    const [mark] = groups[i];
-    for (let j = paths.length - 1; j >= 0; j--) {
-      if (paths[j].includes(mark)) {
-        paths[j] = paths[j].replace(mark, groups[i][1]);
-        break;
-      }
-    }
-  }
-  return paths;
-};
-var patternCache = {};
-var getPattern = (label, next) => {
-  if (label === "*") {
-    return "*";
-  }
-  const match = label.match(/^\:([^\{\}]+)(?:\{(.+)\})?$/);
-  if (match) {
-    const cacheKey = `${label}#${next}`;
-    if (!patternCache[cacheKey]) {
-      if (match[2]) {
-        patternCache[cacheKey] = next && next[0] !== ":" && next[0] !== "*" ? [cacheKey, match[1], new RegExp(`^${match[2]}(?=/${next})`)] : [label, match[1], new RegExp(`^${match[2]}$`)];
-      } else {
-        patternCache[cacheKey] = [label, match[1], true];
-      }
-    }
-    return patternCache[cacheKey];
-  }
-  return null;
-};
-var tryDecode$1 = (str, decoder) => {
-  try {
-    return decoder(str);
-  } catch {
-    return str.replace(/(?:%[0-9A-Fa-f]{2})+/g, (match) => {
-      try {
-        return decoder(match);
-      } catch {
-        return match;
-      }
-    });
-  }
-};
-var tryDecodeURI$1 = (str) => tryDecode$1(str, decodeURI);
-var getPath = (request) => {
-  const url = request.url;
-  const start = url.indexOf("/", url.indexOf(":") + 4);
-  let i = start;
-  for (; i < url.length; i++) {
-    const charCode = url.charCodeAt(i);
-    if (charCode === 37) {
-      const queryIndex = url.indexOf("?", i);
-      const hashIndex = url.indexOf("#", i);
-      const end = queryIndex === -1 ? hashIndex === -1 ? void 0 : hashIndex : hashIndex === -1 ? queryIndex : Math.min(queryIndex, hashIndex);
-      const path = url.slice(start, end);
-      return tryDecodeURI$1(path.includes("%25") ? path.replace(/%25/g, "%2525") : path);
-    } else if (charCode === 63 || charCode === 35) {
-      break;
-    }
-  }
-  return url.slice(start, i);
-};
-var getPathNoStrict = (request) => {
-  const result = getPath(request);
-  return result.length > 1 && result.at(-1) === "/" ? result.slice(0, -1) : result;
-};
-var mergePath = (base, sub, ...rest) => {
-  if (rest.length) {
-    sub = mergePath(sub, ...rest);
-  }
-  return `${base?.[0] === "/" ? "" : "/"}${base}${sub === "/" ? "" : `${base?.at(-1) === "/" ? "" : "/"}${sub?.[0] === "/" ? sub.slice(1) : sub}`}`;
-};
-var checkOptionalParameter = (path) => {
-  if (path.charCodeAt(path.length - 1) !== 63 || !path.includes(":")) {
-    return null;
-  }
-  const segments = path.split("/");
-  const results = [];
-  let basePath = "";
-  segments.forEach((segment) => {
-    if (segment !== "" && !/\:/.test(segment)) {
-      basePath += "/" + segment;
-    } else if (/\:/.test(segment)) {
-      if (/\?/.test(segment)) {
-        if (results.length === 0 && basePath === "") {
-          results.push("/");
-        } else {
-          results.push(basePath);
-        }
-        const optionalSegment = segment.replace("?", "");
-        basePath += "/" + optionalSegment;
-        results.push(basePath);
-      } else {
-        basePath += "/" + segment;
-      }
-    }
-  });
-  return results.filter((v, i, a) => a.indexOf(v) === i);
-};
-var _decodeURI = (value) => {
-  if (!/[%+]/.test(value)) {
-    return value;
-  }
-  if (value.indexOf("+") !== -1) {
-    value = value.replace(/\+/g, " ");
-  }
-  return value.indexOf("%") !== -1 ? tryDecode$1(value, decodeURIComponent_) : value;
-};
-var _getQueryParam = (url, key, multiple) => {
-  let encoded;
-  if (!multiple && key && !/[%+]/.test(key)) {
-    let keyIndex2 = url.indexOf("?", 8);
-    if (keyIndex2 === -1) {
-      return void 0;
-    }
-    if (!url.startsWith(key, keyIndex2 + 1)) {
-      keyIndex2 = url.indexOf(`&${key}`, keyIndex2 + 1);
-    }
-    while (keyIndex2 !== -1) {
-      const trailingKeyCode = url.charCodeAt(keyIndex2 + key.length + 1);
-      if (trailingKeyCode === 61) {
-        const valueIndex = keyIndex2 + key.length + 2;
-        const endIndex = url.indexOf("&", valueIndex);
-        return _decodeURI(url.slice(valueIndex, endIndex === -1 ? void 0 : endIndex));
-      } else if (trailingKeyCode == 38 || isNaN(trailingKeyCode)) {
-        return "";
-      }
-      keyIndex2 = url.indexOf(`&${key}`, keyIndex2 + 1);
-    }
-    encoded = /[%+]/.test(url);
-    if (!encoded) {
-      return void 0;
-    }
-  }
-  const results = {};
-  encoded ??= /[%+]/.test(url);
-  let keyIndex = url.indexOf("?", 8);
-  while (keyIndex !== -1) {
-    const nextKeyIndex = url.indexOf("&", keyIndex + 1);
-    let valueIndex = url.indexOf("=", keyIndex);
-    if (valueIndex > nextKeyIndex && nextKeyIndex !== -1) {
-      valueIndex = -1;
-    }
-    let name = url.slice(
-      keyIndex + 1,
-      valueIndex === -1 ? nextKeyIndex === -1 ? void 0 : nextKeyIndex : valueIndex
-    );
-    if (encoded) {
-      name = _decodeURI(name);
-    }
-    keyIndex = nextKeyIndex;
-    if (name === "") {
-      continue;
-    }
-    let value;
-    if (valueIndex === -1) {
-      value = "";
-    } else {
-      value = url.slice(valueIndex + 1, nextKeyIndex === -1 ? void 0 : nextKeyIndex);
-      if (encoded) {
-        value = _decodeURI(value);
-      }
-    }
-    if (multiple) {
-      if (!(results[name] && Array.isArray(results[name]))) {
-        results[name] = [];
-      }
-      results[name].push(value);
-    } else {
-      results[name] ??= value;
-    }
-  }
-  return key ? results[key] : results;
-};
-var getQueryParam = _getQueryParam;
-var getQueryParams = (url, key) => {
-  return _getQueryParam(url, key, true);
-};
-var decodeURIComponent_ = decodeURIComponent;
-
-// src/request.ts
-var tryDecodeURIComponent = (str) => tryDecode$1(str, decodeURIComponent_);
-var HonoRequest = class {
-  /**
-   * `.raw` can get the raw Request object.
-   *
-   * @see {@link https://hono.dev/docs/api/request#raw}
-   *
-   * @example
-   * ```ts
-   * // For Cloudflare Workers
-   * app.post('/', async (c) => {
-   *   const metadata = c.req.raw.cf?.hostMetadata?
-   *   ...
-   * })
-   * ```
-   */
-  raw;
-  #validatedData;
-  // Short name of validatedData
-  #matchResult;
-  routeIndex = 0;
-  /**
-   * `.path` can get the pathname of the request.
-   *
-   * @see {@link https://hono.dev/docs/api/request#path}
-   *
-   * @example
-   * ```ts
-   * app.get('/about/me', (c) => {
-   *   const pathname = c.req.path // `/about/me`
-   * })
-   * ```
-   */
-  path;
-  bodyCache = {};
-  constructor(request, path = "/", matchResult = [[]]) {
-    this.raw = request;
-    this.path = path;
-    this.#matchResult = matchResult;
-    this.#validatedData = {};
-  }
-  param(key) {
-    return key ? this.#getDecodedParam(key) : this.#getAllDecodedParams();
-  }
-  #getDecodedParam(key) {
-    const paramKey = this.#matchResult[0][this.routeIndex][1][key];
-    const param = this.#getParamValue(paramKey);
-    return param && /\%/.test(param) ? tryDecodeURIComponent(param) : param;
-  }
-  #getAllDecodedParams() {
-    const decoded = {};
-    const keys = Object.keys(this.#matchResult[0][this.routeIndex][1]);
-    for (const key of keys) {
-      const value = this.#getParamValue(this.#matchResult[0][this.routeIndex][1][key]);
-      if (value !== void 0) {
-        decoded[key] = /\%/.test(value) ? tryDecodeURIComponent(value) : value;
-      }
-    }
-    return decoded;
-  }
-  #getParamValue(paramKey) {
-    return this.#matchResult[1] ? this.#matchResult[1][paramKey] : paramKey;
-  }
-  query(key) {
-    return getQueryParam(this.url, key);
-  }
-  queries(key) {
-    return getQueryParams(this.url, key);
-  }
-  header(name) {
-    if (name) {
-      return this.raw.headers.get(name) ?? void 0;
-    }
-    const headerData = {};
-    this.raw.headers.forEach((value, key) => {
-      headerData[key] = value;
-    });
-    return headerData;
-  }
-  async parseBody(options) {
-    return parseBody(this, options);
-  }
-  #cachedBody = (key) => {
-    const { bodyCache, raw } = this;
-    const cachedBody = bodyCache[key];
-    if (cachedBody) {
-      return cachedBody;
-    }
-    const anyCachedKey = Object.keys(bodyCache)[0];
-    if (anyCachedKey) {
-      return bodyCache[anyCachedKey].then((body) => {
-        if (anyCachedKey === "json") {
-          body = JSON.stringify(body);
-        }
-        return new Response(body)[key]();
-      });
-    }
-    return bodyCache[key] = raw[key]();
-  };
-  /**
-   * `.json()` can parse Request body of type `application/json`
-   *
-   * @see {@link https://hono.dev/docs/api/request#json}
-   *
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.json()
-   * })
-   * ```
-   */
-  json() {
-    return this.#cachedBody("text").then((text) => JSON.parse(text));
-  }
-  /**
-   * `.text()` can parse Request body of type `text/plain`
-   *
-   * @see {@link https://hono.dev/docs/api/request#text}
-   *
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.text()
-   * })
-   * ```
-   */
-  text() {
-    return this.#cachedBody("text");
-  }
-  /**
-   * `.arrayBuffer()` parse Request body as an `ArrayBuffer`
-   *
-   * @see {@link https://hono.dev/docs/api/request#arraybuffer}
-   *
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.arrayBuffer()
-   * })
-   * ```
-   */
-  arrayBuffer() {
-    return this.#cachedBody("arrayBuffer");
-  }
-  /**
-   * `.bytes()` parses the request body as a `Uint8Array`.
-   *
-   * @see {@link https://hono.dev/docs/api/request#bytes}
-   *
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.bytes()
-   * })
-   * ```
-   */
-  bytes() {
-    return this.#cachedBody("arrayBuffer").then((buffer) => new Uint8Array(buffer));
-  }
-  /**
-   * Parses the request body as a `Blob`.
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.blob();
-   * });
-   * ```
-   * @see https://hono.dev/docs/api/request#blob
-   */
-  blob() {
-    return this.#cachedBody("blob");
-  }
-  /**
-   * Parses the request body as `FormData`.
-   * @example
-   * ```ts
-   * app.post('/entry', async (c) => {
-   *   const body = await c.req.formData();
-   * });
-   * ```
-   * @see https://hono.dev/docs/api/request#formdata
-   */
-  formData() {
-    return this.#cachedBody("formData");
-  }
-  /**
-   * Adds validated data to the request.
-   *
-   * @param target - The target of the validation.
-   * @param data - The validated data to add.
-   */
-  addValidatedData(target, data) {
-    this.#validatedData[target] = data;
-  }
-  valid(target) {
-    return this.#validatedData[target];
-  }
-  /**
-   * `.url()` can get the request url strings.
-   *
-   * @see {@link https://hono.dev/docs/api/request#url}
-   *
-   * @example
-   * ```ts
-   * app.get('/about/me', (c) => {
-   *   const url = c.req.url // `http://localhost:8787/about/me`
-   *   ...
-   * })
-   * ```
-   */
-  get url() {
-    return this.raw.url;
-  }
-  /**
-   * `.method()` can get the method name of the request.
-   *
-   * @see {@link https://hono.dev/docs/api/request#method}
-   *
-   * @example
-   * ```ts
-   * app.get('/about/me', (c) => {
-   *   const method = c.req.method // `GET`
-   * })
-   * ```
-   */
-  get method() {
-    return this.raw.method;
-  }
-  get [GET_MATCH_RESULT]() {
-    return this.#matchResult;
-  }
-  /**
-   * `.matchedRoutes()` can return a matched route in the handler
-   *
-   * @deprecated
-   *
-   * Use matchedRoutes helper defined in "hono/route" instead.
-   *
-   * @see {@link https://hono.dev/docs/api/request#matchedroutes}
-   *
-   * @example
-   * ```ts
-   * app.use('*', async function logger(c, next) {
-   *   await next()
-   *   c.req.matchedRoutes.forEach(({ handler, method, path }, i) => {
-   *     const name = handler.name || (handler.length < 2 ? '[handler]' : '[middleware]')
-   *     console.log(
-   *       method,
-   *       ' ',
-   *       path,
-   *       ' '.repeat(Math.max(10 - path.length, 0)),
-   *       name,
-   *       i === c.req.routeIndex ? '<- respond from here' : ''
-   *     )
-   *   })
-   * })
-   * ```
-   */
-  get matchedRoutes() {
-    return this.#matchResult[0].map(([[, route]]) => route);
-  }
-  /**
-   * `routePath()` can retrieve the path registered within the handler
-   *
-   * @deprecated
-   *
-   * Use routePath helper defined in "hono/route" instead.
-   *
-   * @see {@link https://hono.dev/docs/api/request#routepath}
-   *
-   * @example
-   * ```ts
-   * app.get('/posts/:id', (c) => {
-   *   return c.json({ path: c.req.routePath })
-   * })
-   * ```
-   */
-  get routePath() {
-    return this.#matchResult[0].map(([[, route]]) => route)[this.routeIndex].path;
-  }
-};
-
-// src/context.ts
-var TEXT_PLAIN = "text/plain; charset=UTF-8";
-var setDefaultContentType = (contentType, headers) => {
-  return {
-    "Content-Type": contentType,
-    ...headers
-  };
-};
-var createResponseInstance = (body, init) => new Response(body, init);
-var Context = class {
-  #rawRequest;
-  #req;
-  /**
-   * `.env` can get bindings (environment variables, secrets, KV namespaces, D1 database, R2 bucket etc.) in Cloudflare Workers.
-   *
-   * @see {@link https://hono.dev/docs/api/context#env}
-   *
-   * @example
-   * ```ts
-   * // Environment object for Cloudflare Workers
-   * app.get('*', async c => {
-   *   const counter = c.env.COUNTER
-   * })
-   * ```
-   */
-  env = {};
-  #var;
-  finalized = false;
-  /**
-   * `.error` can get the error object from the middleware if the Handler throws an error.
-   *
-   * @see {@link https://hono.dev/docs/api/context#error}
-   *
-   * @example
-   * ```ts
-   * app.use('*', async (c, next) => {
-   *   await next()
-   *   if (c.error) {
-   *     // do something...
-   *   }
-   * })
-   * ```
-   */
-  error;
-  #status;
-  #executionCtx;
-  #res;
-  #layout;
-  #renderer;
-  #notFoundHandler;
-  #preparedHeaders;
-  #matchResult;
-  #path;
-  /**
-   * Creates an instance of the Context class.
-   *
-   * @param req - The Request object.
-   * @param options - Optional configuration options for the context.
-   */
-  constructor(req, options) {
-    this.#rawRequest = req;
-    if (options) {
-      this.#executionCtx = options.executionCtx;
-      this.env = options.env;
-      this.#notFoundHandler = options.notFoundHandler;
-      this.#path = options.path;
-      this.#matchResult = options.matchResult;
-    }
-  }
-  /**
-   * `.req` is the instance of {@link HonoRequest}.
-   */
-  get req() {
-    this.#req ??= new HonoRequest(this.#rawRequest, this.#path, this.#matchResult);
-    return this.#req;
-  }
-  /**
-   * @see {@link https://hono.dev/docs/api/context#event}
-   * The FetchEvent associated with the current request.
-   *
-   * @throws Will throw an error if the context does not have a FetchEvent.
-   */
-  get event() {
-    if (this.#executionCtx && "respondWith" in this.#executionCtx) {
-      return this.#executionCtx;
-    } else {
-      throw Error("This context has no FetchEvent");
-    }
-  }
-  /**
-   * @see {@link https://hono.dev/docs/api/context#executionctx}
-   * The ExecutionContext associated with the current request.
-   *
-   * @throws Will throw an error if the context does not have an ExecutionContext.
-   */
-  get executionCtx() {
-    if (this.#executionCtx) {
-      return this.#executionCtx;
-    } else {
-      throw Error("This context has no ExecutionContext");
-    }
-  }
-  /**
-   * @see {@link https://hono.dev/docs/api/context#res}
-   * The Response object for the current request.
-   */
-  get res() {
-    return this.#res ||= createResponseInstance(null, {
-      headers: this.#preparedHeaders ??= new Headers()
-    });
-  }
-  /**
-   * Sets the Response object for the current request.
-   *
-   * @param _res - The Response object to set.
-   */
-  set res(_res) {
-    if (this.#res && _res) {
-      _res = createResponseInstance(_res.body, _res);
-      for (const [k, v] of this.#res.headers.entries()) {
-        if (k === "content-type") {
-          continue;
-        }
-        if (k === "set-cookie") {
-          const cookies = this.#res.headers.getSetCookie();
-          _res.headers.delete("set-cookie");
-          for (const cookie of cookies) {
-            _res.headers.append("set-cookie", cookie);
-          }
-        } else {
-          _res.headers.set(k, v);
-        }
-      }
-    }
-    this.#res = _res;
-    this.finalized = true;
-  }
-  /**
-   * `.render()` can create a response within a layout.
-   *
-   * @see {@link https://hono.dev/docs/api/context#render-setrenderer}
-   *
-   * @example
-   * ```ts
-   * app.get('/', (c) => {
-   *   return c.render('Hello!')
-   * })
-   * ```
-   */
-  render = (...args) => {
-    this.#renderer ??= (content) => this.html(content);
-    return this.#renderer(...args);
-  };
-  /**
-   * Sets the layout for the response.
-   *
-   * @param layout - The layout to set.
-   * @returns The layout function.
-   */
-  setLayout = (layout) => this.#layout = layout;
-  /**
-   * Gets the current layout for the response.
-   *
-   * @returns The current layout function.
-   */
-  getLayout = () => this.#layout;
-  /**
-   * `.setRenderer()` can set the layout in the custom middleware.
-   *
-   * @see {@link https://hono.dev/docs/api/context#render-setrenderer}
-   *
-   * @example
-   * ```tsx
-   * app.use('*', async (c, next) => {
-   *   c.setRenderer((content) => {
-   *     return c.html(
-   *       <html>
-   *         <body>
-   *           <p>{content}</p>
-   *         </body>
-   *       </html>
-   *     )
-   *   })
-   *   await next()
-   * })
-   * ```
-   */
-  setRenderer = (renderer) => {
-    this.#renderer = renderer;
-  };
-  /**
-   * `.header()` can set headers.
-   *
-   * @see {@link https://hono.dev/docs/api/context#header}
-   *
-   * @example
-   * ```ts
-   * app.get('/welcome', (c) => {
-   *   // Set headers
-   *   c.header('X-Message', 'Hello!')
-   *   c.header('Content-Type', 'text/plain')
-   *
-   *   return c.body('Thank you for coming')
-   * })
-   * ```
-   */
-  header = (name, value, options) => {
-    if (this.finalized) {
-      this.#res = createResponseInstance(this.#res.body, this.#res);
-    }
-    const headers = this.#res ? this.#res.headers : this.#preparedHeaders ??= new Headers();
-    if (value === void 0) {
-      headers.delete(name);
-    } else if (options?.append) {
-      headers.append(name, value);
-    } else {
-      headers.set(name, value);
-    }
-  };
-  status = (status) => {
-    this.#status = status;
-  };
-  /**
-   * `.set()` can set the value specified by the key.
-   *
-   * @see {@link https://hono.dev/docs/api/context#set-get}
-   *
-   * @example
-   * ```ts
-   * app.use('*', async (c, next) => {
-   *   c.set('message', 'Hono is hot!!')
-   *   await next()
-   * })
-   * ```
-   */
-  set = (key, value) => {
-    this.#var ??= /* @__PURE__ */ new Map();
-    this.#var.set(key, value);
-  };
-  /**
-   * `.get()` can use the value specified by the key.
-   *
-   * @see {@link https://hono.dev/docs/api/context#set-get}
-   *
-   * @example
-   * ```ts
-   * app.get('/', (c) => {
-   *   const message = c.get('message')
-   *   return c.text(`The message is "${message}"`)
-   * })
-   * ```
-   */
-  get = (key) => {
-    return this.#var ? this.#var.get(key) : void 0;
-  };
-  /**
-   * `.var` can access the value of a variable.
-   *
-   * @see {@link https://hono.dev/docs/api/context#var}
-   *
-   * @example
-   * ```ts
-   * const result = c.var.client.oneMethod()
-   * ```
-   */
-  // c.var.propName is a read-only
-  get var() {
-    if (!this.#var) {
-      return {};
-    }
-    return Object.fromEntries(this.#var);
-  }
-  #newResponse(data, arg, headers) {
-    const responseHeaders = this.#res ? new Headers(this.#res.headers) : this.#preparedHeaders ?? new Headers();
-    if (typeof arg === "object" && "headers" in arg) {
-      const argHeaders = arg.headers instanceof Headers ? arg.headers : new Headers(arg.headers);
-      for (const [key, value] of argHeaders) {
-        if (key.toLowerCase() === "set-cookie") {
-          responseHeaders.append(key, value);
-        } else {
-          responseHeaders.set(key, value);
-        }
-      }
-    }
-    if (headers) {
-      for (const [k, v] of Object.entries(headers)) {
-        if (typeof v === "string") {
-          responseHeaders.set(k, v);
-        } else {
-          responseHeaders.delete(k);
-          for (const v2 of v) {
-            responseHeaders.append(k, v2);
-          }
-        }
-      }
-    }
-    const status = typeof arg === "number" ? arg : arg?.status ?? this.#status;
-    return createResponseInstance(data, { status, headers: responseHeaders });
-  }
-  newResponse = (...args) => this.#newResponse(...args);
-  /**
-   * `.body()` can return the HTTP response.
-   * You can set headers with `.header()` and set HTTP status code with `.status`.
-   * This can also be set in `.text()`, `.json()` and so on.
-   *
-   * @see {@link https://hono.dev/docs/api/context#body}
-   *
-   * @example
-   * ```ts
-   * app.get('/welcome', (c) => {
-   *   // Set headers
-   *   c.header('X-Message', 'Hello!')
-   *   c.header('Content-Type', 'text/plain')
-   *   // Set HTTP status code
-   *   c.status(201)
-   *
-   *   // Return the response body
-   *   return c.body('Thank you for coming')
-   * })
-   * ```
-   */
-  body = (data, arg, headers) => this.#newResponse(data, arg, headers);
-  /**
-   * `.text()` can render text as `Content-Type:text/plain`.
-   *
-   * @see {@link https://hono.dev/docs/api/context#text}
-   *
-   * @example
-   * ```ts
-   * app.get('/say', (c) => {
-   *   return c.text('Hello!')
-   * })
-   * ```
-   */
-  text = (text, arg, headers) => {
-    return !this.#preparedHeaders && !this.#status && !arg && !headers && !this.finalized ? new Response(text) : this.#newResponse(
-      text,
-      arg,
-      setDefaultContentType(TEXT_PLAIN, headers)
-    );
-  };
-  /**
-   * `.json()` can render JSON as `Content-Type:application/json`.
-   *
-   * @see {@link https://hono.dev/docs/api/context#json}
-   *
-   * @example
-   * ```ts
-   * app.get('/api', (c) => {
-   *   return c.json({ message: 'Hello!' })
-   * })
-   * ```
-   */
-  json = (object, arg, headers) => {
-    return this.#newResponse(
-      JSON.stringify(object),
-      arg,
-      setDefaultContentType("application/json", headers)
-    );
-  };
-  html = (html, arg, headers) => {
-    const res = (html2) => this.#newResponse(html2, arg, setDefaultContentType("text/html; charset=UTF-8", headers));
-    return typeof html === "object" ? resolveCallback(html, HtmlEscapedCallbackPhase.Stringify, false, {}).then(res) : res(html);
-  };
-  /**
-   * `.redirect()` can Redirect, default status code is 302.
-   *
-   * @see {@link https://hono.dev/docs/api/context#redirect}
-   *
-   * @example
-   * ```ts
-   * app.get('/redirect', (c) => {
-   *   return c.redirect('/')
-   * })
-   * app.get('/redirect-permanently', (c) => {
-   *   return c.redirect('/', 301)
-   * })
-   * ```
-   */
-  redirect = (location, status) => {
-    const locationString = String(location);
-    this.header(
-      "Location",
-      // Multibyes should be encoded
-      // eslint-disable-next-line no-control-regex
-      !/[^\x00-\xFF]/.test(locationString) ? locationString : encodeURI(locationString)
-    );
-    return this.newResponse(null, status ?? 302);
-  };
-  /**
-   * `.notFound()` can return the Not Found Response.
-   *
-   * @see {@link https://hono.dev/docs/api/context#notfound}
-   *
-   * @example
-   * ```ts
-   * app.get('/notfound', (c) => {
-   *   return c.notFound()
-   * })
-   * ```
-   */
-  notFound = () => {
-    this.#notFoundHandler ??= () => createResponseInstance();
-    return this.#notFoundHandler(this);
-  };
-};
-
-// src/router.ts
-var METHOD_NAME_ALL = "ALL";
-var METHOD_NAME_ALL_LOWERCASE = "all";
-var METHODS = ["get", "post", "put", "delete", "options", "patch"];
-var MESSAGE_MATCHER_IS_ALREADY_BUILT = "Can not add a route since the matcher is already built.";
-var UnsupportedPathError = class extends Error {
-};
-
-// src/utils/constants.ts
-var COMPOSED_HANDLER = "__COMPOSED_HANDLER";
-
-// src/hono-base.ts
-var notFoundHandler = (c) => {
-  return c.text("404 Not Found", 404);
-};
-var errorHandler$1 = (err, c) => {
-  if ("getResponse" in err) {
-    const res = err.getResponse();
-    return c.newResponse(res.body, res);
-  }
-  console.error(err);
-  return c.text("Internal Server Error", 500);
-};
-var Hono$1 = class _Hono {
-  get;
-  post;
-  put;
-  delete;
-  options;
-  patch;
-  all;
-  on;
-  use;
-  /*
-    This class is like an abstract class and does not have a router.
-    To use it, inherit the class and implement router in the constructor.
-  */
-  router;
-  getPath;
-  // Cannot use `#` because it requires visibility at JavaScript runtime.
-  _basePath = "/";
-  #path = "/";
-  routes = [];
-  constructor(options = {}) {
-    const allMethods = [...METHODS, METHOD_NAME_ALL_LOWERCASE];
-    allMethods.forEach((method) => {
-      this[method] = (args1, ...args) => {
-        if (typeof args1 === "string") {
-          this.#path = args1;
-        } else {
-          this.#addRoute(method, this.#path, args1);
-        }
-        args.forEach((handler) => {
-          this.#addRoute(method, this.#path, handler);
-        });
-        return this;
-      };
-    });
-    this.on = (method, path, ...handlers) => {
-      for (const p of [path].flat()) {
-        this.#path = p;
-        for (const m of [method].flat()) {
-          handlers.map((handler) => {
-            this.#addRoute(m.toUpperCase(), this.#path, handler);
-          });
-        }
-      }
-      return this;
-    };
-    this.use = (arg1, ...handlers) => {
-      if (typeof arg1 === "string") {
-        this.#path = arg1;
-      } else {
-        this.#path = "*";
-        handlers.unshift(arg1);
-      }
-      handlers.forEach((handler) => {
-        this.#addRoute(METHOD_NAME_ALL, this.#path, handler);
-      });
-      return this;
-    };
-    const { strict, ...optionsWithoutStrict } = options;
-    Object.assign(this, optionsWithoutStrict);
-    this.getPath = strict ?? true ? options.getPath ?? getPath : getPathNoStrict;
-  }
-  #clone() {
-    const clone = new _Hono({
-      router: this.router,
-      getPath: this.getPath
-    });
-    clone.errorHandler = this.errorHandler;
-    clone.#notFoundHandler = this.#notFoundHandler;
-    clone.routes = this.routes;
-    return clone;
-  }
-  #notFoundHandler = notFoundHandler;
-  // Cannot use `#` because it requires visibility at JavaScript runtime.
-  errorHandler = errorHandler$1;
-  /**
-   * `.route()` allows grouping other Hono instance in routes.
-   *
-   * @see {@link https://hono.dev/docs/api/routing#grouping}
-   *
-   * @param {string} path - base Path
-   * @param {Hono} app - other Hono instance
-   * @returns {Hono} routed Hono instance
-   *
-   * @example
-   * ```ts
-   * const app = new Hono()
-   * const app2 = new Hono()
-   *
-   * app2.get("/user", (c) => c.text("user"))
-   * app.route("/api", app2) // GET /api/user
-   * ```
-   */
-  route(path, app) {
-    const subApp = this.basePath(path);
-    app.routes.map((r) => {
-      let handler;
-      if (app.errorHandler === errorHandler$1) {
-        handler = r.handler;
-      } else {
-        handler = async (c, next) => (await compose([], app.errorHandler)(c, () => r.handler(c, next))).res;
-        handler[COMPOSED_HANDLER] = r.handler;
-      }
-      subApp.#addRoute(r.method, r.path, handler, r.basePath);
-    });
-    return this;
-  }
-  /**
-   * `.basePath()` allows base paths to be specified.
-   *
-   * @see {@link https://hono.dev/docs/api/routing#base-path}
-   *
-   * @param {string} path - base Path
-   * @returns {Hono} changed Hono instance
-   *
-   * @example
-   * ```ts
-   * const api = new Hono().basePath('/api')
-   * ```
-   */
-  basePath(path) {
-    const subApp = this.#clone();
-    subApp._basePath = mergePath(this._basePath, path);
-    return subApp;
-  }
-  /**
-   * `.onError()` handles an error and returns a customized Response.
-   *
-   * @see {@link https://hono.dev/docs/api/hono#error-handling}
-   *
-   * @param {ErrorHandler} handler - request Handler for error
-   * @returns {Hono} changed Hono instance
-   *
-   * @example
-   * ```ts
-   * app.onError((err, c) => {
-   *   console.error(`${err}`)
-   *   return c.text('Custom Error Message', 500)
-   * })
-   * ```
-   */
-  onError = (handler) => {
-    this.errorHandler = handler;
-    return this;
-  };
-  /**
-   * `.notFound()` allows you to customize a Not Found Response.
-   *
-   * @see {@link https://hono.dev/docs/api/hono#not-found}
-   *
-   * @param {NotFoundHandler} handler - request handler for not-found
-   * @returns {Hono} changed Hono instance
-   *
-   * @example
-   * ```ts
-   * app.notFound((c) => {
-   *   return c.text('Custom 404 Message', 404)
-   * })
-   * ```
-   */
-  notFound = (handler) => {
-    this.#notFoundHandler = handler;
-    return this;
-  };
-  /**
-   * `.mount()` allows you to mount applications built with other frameworks into your Hono application.
-   *
-   * @see {@link https://hono.dev/docs/api/hono#mount}
-   *
-   * @param {string} path - base Path
-   * @param {Function} applicationHandler - other Request Handler
-   * @param {MountOptions} [options] - options of `.mount()`
-   * @returns {Hono} mounted Hono instance
-   *
-   * @example
-   * ```ts
-   * import { Router as IttyRouter } from 'itty-router'
-   * import { Hono } from 'hono'
-   * // Create itty-router application
-   * const ittyRouter = IttyRouter()
-   * // GET /itty-router/hello
-   * ittyRouter.get('/hello', () => new Response('Hello from itty-router'))
-   *
-   * const app = new Hono()
-   * app.mount('/itty-router', ittyRouter.handle)
-   * ```
-   *
-   * @example
-   * ```ts
-   * const app = new Hono()
-   * // Send the request to another application without modification.
-   * app.mount('/app', anotherApp, {
-   *   replaceRequest: (req) => req,
-   * })
-   * ```
-   */
-  mount(path, applicationHandler, options) {
-    let replaceRequest;
-    let optionHandler;
-    if (options) {
-      if (typeof options === "function") {
-        optionHandler = options;
-      } else {
-        optionHandler = options.optionHandler;
-        if (options.replaceRequest === false) {
-          replaceRequest = (request) => request;
-        } else {
-          replaceRequest = options.replaceRequest;
-        }
-      }
-    }
-    const getOptions = optionHandler ? (c) => {
-      const options2 = optionHandler(c);
-      return Array.isArray(options2) ? options2 : [options2];
-    } : (c) => {
-      let executionContext = void 0;
-      try {
-        executionContext = c.executionCtx;
-      } catch {
-      }
-      return [c.env, executionContext];
-    };
-    replaceRequest ||= (() => {
-      const mergedPath = mergePath(this._basePath, path);
-      const pathPrefixLength = mergedPath === "/" ? 0 : mergedPath.length;
-      return (request) => {
-        const url = new URL(request.url);
-        url.pathname = this.getPath(request).slice(pathPrefixLength) || "/";
-        return new Request(url, request);
-      };
-    })();
-    const handler = async (c, next) => {
-      const res = await applicationHandler(replaceRequest(c.req.raw), ...getOptions(c));
-      if (res) {
-        return res;
-      }
-      await next();
-    };
-    this.#addRoute(METHOD_NAME_ALL, mergePath(path, "*"), handler);
-    return this;
-  }
-  #addRoute(method, path, handler, baseRoutePath) {
-    method = method.toUpperCase();
-    path = mergePath(this._basePath, path);
-    const r = {
-      basePath: baseRoutePath !== void 0 ? mergePath(this._basePath, baseRoutePath) : this._basePath,
-      path,
-      method,
-      handler
-    };
-    this.router.add(method, path, [handler, r]);
-    this.routes.push(r);
-  }
-  #handleError(err, c) {
-    if (err instanceof Error) {
-      return this.errorHandler(err, c);
-    }
-    throw err;
-  }
-  #dispatch(request, executionCtx, env, method) {
-    if (method === "HEAD") {
-      return (async () => new Response(null, await this.#dispatch(request, executionCtx, env, "GET")))();
-    }
-    const path = this.getPath(request, { env });
-    const matchResult = this.router.match(method, path);
-    const c = new Context(request, {
-      path,
-      matchResult,
-      env,
-      executionCtx,
-      notFoundHandler: this.#notFoundHandler
-    });
-    if (matchResult[0].length === 1) {
-      let res;
-      try {
-        res = matchResult[0][0][0][0](c, async () => {
-          c.res = await this.#notFoundHandler(c);
-        });
-      } catch (err) {
-        return this.#handleError(err, c);
-      }
-      return res instanceof Promise ? res.then(
-        (resolved) => resolved || (c.finalized ? c.res : this.#notFoundHandler(c))
-      ).catch((err) => this.#handleError(err, c)) : res ?? this.#notFoundHandler(c);
-    }
-    const composed = compose(matchResult[0], this.errorHandler, this.#notFoundHandler);
-    return (async () => {
-      try {
-        const context = await composed(c);
-        if (!context.finalized) {
-          throw new Error(
-            "Context is not finalized. Did you forget to return a Response object or `await next()`?"
-          );
-        }
-        return context.res;
-      } catch (err) {
-        return this.#handleError(err, c);
-      }
-    })();
-  }
-  /**
-   * `.fetch()` will be entry point of your app.
-   *
-   * @see {@link https://hono.dev/docs/api/hono#fetch}
-   *
-   * @param {Request} request - request Object of request
-   * @param {Env} Env - env Object
-   * @param {ExecutionContext} - context of execution
-   * @returns {Response | Promise<Response>} response of request
-   *
-   */
-  fetch = (request, ...rest) => {
-    return this.#dispatch(request, rest[1], rest[0], request.method);
-  };
-  /**
-   * `.request()` is a useful method for testing.
-   * You can pass a URL or pathname to send a GET request.
-   * app will return a Response object.
-   * ```ts
-   * test('GET /hello is ok', async () => {
-   *   const res = await app.request('/hello')
-   *   expect(res.status).toBe(200)
-   * })
-   * ```
-   * @see https://hono.dev/docs/api/hono#request
-   */
-  request = (input, requestInit, Env, executionCtx) => {
-    if (input instanceof Request) {
-      return this.fetch(requestInit ? new Request(input, requestInit) : input, Env, executionCtx);
-    }
-    input = input.toString();
-    return this.fetch(
-      new Request(
-        /^https?:\/\//.test(input) ? input : `http://localhost${mergePath("/", input)}`,
-        requestInit
-      ),
-      Env,
-      executionCtx
-    );
-  };
-  /**
-   * `.fire()` automatically adds a global fetch event listener.
-   * This can be useful for environments that adhere to the Service Worker API, such as non-ES module Cloudflare Workers.
-   * @deprecated
-   * Use `fire` from `hono/service-worker` instead.
-   * ```ts
-   * import { Hono } from 'hono'
-   * import { fire } from 'hono/service-worker'
-   *
-   * const app = new Hono()
-   * // ...
-   * fire(app)
-   * ```
-   * @see https://hono.dev/docs/api/hono#fire
-   * @see https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API
-   * @see https://developers.cloudflare.com/workers/reference/migrate-to-module-workers/
-   */
-  fire = () => {
-    addEventListener("fetch", (event) => {
-      event.respondWith(this.#dispatch(event.request, event, void 0, event.request.method));
-    });
-  };
-};
-
-// src/router/reg-exp-router/matcher.ts
-var emptyParam = [];
-function match(method, path) {
-  const matchers = this.buildAllMatchers();
-  const match2 = ((method2, path2) => {
-    const matcher = matchers[method2] || matchers[METHOD_NAME_ALL];
-    const staticMatch = matcher[2][path2];
-    if (staticMatch) {
-      return staticMatch;
-    }
-    const match3 = path2.match(matcher[0]);
-    if (!match3) {
-      return [[], emptyParam];
-    }
-    const index = match3.indexOf("", 1);
-    return [matcher[1][index], match3];
-  });
-  this.match = match2;
-  return match2(method, path);
-}
-
-// src/router/reg-exp-router/node.ts
-var LABEL_REG_EXP_STR = "[^/]+";
-var ONLY_WILDCARD_REG_EXP_STR = ".*";
-var TAIL_WILDCARD_REG_EXP_STR = "(?:|/.*)";
-var PATH_ERROR = /* @__PURE__ */ Symbol();
-var regExpMetaChars = new Set(".\\+*[^]$()");
-function compareKey(a, b) {
-  if (a.length === 1) {
-    return b.length === 1 ? a < b ? -1 : 1 : -1;
-  }
-  if (b.length === 1) {
-    return 1;
-  }
-  if (a === ONLY_WILDCARD_REG_EXP_STR || a === TAIL_WILDCARD_REG_EXP_STR) {
-    return 1;
-  } else if (b === ONLY_WILDCARD_REG_EXP_STR || b === TAIL_WILDCARD_REG_EXP_STR) {
-    return -1;
-  }
-  if (a === LABEL_REG_EXP_STR) {
-    return 1;
-  } else if (b === LABEL_REG_EXP_STR) {
-    return -1;
-  }
-  return a.length === b.length ? a < b ? -1 : 1 : b.length - a.length;
-}
-var Node$1 = class _Node {
-  #index;
-  #varIndex;
-  #children = /* @__PURE__ */ Object.create(null);
-  insert(tokens, index, paramMap, context, pathErrorCheckOnly) {
-    if (tokens.length === 0) {
-      if (this.#index !== void 0) {
-        throw PATH_ERROR;
-      }
-      if (pathErrorCheckOnly) {
-        return;
-      }
-      this.#index = index;
-      return;
-    }
-    const [token, ...restTokens] = tokens;
-    const pattern = token === "*" ? restTokens.length === 0 ? ["", "", ONLY_WILDCARD_REG_EXP_STR] : ["", "", LABEL_REG_EXP_STR] : token === "/*" ? ["", "", TAIL_WILDCARD_REG_EXP_STR] : token.match(/^\:([^\{\}]+)(?:\{(.+)\})?$/);
-    let node;
-    if (pattern) {
-      const name = pattern[1];
-      let regexpStr = pattern[2] || LABEL_REG_EXP_STR;
-      if (name && pattern[2]) {
-        if (regexpStr === ".*") {
-          throw PATH_ERROR;
-        }
-        regexpStr = regexpStr.replace(/^\((?!\?:)(?=[^)]+\)$)/, "(?:");
-        if (/\((?!\?:)/.test(regexpStr)) {
-          throw PATH_ERROR;
-        }
-      }
-      node = this.#children[regexpStr];
-      if (!node) {
-        if (Object.keys(this.#children).some(
-          (k) => k !== ONLY_WILDCARD_REG_EXP_STR && k !== TAIL_WILDCARD_REG_EXP_STR
-        )) {
-          throw PATH_ERROR;
-        }
-        if (pathErrorCheckOnly) {
-          return;
-        }
-        node = this.#children[regexpStr] = new _Node();
-        if (name !== "") {
-          node.#varIndex = context.varIndex++;
-        }
-      }
-      if (!pathErrorCheckOnly && name !== "") {
-        paramMap.push([name, node.#varIndex]);
-      }
-    } else {
-      node = this.#children[token];
-      if (!node) {
-        if (Object.keys(this.#children).some(
-          (k) => k.length > 1 && k !== ONLY_WILDCARD_REG_EXP_STR && k !== TAIL_WILDCARD_REG_EXP_STR
-        )) {
-          throw PATH_ERROR;
-        }
-        if (pathErrorCheckOnly) {
-          return;
-        }
-        node = this.#children[token] = new _Node();
-      }
-    }
-    node.insert(restTokens, index, paramMap, context, pathErrorCheckOnly);
-  }
-  buildRegExpStr() {
-    const childKeys = Object.keys(this.#children).sort(compareKey);
-    const strList = childKeys.map((k) => {
-      const c = this.#children[k];
-      return (typeof c.#varIndex === "number" ? `(${k})@${c.#varIndex}` : regExpMetaChars.has(k) ? `\\${k}` : k) + c.buildRegExpStr();
-    });
-    if (typeof this.#index === "number") {
-      strList.unshift(`#${this.#index}`);
-    }
-    if (strList.length === 0) {
-      return "";
-    }
-    if (strList.length === 1) {
-      return strList[0];
-    }
-    return "(?:" + strList.join("|") + ")";
-  }
-};
-
-// src/router/reg-exp-router/trie.ts
-var Trie = class {
-  #context = { varIndex: 0 };
-  #root = new Node$1();
-  insert(path, index, pathErrorCheckOnly) {
-    const paramAssoc = [];
-    const groups = [];
-    for (let i = 0; ; ) {
-      let replaced = false;
-      path = path.replace(/\{[^}]+\}/g, (m) => {
-        const mark = `@\\${i}`;
-        groups[i] = [mark, m];
-        i++;
-        replaced = true;
-        return mark;
-      });
-      if (!replaced) {
-        break;
-      }
-    }
-    const tokens = path.match(/(?::[^\/]+)|(?:\/\*$)|./g) || [];
-    for (let i = groups.length - 1; i >= 0; i--) {
-      const [mark] = groups[i];
-      for (let j = tokens.length - 1; j >= 0; j--) {
-        if (tokens[j].indexOf(mark) !== -1) {
-          tokens[j] = tokens[j].replace(mark, groups[i][1]);
-          break;
-        }
-      }
-    }
-    this.#root.insert(tokens, index, paramAssoc, this.#context, pathErrorCheckOnly);
-    return paramAssoc;
-  }
-  buildRegExp() {
-    let regexp = this.#root.buildRegExpStr();
-    if (regexp === "") {
-      return [/^$/, [], []];
-    }
-    let captureIndex = 0;
-    const indexReplacementMap = [];
-    const paramReplacementMap = [];
-    regexp = regexp.replace(/#(\d+)|@(\d+)|\.\*\$/g, (_, handlerIndex, paramIndex) => {
-      if (handlerIndex !== void 0) {
-        indexReplacementMap[++captureIndex] = Number(handlerIndex);
-        return "$()";
-      }
-      if (paramIndex !== void 0) {
-        paramReplacementMap[Number(paramIndex)] = ++captureIndex;
-        return "";
-      }
-      return "";
-    });
-    return [new RegExp(`^${regexp}`), indexReplacementMap, paramReplacementMap];
-  }
-};
-
-// src/router/reg-exp-router/router.ts
-var nullMatcher = [/^$/, [], /* @__PURE__ */ Object.create(null)];
-var wildcardRegExpCache = /* @__PURE__ */ Object.create(null);
-function buildWildcardRegExp(path) {
-  return wildcardRegExpCache[path] ??= new RegExp(
-    path === "*" ? "" : `^${path.replace(
-      /\/\*$|([.\\+*[^\]$()])/g,
-      (_, metaChar) => metaChar ? `\\${metaChar}` : "(?:|/.*)"
-    )}$`
-  );
-}
-function clearWildcardRegExpCache() {
-  wildcardRegExpCache = /* @__PURE__ */ Object.create(null);
-}
-function buildMatcherFromPreprocessedRoutes(routes) {
-  const trie = new Trie();
-  const handlerData = [];
-  if (routes.length === 0) {
-    return nullMatcher;
-  }
-  const routesWithStaticPathFlag = routes.map(
-    (route) => [!/\*|\/:/.test(route[0]), ...route]
-  ).sort(
-    ([isStaticA, pathA], [isStaticB, pathB]) => isStaticA ? 1 : isStaticB ? -1 : pathA.length - pathB.length
-  );
-  const staticMap = /* @__PURE__ */ Object.create(null);
-  for (let i = 0, j = -1, len = routesWithStaticPathFlag.length; i < len; i++) {
-    const [pathErrorCheckOnly, path, handlers] = routesWithStaticPathFlag[i];
-    if (pathErrorCheckOnly) {
-      staticMap[path] = [handlers.map(([h]) => [h, /* @__PURE__ */ Object.create(null)]), emptyParam];
-    } else {
-      j++;
-    }
-    let paramAssoc;
-    try {
-      paramAssoc = trie.insert(path, j, pathErrorCheckOnly);
-    } catch (e) {
-      throw e === PATH_ERROR ? new UnsupportedPathError(path) : e;
-    }
-    if (pathErrorCheckOnly) {
-      continue;
-    }
-    handlerData[j] = handlers.map(([h, paramCount]) => {
-      const paramIndexMap = /* @__PURE__ */ Object.create(null);
-      paramCount -= 1;
-      for (; paramCount >= 0; paramCount--) {
-        const [key, value] = paramAssoc[paramCount];
-        paramIndexMap[key] = value;
-      }
-      return [h, paramIndexMap];
-    });
-  }
-  const [regexp, indexReplacementMap, paramReplacementMap] = trie.buildRegExp();
-  for (let i = 0, len = handlerData.length; i < len; i++) {
-    for (let j = 0, len2 = handlerData[i].length; j < len2; j++) {
-      const map = handlerData[i][j]?.[1];
-      if (!map) {
-        continue;
-      }
-      const keys = Object.keys(map);
-      for (let k = 0, len3 = keys.length; k < len3; k++) {
-        map[keys[k]] = paramReplacementMap[map[keys[k]]];
-      }
-    }
-  }
-  const handlerMap = [];
-  for (const i in indexReplacementMap) {
-    handlerMap[i] = handlerData[indexReplacementMap[i]];
-  }
-  return [regexp, handlerMap, staticMap];
-}
-function findMiddleware(middleware, path) {
-  if (!middleware) {
-    return void 0;
-  }
-  for (const k of Object.keys(middleware).sort((a, b) => b.length - a.length)) {
-    if (buildWildcardRegExp(k).test(path)) {
-      return [...middleware[k]];
-    }
-  }
-  return void 0;
-}
-var RegExpRouter = class {
-  name = "RegExpRouter";
-  #middleware;
-  #routes;
-  constructor() {
-    this.#middleware = { [METHOD_NAME_ALL]: /* @__PURE__ */ Object.create(null) };
-    this.#routes = { [METHOD_NAME_ALL]: /* @__PURE__ */ Object.create(null) };
-  }
-  add(method, path, handler) {
-    const middleware = this.#middleware;
-    const routes = this.#routes;
-    if (!middleware || !routes) {
-      throw new Error(MESSAGE_MATCHER_IS_ALREADY_BUILT);
-    }
-    if (!middleware[method]) {
-      [middleware, routes].forEach((handlerMap) => {
-        handlerMap[method] = /* @__PURE__ */ Object.create(null);
-        Object.keys(handlerMap[METHOD_NAME_ALL]).forEach((p) => {
-          handlerMap[method][p] = [...handlerMap[METHOD_NAME_ALL][p]];
-        });
-      });
-    }
-    if (path === "/*") {
-      path = "*";
-    }
-    const paramCount = (path.match(/\/:/g) || []).length;
-    if (/\*$/.test(path)) {
-      const re = buildWildcardRegExp(path);
-      if (method === METHOD_NAME_ALL) {
-        Object.keys(middleware).forEach((m) => {
-          middleware[m][path] ||= findMiddleware(middleware[m], path) || findMiddleware(middleware[METHOD_NAME_ALL], path) || [];
-        });
-      } else {
-        middleware[method][path] ||= findMiddleware(middleware[method], path) || findMiddleware(middleware[METHOD_NAME_ALL], path) || [];
-      }
-      Object.keys(middleware).forEach((m) => {
-        if (method === METHOD_NAME_ALL || method === m) {
-          Object.keys(middleware[m]).forEach((p) => {
-            re.test(p) && middleware[m][p].push([handler, paramCount]);
-          });
-        }
-      });
-      Object.keys(routes).forEach((m) => {
-        if (method === METHOD_NAME_ALL || method === m) {
-          Object.keys(routes[m]).forEach(
-            (p) => re.test(p) && routes[m][p].push([handler, paramCount])
-          );
-        }
-      });
-      return;
-    }
-    const paths = checkOptionalParameter(path) || [path];
-    for (let i = 0, len = paths.length; i < len; i++) {
-      const path2 = paths[i];
-      Object.keys(routes).forEach((m) => {
-        if (method === METHOD_NAME_ALL || method === m) {
-          routes[m][path2] ||= [
-            ...findMiddleware(middleware[m], path2) || findMiddleware(middleware[METHOD_NAME_ALL], path2) || []
-          ];
-          routes[m][path2].push([handler, paramCount - len + i + 1]);
-        }
-      });
-    }
-  }
-  match = match;
-  buildAllMatchers() {
-    const matchers = /* @__PURE__ */ Object.create(null);
-    Object.keys(this.#routes).concat(Object.keys(this.#middleware)).forEach((method) => {
-      matchers[method] ||= this.#buildMatcher(method);
-    });
-    this.#middleware = this.#routes = void 0;
-    clearWildcardRegExpCache();
-    return matchers;
-  }
-  #buildMatcher(method) {
-    const routes = [];
-    let hasOwnRoute = method === METHOD_NAME_ALL;
-    [this.#middleware, this.#routes].forEach((r) => {
-      const ownRoute = r[method] ? Object.keys(r[method]).map((path) => [path, r[method][path]]) : [];
-      if (ownRoute.length !== 0) {
-        hasOwnRoute ||= true;
-        routes.push(...ownRoute);
-      } else if (method !== METHOD_NAME_ALL) {
-        routes.push(
-          ...Object.keys(r[METHOD_NAME_ALL]).map((path) => [path, r[METHOD_NAME_ALL][path]])
-        );
-      }
-    });
-    if (!hasOwnRoute) {
-      return null;
-    } else {
-      return buildMatcherFromPreprocessedRoutes(routes);
-    }
-  }
-};
-
-// src/router/smart-router/router.ts
-var SmartRouter = class {
-  name = "SmartRouter";
-  #routers = [];
-  #routes = [];
-  constructor(init) {
-    this.#routers = init.routers;
-  }
-  add(method, path, handler) {
-    if (!this.#routes) {
-      throw new Error(MESSAGE_MATCHER_IS_ALREADY_BUILT);
-    }
-    this.#routes.push([method, path, handler]);
-  }
-  match(method, path) {
-    if (!this.#routes) {
-      throw new Error("Fatal error");
-    }
-    const routers = this.#routers;
-    const routes = this.#routes;
-    const len = routers.length;
-    let i = 0;
-    let res;
-    for (; i < len; i++) {
-      const router = routers[i];
-      try {
-        for (let i2 = 0, len2 = routes.length; i2 < len2; i2++) {
-          router.add(...routes[i2]);
-        }
-        res = router.match(method, path);
-      } catch (e) {
-        if (e instanceof UnsupportedPathError) {
-          continue;
-        }
-        throw e;
-      }
-      this.match = router.match.bind(router);
-      this.#routers = [router];
-      this.#routes = void 0;
-      break;
-    }
-    if (i === len) {
-      throw new Error("Fatal error");
-    }
-    this.name = `SmartRouter + ${this.activeRouter.name}`;
-    return res;
-  }
-  get activeRouter() {
-    if (this.#routes || this.#routers.length !== 1) {
-      throw new Error("No active router has been determined yet.");
-    }
-    return this.#routers[0];
-  }
-};
-
-// src/router/trie-router/node.ts
-var emptyParams = /* @__PURE__ */ Object.create(null);
-var hasChildren = (children) => {
-  for (const _ in children) {
-    return true;
-  }
-  return false;
-};
-var Node = class _Node {
-  #methods;
-  #children;
-  #patterns;
-  #order = 0;
-  #params = emptyParams;
-  constructor(method, handler, children) {
-    this.#children = children || /* @__PURE__ */ Object.create(null);
-    this.#methods = [];
-    if (method && handler) {
-      const m = /* @__PURE__ */ Object.create(null);
-      m[method] = { handler, possibleKeys: [], score: 0 };
-      this.#methods = [m];
-    }
-    this.#patterns = [];
-  }
-  insert(method, path, handler) {
-    this.#order = ++this.#order;
-    let curNode = this;
-    const parts = splitRoutingPath(path);
-    const possibleKeys = [];
-    for (let i = 0, len = parts.length; i < len; i++) {
-      const p = parts[i];
-      const nextP = parts[i + 1];
-      const pattern = getPattern(p, nextP);
-      const key = Array.isArray(pattern) ? pattern[0] : p;
-      if (key in curNode.#children) {
-        curNode = curNode.#children[key];
-        if (pattern) {
-          possibleKeys.push(pattern[1]);
-        }
-        continue;
-      }
-      curNode.#children[key] = new _Node();
-      if (pattern) {
-        curNode.#patterns.push(pattern);
-        possibleKeys.push(pattern[1]);
-      }
-      curNode = curNode.#children[key];
-    }
-    curNode.#methods.push({
-      [method]: {
-        handler,
-        possibleKeys: possibleKeys.filter((v, i, a) => a.indexOf(v) === i),
-        score: this.#order
-      }
-    });
-    return curNode;
-  }
-  #pushHandlerSets(handlerSets, node, method, nodeParams, params) {
-    for (let i = 0, len = node.#methods.length; i < len; i++) {
-      const m = node.#methods[i];
-      const handlerSet = m[method] || m[METHOD_NAME_ALL];
-      const processedSet = {};
-      if (handlerSet !== void 0) {
-        handlerSet.params = /* @__PURE__ */ Object.create(null);
-        handlerSets.push(handlerSet);
-        if (nodeParams !== emptyParams || params && params !== emptyParams) {
-          for (let i2 = 0, len2 = handlerSet.possibleKeys.length; i2 < len2; i2++) {
-            const key = handlerSet.possibleKeys[i2];
-            const processed = processedSet[handlerSet.score];
-            handlerSet.params[key] = params?.[key] && !processed ? params[key] : nodeParams[key] ?? params?.[key];
-            processedSet[handlerSet.score] = true;
-          }
-        }
-      }
-    }
-  }
-  search(method, path) {
-    const handlerSets = [];
-    this.#params = emptyParams;
-    const curNode = this;
-    let curNodes = [curNode];
-    const parts = splitPath(path);
-    const curNodesQueue = [];
-    const len = parts.length;
-    let partOffsets = null;
-    for (let i = 0; i < len; i++) {
-      const part = parts[i];
-      const isLast = i === len - 1;
-      const tempNodes = [];
-      for (let j = 0, len2 = curNodes.length; j < len2; j++) {
-        const node = curNodes[j];
-        const nextNode = node.#children[part];
-        if (nextNode) {
-          nextNode.#params = node.#params;
-          if (isLast) {
-            if (nextNode.#children["*"]) {
-              this.#pushHandlerSets(handlerSets, nextNode.#children["*"], method, node.#params);
-            }
-            this.#pushHandlerSets(handlerSets, nextNode, method, node.#params);
-          } else {
-            tempNodes.push(nextNode);
-          }
-        }
-        for (let k = 0, len3 = node.#patterns.length; k < len3; k++) {
-          const pattern = node.#patterns[k];
-          const params = node.#params === emptyParams ? {} : { ...node.#params };
-          if (pattern === "*") {
-            const astNode = node.#children["*"];
-            if (astNode) {
-              this.#pushHandlerSets(handlerSets, astNode, method, node.#params);
-              astNode.#params = params;
-              tempNodes.push(astNode);
-            }
-            continue;
-          }
-          const [key, name, matcher] = pattern;
-          if (!part && !(matcher instanceof RegExp)) {
-            continue;
-          }
-          const child = node.#children[key];
-          if (matcher instanceof RegExp) {
-            if (partOffsets === null) {
-              partOffsets = new Array(len);
-              let offset = path[0] === "/" ? 1 : 0;
-              for (let p = 0; p < len; p++) {
-                partOffsets[p] = offset;
-                offset += parts[p].length + 1;
-              }
-            }
-            const restPathString = path.substring(partOffsets[i]);
-            const m = matcher.exec(restPathString);
-            if (m) {
-              params[name] = m[0];
-              this.#pushHandlerSets(handlerSets, child, method, node.#params, params);
-              if (hasChildren(child.#children)) {
-                child.#params = params;
-                const componentCount = m[0].match(/\//)?.length ?? 0;
-                const targetCurNodes = curNodesQueue[componentCount] ||= [];
-                targetCurNodes.push(child);
-              }
-              continue;
-            }
-          }
-          if (matcher === true || matcher.test(part)) {
-            params[name] = part;
-            if (isLast) {
-              this.#pushHandlerSets(handlerSets, child, method, params, node.#params);
-              if (child.#children["*"]) {
-                this.#pushHandlerSets(
-                  handlerSets,
-                  child.#children["*"],
-                  method,
-                  params,
-                  node.#params
-                );
-              }
-            } else {
-              child.#params = params;
-              tempNodes.push(child);
-            }
-          }
-        }
-      }
-      const shifted = curNodesQueue.shift();
-      curNodes = shifted ? tempNodes.concat(shifted) : tempNodes;
-    }
-    if (handlerSets.length > 1) {
-      handlerSets.sort((a, b) => {
-        return a.score - b.score;
-      });
-    }
-    return [handlerSets.map(({ handler, params }) => [handler, params])];
-  }
-};
-
-// src/router/trie-router/router.ts
-var TrieRouter = class {
-  name = "TrieRouter";
-  #node;
-  constructor() {
-    this.#node = new Node();
-  }
-  add(method, path, handler) {
-    const results = checkOptionalParameter(path);
-    if (results) {
-      for (let i = 0, len = results.length; i < len; i++) {
-        this.#node.insert(method, results[i], handler);
-      }
-      return;
-    }
-    this.#node.insert(method, path, handler);
-  }
-  match(method, path) {
-    return this.#node.search(method, path);
-  }
-};
-
-// src/hono.ts
-var Hono = class extends Hono$1 {
-  /**
-   * Creates an instance of the Hono class.
-   *
-   * @param options - Optional configuration options for the Hono instance.
-   */
-  constructor(options = {}) {
-    super(options);
-    this.router = options.router ?? new SmartRouter({
-      routers: [new RegExpRouter(), new TrieRouter()]
-    });
-  }
-};
-
 // src/server/server-adapter/routes/fga-manifest.ts
 function isProtectedFGARoute(route) {
   return route.requiresAuth !== false;
@@ -47412,7 +44939,7 @@ function unwrapOptionalNullable(schema) {
   return inner;
 }
 function parseComplexQueryParams(queryParamSchema, params) {
-  if (!(queryParamSchema instanceof z$1.ZodObject)) {
+  if (!(queryParamSchema instanceof z.ZodObject)) {
     return params;
   }
   const parsedParams = { ...params };
@@ -48146,175 +45673,6 @@ function getFGAResourcePermissionSlug(resourceType) {
   return resourcePermissionSlugs[resourceType] ?? resourceType;
 }
 
-// src/middleware/body-limit/index.ts
-var ERROR_MESSAGE = "Payload Too Large";
-var bodyLimit = (options) => {
-  const onError = options.onError || (() => {
-    const res = new Response(ERROR_MESSAGE, {
-      status: 413
-    });
-    throw new HTTPException(413, { res });
-  });
-  const maxSize = options.maxSize;
-  return async function bodyLimit2(c, next) {
-    if (!c.req.raw.body) {
-      return next();
-    }
-    const hasTransferEncoding = c.req.raw.headers.has("transfer-encoding");
-    const hasContentLength = c.req.raw.headers.has("content-length");
-    if (hasContentLength && !hasTransferEncoding) {
-      const contentLength = parseInt(c.req.raw.headers.get("content-length") || "0", 10);
-      return contentLength > maxSize ? onError(c) : next();
-    }
-    let size = 0;
-    const chunks = [];
-    const rawReader = c.req.raw.body.getReader();
-    for (; ; ) {
-      const { done, value } = await rawReader.read();
-      if (done) {
-        break;
-      }
-      size += value.length;
-      if (size > maxSize) {
-        return onError(c);
-      }
-      chunks.push(value);
-    }
-    const requestInit = {
-      body: new ReadableStream({
-        start(controller) {
-          for (const chunk of chunks) {
-            controller.enqueue(chunk);
-          }
-          controller.close();
-        }
-      }),
-      duplex: "half"
-    };
-    c.req.raw = new Request(c.req.raw, requestInit);
-    return next();
-  };
-};
-
-// src/utils/stream.ts
-var StreamingApi = class {
-  writer;
-  encoder;
-  writable;
-  abortSubscribers = [];
-  responseReadable;
-  /**
-   * Whether the stream has been aborted.
-   */
-  aborted = false;
-  /**
-   * Whether the stream has been closed normally.
-   */
-  closed = false;
-  constructor(writable, _readable) {
-    this.writable = writable;
-    this.writer = writable.getWriter();
-    this.encoder = new TextEncoder();
-    const reader = _readable.getReader();
-    this.abortSubscribers.push(async () => {
-      await reader.cancel();
-    });
-    this.responseReadable = new ReadableStream({
-      async pull(controller) {
-        const { done, value } = await reader.read();
-        done ? controller.close() : controller.enqueue(value);
-      },
-      cancel: () => {
-        if (!this.closed) {
-          this.abort();
-        }
-      }
-    });
-  }
-  async write(input) {
-    try {
-      if (typeof input === "string") {
-        input = this.encoder.encode(input);
-      }
-      await this.writer.write(input);
-    } catch {
-    }
-    return this;
-  }
-  async writeln(input) {
-    await this.write(input + "\n");
-    return this;
-  }
-  sleep(ms) {
-    return new Promise((res) => setTimeout(res, ms));
-  }
-  async close() {
-    this.closed = true;
-    try {
-      await this.writer.close();
-    } catch {
-    }
-  }
-  async pipe(body) {
-    this.writer.releaseLock();
-    await body.pipeTo(this.writable, { preventClose: true });
-    this.writer = this.writable.getWriter();
-  }
-  onAbort(listener) {
-    this.abortSubscribers.push(listener);
-  }
-  /**
-   * Abort the stream.
-   * You can call this method when stream is aborted by external event.
-   */
-  abort() {
-    if (!this.aborted) {
-      this.aborted = true;
-      this.abortSubscribers.forEach((subscriber) => subscriber());
-    }
-  }
-};
-
-// src/helper/streaming/utils.ts
-var isOldBunVersion = () => {
-  const version = typeof Bun !== "undefined" ? Bun.version : void 0;
-  if (version === void 0) {
-    return false;
-  }
-  const result = version.startsWith("1.1") || version.startsWith("1.0") || version.startsWith("0.");
-  isOldBunVersion = () => result;
-  return result;
-};
-
-// src/helper/streaming/stream.ts
-var contextStash = /* @__PURE__ */ new WeakMap();
-var stream = (c, cb, onError) => {
-  const { readable, writable } = new TransformStream();
-  const stream2 = new StreamingApi(writable, readable);
-  if (isOldBunVersion()) {
-    c.req.raw.signal.addEventListener("abort", () => {
-      if (!stream2.closed) {
-        stream2.abort();
-      }
-    });
-  }
-  contextStash.set(stream2.responseReadable, c);
-  (async () => {
-    try {
-      await cb(stream2);
-    } catch (e) {
-      if (e === void 0) ; else if (e instanceof Error && onError) {
-        await onError(e, stream2);
-      } else {
-        console.error(e);
-      }
-    } finally {
-      stream2.close();
-    }
-  })();
-  return c.newResponse(stream2.responseReadable);
-};
-
 // src/server/browser-stream/viewer-registry.ts
 var ViewerRegistry = class {
   /** Map of agentId to set of connected WebSocket contexts */
@@ -48948,458 +46306,6 @@ var InMemoryTaskStore = class {
       signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
-};
-
-// src/utils/accept.ts
-var isWhitespace = (char) => char === 32 || char === 9 || char === 10 || char === 13;
-var consumeWhitespace = (acceptHeader, startIndex) => {
-  while (startIndex < acceptHeader.length) {
-    if (!isWhitespace(acceptHeader.charCodeAt(startIndex))) {
-      break;
-    }
-    startIndex++;
-  }
-  return startIndex;
-};
-var ignoreTrailingWhitespace = (acceptHeader, startIndex) => {
-  while (startIndex > 0) {
-    if (!isWhitespace(acceptHeader.charCodeAt(startIndex - 1))) {
-      break;
-    }
-    startIndex--;
-  }
-  return startIndex;
-};
-var skipInvalidParam = (acceptHeader, startIndex) => {
-  while (startIndex < acceptHeader.length) {
-    const char = acceptHeader.charCodeAt(startIndex);
-    if (char === 59) {
-      return [startIndex + 1, true];
-    }
-    if (char === 44) {
-      return [startIndex + 1, false];
-    }
-    startIndex++;
-  }
-  return [startIndex, false];
-};
-var skipInvalidAcceptValue = (acceptHeader, startIndex) => {
-  let i = startIndex;
-  let inQuotes = false;
-  while (i < acceptHeader.length) {
-    const char = acceptHeader.charCodeAt(i);
-    if (inQuotes && char === 92) {
-      i++;
-    } else if (char === 34) {
-      inQuotes = !inQuotes;
-    } else if (!inQuotes && char === 44) {
-      return i + 1;
-    }
-    i++;
-  }
-  return i;
-};
-var getNextParam = (acceptHeader, startIndex) => {
-  startIndex = consumeWhitespace(acceptHeader, startIndex);
-  let i = startIndex;
-  let key;
-  let value;
-  let hasNext = false;
-  while (i < acceptHeader.length) {
-    const char = acceptHeader.charCodeAt(i);
-    if (char === 61) {
-      key = acceptHeader.slice(startIndex, ignoreTrailingWhitespace(acceptHeader, i));
-      i++;
-      break;
-    }
-    if (char === 59) {
-      return [i + 1, void 0, void 0, true];
-    }
-    if (char === 44) {
-      return [i + 1, void 0, void 0, false];
-    }
-    i++;
-  }
-  if (key === void 0) {
-    return [i, void 0, void 0, false];
-  }
-  i = consumeWhitespace(acceptHeader, i);
-  if (acceptHeader.charCodeAt(i) === 61) {
-    const skipResult = skipInvalidParam(acceptHeader, i + 1);
-    return [skipResult[0], key, void 0, skipResult[1]];
-  }
-  let inQuotes = false;
-  const paramStartIndex = i;
-  while (i < acceptHeader.length) {
-    const char = acceptHeader.charCodeAt(i);
-    if (inQuotes && char === 92) {
-      i++;
-    } else if (char === 34) {
-      if (inQuotes) {
-        let nextIndex = consumeWhitespace(acceptHeader, i + 1);
-        const nextChar = acceptHeader.charCodeAt(nextIndex);
-        if (nextIndex < acceptHeader.length && !(nextChar === 59 || nextChar === 44)) {
-          const skipResult = skipInvalidParam(acceptHeader, nextIndex);
-          return [skipResult[0], key, void 0, skipResult[1]];
-        }
-        value = acceptHeader.slice(paramStartIndex + 1, i);
-        if (value.includes("\\")) {
-          value = value.replace(/\\(.)/g, "$1");
-        }
-        if (nextChar === 44) {
-          return [nextIndex + 1, key, value, false];
-        }
-        if (nextChar === 59) {
-          hasNext = true;
-          nextIndex++;
-        }
-        i = nextIndex;
-        break;
-      }
-      inQuotes = true;
-    } else if (!inQuotes && (char === 59 || char === 44)) {
-      value = acceptHeader.slice(paramStartIndex, ignoreTrailingWhitespace(acceptHeader, i));
-      if (char === 59) {
-        hasNext = true;
-      }
-      i++;
-      break;
-    }
-    i++;
-  }
-  return [
-    i,
-    key,
-    value ?? acceptHeader.slice(paramStartIndex, ignoreTrailingWhitespace(acceptHeader, i)),
-    hasNext
-  ];
-};
-var getNextAcceptValue = (acceptHeader, startIndex) => {
-  const accept = {
-    type: "",
-    params: {},
-    q: 1
-  };
-  startIndex = consumeWhitespace(acceptHeader, startIndex);
-  let i = startIndex;
-  while (i < acceptHeader.length) {
-    const char = acceptHeader.charCodeAt(i);
-    if (char === 59 || char === 44) {
-      accept.type = acceptHeader.slice(startIndex, ignoreTrailingWhitespace(acceptHeader, i));
-      i++;
-      if (char === 44) {
-        return [i, accept.type ? accept : void 0];
-      }
-      if (!accept.type) {
-        return [skipInvalidAcceptValue(acceptHeader, i), void 0];
-      }
-      break;
-    }
-    i++;
-  }
-  if (!accept.type) {
-    accept.type = acceptHeader.slice(
-      startIndex,
-      ignoreTrailingWhitespace(acceptHeader, acceptHeader.length)
-    );
-    return [acceptHeader.length, accept.type ? accept : void 0];
-  }
-  let param;
-  let value;
-  let hasNext;
-  while (i < acceptHeader.length) {
-    [i, param, value, hasNext] = getNextParam(acceptHeader, i);
-    if (param && value) {
-      accept.params[param] = value;
-    }
-    if (!hasNext) {
-      break;
-    }
-  }
-  return [i, accept];
-};
-var parseAccept = (acceptHeader) => {
-  if (!acceptHeader) {
-    return [];
-  }
-  const values = [];
-  let i = 0;
-  let accept;
-  let requiresSort = false;
-  let lastAccept;
-  while (i < acceptHeader.length) {
-    [i, accept] = getNextAcceptValue(acceptHeader, i);
-    if (accept) {
-      accept.q = parseQuality(accept.params.q);
-      values.push(accept);
-      if (lastAccept && lastAccept.q < accept.q) {
-        requiresSort = true;
-      }
-      lastAccept = accept;
-    }
-  }
-  if (requiresSort) {
-    values.sort((a, b) => b.q - a.q);
-  }
-  return values;
-};
-var parseQuality = (qVal) => {
-  if (qVal === void 0) {
-    return 1;
-  }
-  if (qVal === "") {
-    return 1;
-  }
-  if (qVal === "NaN") {
-    return 0;
-  }
-  const num = Number(qVal);
-  if (num === Infinity) {
-    return 1;
-  }
-  if (num === -Infinity) {
-    return 0;
-  }
-  if (Number.isNaN(num)) {
-    return 1;
-  }
-  if (num < 0 || num > 1) {
-    return 1;
-  }
-  return num;
-};
-
-// src/utils/compress.ts
-var COMPRESSIBLE_CONTENT_TYPE_REGEX$1 = /^\s*(?:text\/(?!event-stream(?:[;\s]|$))[^;\s]+|application\/(?:javascript|json|xml|xml-dtd|ecmascript|dart|msgpack|postscript|rtf|tar|toml|vnd\.dart|vnd\.ms-fontobject|vnd\.ms-opentype|vnd\.msgpack|wasm|x-httpd-php|x-javascript|x-msgpack|x-ns-proxy-autoconfig|x-sh|x-tar|x-virtualbox-hdd|x-virtualbox-ova|x-virtualbox-ovf|x-virtualbox-vbox|x-virtualbox-vdi|x-virtualbox-vhd|x-virtualbox-vmdk|x-www-form-urlencoded)|font\/(?:otf|ttf)|image\/(?:bmp|vnd\.adobe\.photoshop|vnd\.microsoft\.icon|vnd\.ms-dds|x-icon|x-ms-bmp)|message\/rfc822|model\/gltf-binary|x-shader\/x-fragment|x-shader\/x-vertex|[^;\s]+?\+(?:json|text|xml|yaml|msgpack))(?:[;\s]|$)/i;
-
-// src/middleware/compress/index.ts
-var ENCODING_TYPES = ["gzip", "deflate"];
-var cacheControlNoTransformRegExp = /(?:^|,)\s*?no-transform\s*?(?:,|$)/i;
-var selectEncoding = (header, candidates) => {
-  if (header === void 0) {
-    return void 0;
-  }
-  const accepts = parseAccept(header);
-  const wildcardQ = accepts.find((a) => a.type === "*")?.q;
-  let best;
-  for (const enc of candidates) {
-    const explicit = accepts.find((a) => a.type.toLowerCase() === enc);
-    const q = explicit ? explicit.q : wildcardQ ?? 0;
-    if (q === 1) {
-      return enc;
-    } else if (q > 0 && (!best || q > best.q)) {
-      best = { encoding: enc, q };
-    }
-  }
-  return best?.encoding;
-};
-var compress = (options) => {
-  const threshold = 1024;
-  const candidates = ENCODING_TYPES;
-  const contentTypeFilter = COMPRESSIBLE_CONTENT_TYPE_REGEX$1;
-  const shouldCompress = typeof contentTypeFilter === "function" ? (res) => {
-    const type = res.headers.get("Content-Type");
-    return type && contentTypeFilter(type);
-  } : (res) => {
-    const type = res.headers.get("Content-Type");
-    return type && contentTypeFilter.test(type);
-  };
-  return async function compress2(ctx, next) {
-    await next();
-    const contentLength = ctx.res.headers.get("Content-Length");
-    if (ctx.res.headers.has("Content-Encoding") || // already encoded
-    ctx.res.headers.has("Transfer-Encoding") || // already encoded or chunked
-    ctx.req.method === "HEAD" || // HEAD request
-    contentLength && Number(contentLength) < threshold || // content-length below threshold
-    !shouldCompress(ctx.res) || // not compressible type
-    !shouldTransform(ctx.res)) {
-      return;
-    }
-    const accepted = ctx.req.header("Accept-Encoding");
-    const encoding = selectEncoding(accepted, candidates);
-    if (!encoding || !ctx.res.body) {
-      return;
-    }
-    const stream = new CompressionStream(encoding);
-    ctx.res = new Response(ctx.res.body.pipeThrough(stream), ctx.res);
-    ctx.res.headers.delete("Content-Length");
-    ctx.res.headers.set("Content-Encoding", encoding);
-    const etag = ctx.res.headers.get("ETag");
-    if (etag && !etag.startsWith("W/")) {
-      ctx.res.headers.set("ETag", `W/${etag}`);
-    }
-  };
-};
-var shouldTransform = (res) => {
-  const cacheControl = res.headers.get("Cache-Control");
-  return !cacheControl || !cacheControlNoTransformRegExp.test(cacheControl);
-};
-
-// src/middleware/cors/index.ts
-var cors = (options) => {
-  const opts = {
-    origin: "*",
-    allowMethods: ["GET", "HEAD", "PUT", "POST", "DELETE", "PATCH"],
-    allowHeaders: [],
-    exposeHeaders: [],
-    ...options
-  };
-  const findAllowOrigin = ((optsOrigin) => {
-    if (typeof optsOrigin === "string") {
-      if (optsOrigin === "*") {
-        return () => optsOrigin;
-      } else {
-        return (origin) => optsOrigin === origin ? origin : null;
-      }
-    } else if (typeof optsOrigin === "function") {
-      return optsOrigin;
-    } else {
-      return (origin) => optsOrigin.includes(origin) ? origin : null;
-    }
-  })(opts.origin);
-  const findAllowMethods = ((optsAllowMethods) => {
-    if (typeof optsAllowMethods === "function") {
-      return optsAllowMethods;
-    } else if (Array.isArray(optsAllowMethods)) {
-      return () => optsAllowMethods;
-    } else {
-      return () => [];
-    }
-  })(opts.allowMethods);
-  return async function cors2(c, next) {
-    function set(key, value) {
-      c.res.headers.set(key, value);
-    }
-    const allowOrigin = await findAllowOrigin(c.req.header("origin") || "", c);
-    if (allowOrigin) {
-      set("Access-Control-Allow-Origin", allowOrigin);
-    }
-    if (opts.credentials) {
-      set("Access-Control-Allow-Credentials", "true");
-    }
-    if (opts.exposeHeaders?.length) {
-      set("Access-Control-Expose-Headers", opts.exposeHeaders.join(","));
-    }
-    if (c.req.method === "OPTIONS") {
-      if (opts.origin !== "*") {
-        set("Vary", "Origin");
-      }
-      if (opts.maxAge != null) {
-        set("Access-Control-Max-Age", opts.maxAge.toString());
-      }
-      const allowMethods = await findAllowMethods(c.req.header("origin") || "", c);
-      if (allowMethods.length) {
-        set("Access-Control-Allow-Methods", allowMethods.join(","));
-      }
-      let headers = opts.allowHeaders;
-      if (!headers?.length) {
-        const requestHeaders = c.req.header("Access-Control-Request-Headers");
-        if (requestHeaders) {
-          headers = requestHeaders.split(/\s*,\s*/);
-        }
-      }
-      if (headers?.length) {
-        set("Access-Control-Allow-Headers", headers.join(","));
-        c.res.headers.append("Vary", "Access-Control-Request-Headers");
-      }
-      c.res.headers.delete("Content-Length");
-      c.res.headers.delete("Content-Type");
-      return new Response(null, {
-        headers: c.res.headers,
-        status: 204,
-        statusText: "No Content"
-      });
-    }
-    await next();
-    if (opts.origin !== "*") {
-      c.header("Vary", "Origin", { append: true });
-    }
-  };
-};
-
-// src/utils/color.ts
-function getColorEnabled() {
-  const { process, Deno } = globalThis;
-  const isNoColor = typeof Deno?.noColor === "boolean" ? Deno.noColor : process !== void 0 ? (
-    // eslint-disable-next-line no-unsafe-optional-chaining
-    "NO_COLOR" in process?.env
-  ) : false;
-  return !isNoColor;
-}
-async function getColorEnabledAsync() {
-  const { navigator } = globalThis;
-  const cfWorkers = "cloudflare:workers";
-  const isNoColor = navigator !== void 0 && navigator.userAgent === "Cloudflare-Workers" ? await (async () => {
-    try {
-      return "NO_COLOR" in ((await import(cfWorkers)).env ?? {});
-    } catch {
-      return false;
-    }
-  })() : !getColorEnabled();
-  return !isNoColor;
-}
-
-// src/middleware/logger/index.ts
-var humanize = (times) => {
-  const [delimiter, separator] = [",", "."];
-  const orderTimes = times.map((v) => v.replace(/(\d)(?=(\d\d\d)+(?!\d))/g, "$1" + delimiter));
-  return orderTimes.join(separator);
-};
-var time = (start) => {
-  const delta = Date.now() - start;
-  return humanize([delta < 1e3 ? delta + "ms" : Math.round(delta / 1e3) + "s"]);
-};
-var colorStatus = async (status) => {
-  const colorEnabled = await getColorEnabledAsync();
-  if (colorEnabled) {
-    switch (status / 100 | 0) {
-      case 5:
-        return `\x1B[31m${status}\x1B[0m`;
-      case 4:
-        return `\x1B[33m${status}\x1B[0m`;
-      case 3:
-        return `\x1B[36m${status}\x1B[0m`;
-      case 2:
-        return `\x1B[32m${status}\x1B[0m`;
-    }
-  }
-  return `${status}`;
-};
-async function log(fn, prefix, method, path, status = 0, elapsed) {
-  const out = prefix === "<--" /* Incoming */ ? `${prefix} ${method} ${path}` : `${prefix} ${method} ${path} ${await colorStatus(status)} ${elapsed}`;
-  fn(out);
-}
-var logger = (fn = console.log) => {
-  return async function logger2(c, next) {
-    const { method, url } = c.req;
-    const path = url.slice(url.indexOf("/", 8));
-    await log(fn, "<--" /* Incoming */, method, path);
-    const start = Date.now();
-    await next();
-    await log(fn, "-->" /* Outgoing */, method, path, c.res.status, time(start));
-  };
-};
-
-// src/middleware/timeout/index.ts
-var defaultTimeoutException = new HTTPException(504, {
-  message: "Gateway Timeout"
-});
-var timeout = (duration, exception = defaultTimeoutException) => {
-  return async function timeout2(context, next) {
-    let timer;
-    const timeoutPromise = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        reject(typeof exception === "function" ? exception(context) : exception);
-      }, duration);
-    });
-    try {
-      await Promise.race([next(), timeoutPromise]);
-    } finally {
-      if (timer !== void 0) {
-        clearTimeout(timer);
-      }
-    }
-  };
 };
 
 var RequestError = class extends Error {
@@ -52878,13 +49784,13 @@ function isHotReloadDisabled() {
 }
 function handleError(error, defaultMessage) {
   const apiError = error;
-  throw new HTTPException(apiError.status || 500, {
+  throw new HTTPException$2(apiError.status || 500, {
     message: apiError.message || defaultMessage,
     cause: apiError.cause
   });
 }
 function errorHandler(err, c, isDev) {
-  if (err instanceof HTTPException) {
+  if (err instanceof HTTPException$2) {
     if (isDev) {
       return c.json({ error: err.message, cause: err.cause, stack: err.stack }, err.status);
     }
@@ -53905,16 +50811,15 @@ async function createNodeServer(mastra, options = { tools: {} }) {
   return server;
 }
 
-// @ts-ignore
-// @ts-ignore
-await createNodeServer(mastra, {
-  studio: true,
-  isDev: true,
-  tools: getToolExports(tools),
-});
+// @ts-expect-error
+    await createNodeServer(mastra, { tools: getToolExports(tools), studio: false });
 
-if (mastra.getStorage()) {
-  mastra.__registerInternalWorkflow(scoreTracesWorkflow);
-}
+    const storage = mastra.getStorage();
+    if (storage) {
+      if (!storage.disableInit) {
+        storage.init();
+      }
+      mastra.__registerInternalWorkflow(scoreTracesWorkflow);
+    }
 
 export { SERVER_ROUTES as S, __commonJS as _, __require as a, standardSchemaToJSONSchema as b, __toESM as c, isStandardSchemaWithJSON as i, schemaToJsonSchema$2 as s, toStandardSchema5 as t };
