@@ -10,6 +10,7 @@
  * - 用户确认 → ConfirmationStore.confirm() → 工具 execute 继续
  * - 用户拒绝 → ConfirmationStore.reject() → 工具返回 user_rejected
  */
+import type { UIMessage } from "ai";
 import { FilePlus, Pencil } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -64,7 +65,7 @@ function summarizeUpdate(input: Record<string, unknown>): {
 /* 组件                                                                        */
 /* -------------------------------------------------------------------------- */
 
-export function ToolConfirmCard() {
+export function ToolConfirmCard({ message }: { message: UIMessage }) {
   // 自订阅：ConfirmationStore 变更时触发重渲染
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -73,6 +74,12 @@ export function ToolConfirmCard() {
 
   const pending = ConfirmationStore.pending;
   if (!pending) return null;
+
+  // 只在包含 pending toolCallId 的那条消息上渲染，避免多 assistant 消息时重复弹卡
+  const belongsToThisMessage = message.parts.some(
+    (p) => (p as { toolCallId?: string }).toolCallId === pending.toolCallId,
+  );
+  if (!belongsToThisMessage) return null;
 
   const { toolName, input } = pending;
   const isCreate = toolName === "create_memo";

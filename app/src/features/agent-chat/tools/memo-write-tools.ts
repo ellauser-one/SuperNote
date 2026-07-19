@@ -52,9 +52,25 @@ export type PendingConfirmation = {
 export const ConfirmationStore = {
   _pending: null as PendingConfirmation | null,
   _listeners: [] as Array<() => void>,
+  _timer: null as ReturnType<typeof setTimeout> | null,
+  _onAbort: null as (() => void) | null,
+  _signal: null as AbortSignal | null,
 
   _notify(): void {
     for (const l of this._listeners) l();
+  },
+
+  /** 清理定时器与 abort 监听（不动 _pending） */
+  _clearTimers(): void {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    if (this._onAbort && this._signal) {
+      this._signal.removeEventListener("abort", this._onAbort);
+    }
+    this._onAbort = null;
+    this._signal = null;
   },
 
   /** React 组件订阅变更（返回取消订阅函数） */
@@ -65,26 +81,55 @@ export const ConfirmationStore = {
     };
   },
 
+  /**
+   * 请求用户确认；返回 Promise，用户 confirm/reject 或 signal abort/超时时 resolve。
+   * - signal: stop 按钮触发的 AbortSignal，abort 时自动 reject
+   * - timeoutMs: 超时兜底，默认 60s，防永久挂起
+   */
   request(
     toolCallId: string,
     toolName: string,
     input: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<boolean> {
+    // 防御性：若上一个 pending 还在，先拒绝（避免悬挂 promise）
+    if (this._pending) this.reject();
+
     return new Promise<boolean>((resolve) => {
       this._pending = { toolCallId, toolName, input, resolve };
       this._notify();
+
+      const { signal, timeoutMs = 60_000 } = options ?? {};
+
+      // 超时兜底
+      this._timer = setTimeout(() => this.reject(), timeoutMs);
+
+      // abort 监听：stop() 触发时自动 reject
+      if (signal) {
+        if (signal.aborted) {
+          this.reject();
+          return;
+        }
+        this._signal = signal;
+        this._onAbort = () => this.reject();
+        signal.addEventListener("abort", this._onAbort);
+      }
     });
   },
 
   confirm(): void {
-    this._pending?.resolve(true);
+    const pending = this._pending;
+    this._clearTimers();
     this._pending = null;
+    pending?.resolve(true);
     this._notify();
   },
 
   reject(): void {
-    this._pending?.resolve(false);
+    const pending = this._pending;
+    this._clearTimers();
     this._pending = null;
+    pending?.resolve(false);
     this._notify();
   },
 
@@ -169,11 +214,12 @@ export const createMemoTool = createTool({
         };
       }
 
-      // 写入前用户确认
+      // 写入前用户确认（signal 来自 stop 按钮的 AbortController）
       const confirmed = await ConfirmationStore.request(
-        (context as { toolCallId?: string }).toolCallId ?? "unknown",
+        (context as { toolCallId?: string; signal?: AbortSignal }).toolCallId ?? "unknown",
         "create_memo",
         parsed.data as Record<string, unknown>,
+        { signal: (context as { signal?: AbortSignal }).signal },
       );
       if (!confirmed) {
         return { ok: false, error: "user_rejected" };
@@ -226,11 +272,12 @@ export const updateMemoTool = createTool({
         };
       }
 
-      // 写入前用户确认
+      // 写入前用户确认（signal 来自 stop 按钮的 AbortController）
       const confirmed = await ConfirmationStore.request(
-        (context as { toolCallId?: string }).toolCallId ?? "unknown",
+        (context as { toolCallId?: string; signal?: AbortSignal }).toolCallId ?? "unknown",
         "update_memo",
         parsed.data as Record<string, unknown>,
+        { signal: (context as { signal?: AbortSignal }).signal },
       );
       if (!confirmed) {
         return { ok: false, error: "user_rejected" };

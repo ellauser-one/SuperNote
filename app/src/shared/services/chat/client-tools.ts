@@ -146,7 +146,10 @@ const searchMemosTool = createTool({
     "搜索当前登录用户的备忘录，返回紧凑列表（id/标题/分类/摘要，无完整正文）。需要了解用户已有备忘录时调用。",
   inputSchema: searchMemosInputSchema,
   outputSchema: searchMemosOutputSchema,
-  execute: async (inputData): Promise<SearchMemosOutput> => {
+  execute: async (
+    inputData,
+    context,
+  ): Promise<SearchMemosOutput> => {
     try {
       const parsed = searchMemosInputSchema.safeParse(inputData);
       if (!parsed.success) {
@@ -158,7 +161,9 @@ const searchMemosTool = createTool({
       const { query, category, limit } = parsed.data;
 
       // 读登录态调 api（getMemoTree 内部自带 JWT）；只取 compact 字段回模型
-      const tree = await getMemoTree();
+      // signal 传入：stop 按钮可中断此 fetch
+      const signal = (context as { signal?: AbortSignal } | undefined)?.signal;
+      const tree = await getMemoTree(signal);
       const queryLc = query?.toLowerCase();
       const categoryLc = category?.toLowerCase();
 
@@ -239,7 +244,12 @@ export type ClientToolName = keyof typeof clientTools;
  */
 export function findClientTool(
   name: string,
-): { execute: (input: unknown) => Promise<unknown> } | null {
+): {
+  execute: (
+    input: unknown,
+    options?: { signal?: AbortSignal },
+  ) => Promise<unknown>;
+} | null {
   const tool = (clientTools as Record<string, unknown>)[name];
   if (!tool || typeof tool !== "object") return null;
 
@@ -247,12 +257,13 @@ export function findClientTool(
   if (typeof execute !== "function") return null;
 
   return {
-    execute: (input) =>
+    // signal 经 context 传入 tool.execute（Mastra createTool 第二参数约定）
+    execute: (input, options) =>
       (
         execute as (
           i: unknown,
           context: Record<string, unknown>,
         ) => Promise<unknown>
-      )(input, {}),
+      )(input, { signal: options?.signal }),
   };
 }

@@ -30,7 +30,16 @@
  */
 import { useChat } from "@ai-sdk/react";
 import { lastAssistantMessageIsCompleteWithToolCalls, type UIMessage } from "ai";
-import { SendHorizontal, Square } from "lucide-react";
+import {
+  Eye,
+  FilePlus,
+  Loader2,
+  Pencil,
+  Search,
+  SendHorizontal,
+  Square,
+  type LucideIcon,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAuth } from "../../app/providers/AuthProvider";
@@ -50,6 +59,37 @@ import { getMessageText } from "./message-text";
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                     */
 /* -------------------------------------------------------------------------- */
+
+/** 工具名 → 友好标签 + 图标（渲染状态指示器用） */
+const TOOL_META: Record<string, { label: string; icon: LucideIcon }> = {
+  search_memos: { label: "搜索备忘录", icon: Search },
+  read_current_memo: { label: "读取当前备忘录", icon: Eye },
+  create_memo: { label: "创建备忘录", icon: FilePlus },
+  update_memo: { label: "修改备忘录", icon: Pencil },
+} as const;
+
+/** 遍历 message.parts，找出 state=input-available 的工具调用（正在执行中） */
+function runningTools(
+  message: UIMessage | undefined,
+): Array<{ name: string }> {
+  if (!message) return [];
+  const out: Array<{ name: string }> = [];
+  for (const p of message.parts) {
+    const part = p as { type?: string; state?: string; toolName?: string };
+    if (part.state !== "input-available") continue;
+    if (part.type === "dynamic-tool") {
+      out.push({ name: part.toolName ?? "工具" });
+    } else if (part.type?.startsWith("tool-")) {
+      out.push({ name: part.type.slice("tool-".length) });
+    }
+  }
+  return out;
+}
+
+/** 是否有正在执行的工具（用于"正在思考"提示的去重） */
+function hasRunningTool(message: UIMessage | undefined): boolean {
+  return runningTools(message).length > 0;
+}
 
 function friendlyError(error: Error | undefined): string | null {
   if (!error) return null;
@@ -92,6 +132,8 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
   const { isAuthenticated } = useAuth();
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+  // stop 按钮的 AbortController：贯穿到 tool.execute，可中断 HTTP 与 ConfirmationStore
+  const abortRef = useRef<AbortController | null>(null);
 
   // 写权跟人走
   const canWrite = isAuthenticated;
@@ -176,7 +218,9 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
       }
 
       try {
-        const output = await tool.execute(toolCall.input);
+        const output = await tool.execute(toolCall.input, {
+          signal: abortRef.current?.signal,
+        });
         await addToolResult({
           tool: toolName,
           toolCallId: toolCall.toolCallId,
@@ -239,6 +283,8 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
     const text = draft.trim();
     if (!text || isPending) return;
     if (error) clearError();
+    // 新一轮对话：新建 AbortController，供 onToolCall 内 tool.execute 使用
+    abortRef.current = new AbortController();
     setDraft("");
     try {
       await sendMessage({ text });
@@ -327,9 +373,40 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
                   ) : isStreaming ? (
                     <p className="font-helvetica-now text-ui text-graphite">…</p>
                   ) : null}
+                  {/* tool 执行中状态指示器：spinner + 图标 + 友好名；读写分色 */}
+                  {!isUser && runningTools(message).length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      {runningTools(message).map((t, i) => {
+                        const meta = TOOL_META[t.name];
+                        const Icon = meta?.icon;
+                        const label = meta?.label ?? t.name;
+                        const tone = isWriteTool(t.name)
+                          ? "bg-bone text-warning"
+                          : "bg-bone text-graphite";
+                        return (
+                          <span
+                            key={`${t.name}-${i}`}
+                            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-helvetica-now text-meta ${tone}`}
+                          >
+                            <Loader2
+                              className="h-3 w-3 animate-spin"
+                              aria-hidden="true"
+                            />
+                            {Icon ? (
+                              <Icon
+                                className="h-3 w-3"
+                                aria-hidden="true"
+                              />
+                            ) : null}
+                            {label}…
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               </Card>
-              {!isUser && <ToolConfirmCard />}
+              {!isUser && <ToolConfirmCard message={message} />}
             </div>
           );
         })}
@@ -341,7 +418,7 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
             </p>
             <p className="mt-2 font-helvetica-now text-ui text-graphite">正在连接…</p>
           </Card>
-        ) : isStreaming && messages[messages.length - 1]?.role === "user" ? (
+        ) : isStreaming && !hasRunningTool(messages[messages.length - 1]) ? (
           <Card tone="chalk" className="rounded-md p-6">
             <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
               Assistant
@@ -393,6 +470,10 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
               aria-label="停止生成"
               icon={<Square aria-hidden="true" />}
               onClick={() => {
+                // 先 abort 贯穿到 tool.execute（中断 fetch + reject ConfirmationStore），
+                // 再 stop 中断 SSE 流读取；两者缺一不可
+                abortRef.current?.abort();
+                abortRef.current = null;
                 void stop();
               }}
             >
