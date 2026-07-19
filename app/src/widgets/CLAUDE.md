@@ -2,7 +2,8 @@
 > L2 | 父级: ../../CLAUDE.md
 
 成员清单
-AppSidebar.tsx: /app 左侧导航；顶栏 Logo 与「首页」项回 Landing；底部账户区委托 UserMenu；DEV Design System 入口
+AppSidebar.tsx: /app 左侧永久展开导航侧栏（带文字标签）；消费 sidebar.store 导航；可切换 Agent 面板
+ContextPanel.tsx: 侧栏旁的可折叠上下文面板（memos→文件树，trash→待实现）；250ms ease 动画过渡
 MdxMemoEditor.tsx: MDX 所见即所得适配边界；props/onChange 只暴露干净 content_mdx；内部 inflate/deflate + trim=false + pre-wrap + insertText 粘贴
 mdx-whitespace-adapter.ts: 空行/行首尾空格的 inflate·deflate（ZWSP/NBSP/哨兵只活在编辑器内）；mdx-whitespace-adapter.test.ts 验收 round-trip
 MemoEditorView.tsx: 备忘录主编辑区；标题重命名 + 无感知自动保存；只消费干净 markdown，不感知 adapter 标记

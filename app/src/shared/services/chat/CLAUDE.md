@@ -2,8 +2,9 @@
 > L2 | 父级: ../CLAUDE.md
 
 成员清单
-chat-transport.ts: DefaultChatTransport + chatFetch（Supabase session → Bearer）；ChatClientError envelope 解析
+chat-transport.ts: DefaultChatTransport + chatFetch（Supabase session → Bearer）；ChatClientError envelope 解析；createChatTransport 支持传入 sessionId 作为 body
 client-tools.ts: 客户端镜像工具（@mastra/client-js createTool，同 chat/ 壳同 id）— search_memos / read_current_memo / create_memo / update_memo；findClientTool 供 onToolCall 查找；写工具从 features/agent-chat/tools/memo-write-tools 导入
+session.api.ts: 会话 CRUD + 消息分页 REST 客户端；复用 chatFetch 解包 chat/ 信封；类型 ChatSession / ChatMessage / MessagePage
 
 ## 边界
 - 只取登录态 token，不直连 Supabase 业务表

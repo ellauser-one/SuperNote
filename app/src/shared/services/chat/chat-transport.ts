@@ -100,23 +100,27 @@ export async function chatFetch(
 
 /**
  * 创建指向 chat 服务 /v1/chat 的 DefaultChatTransport。
+ * 传入 sessionId 时自动注入 body.sessionId（每次请求都会携带）。
  * 建议在组件外或 useMemo 中只建一次实例。
  */
-export function createChatTransport() {
+export function createChatTransport(sessionId?: string | null) {
   // AI SDK FetchFunction ≈ typeof fetch；chatFetch 运行时签名兼容
   const fetchImpl = chatFetch as typeof fetch;
+  const body = sessionId ? { sessionId } : undefined;
 
   if (!chatBase) {
     // 仍返回 transport；真正请求时 chatFetch 会抛 CHAT_NOT_CONFIGURED
     return new DefaultChatTransport({
       api: "/v1/chat",
       fetch: fetchImpl,
+      body,
     });
   }
 
   return new DefaultChatTransport({
     api: `${chatBase}/v1/chat`,
     fetch: fetchImpl,
+    body,
   });
 }
 

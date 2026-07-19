@@ -1,8 +1,8 @@
 /**
  * [INPUT]: 依赖 react-router useParams/useNavigate、useAuth、
- *         widgets/MemoTree、widgets/MemoEditorView、shared/stores/memo-tree.store、
- *         shared/lib/memo-tree-helpers、shared/lib/last-opened-memo
- * [OUTPUT]: 对外提供 NotesLayout（文件树主侧栏 + 编辑区）
+ *         shared/stores/memo-tree.store、shared/lib/memo-tree-helpers、
+ *         shared/lib/last-opened-memo、widgets/MemoEditorView
+ * [OUTPUT]: 对外提供 NotesLayout（纯编辑区，文件树由全局 ContextPanel 承载）
  * [POS]: pages /app 与 /app/notes/:noteId 主内容区
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  *
@@ -10,7 +10,7 @@
  * 1. 等 GET /memo-tree 成功
  * 2. 有 last-opened memo → replace 到 /app/notes/:id
  * 3. 完全无节点 → 自动创建根级 memo 并打开
- * 4. 有节点但 last memo 不存在 → 空选择态（不显示假编辑器）
+ * 4. 有节点但 last memo 不存在 → 空选择态
  *
  * 正文编辑与无感知自动保存委托 widgets/MemoEditorView。
  */
@@ -25,7 +25,6 @@ import {
 import { findNode } from "../shared/lib/memo-tree-helpers";
 import { useMemoTreeStore } from "../shared/stores/memo-tree.store";
 import { MemoEditorView } from "../widgets/MemoEditorView";
-import { MemoTree } from "../widgets/MemoTree/MemoTree";
 
 /* -------------------------------------------------------------------------- */
 /* 空选择态                                                                     */
@@ -33,11 +32,8 @@ import { MemoTree } from "../widgets/MemoTree/MemoTree";
 
 function EmptyState({ onCreateFirst }: { onCreateFirst: () => void }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-12 font-helvetica-now text-ui text-graphite">
-      <p>选择左侧一条备忘录开始编辑</p>
-      <p className="max-w-prose-xs text-center text-meta">
-        用顶部「新建文件夹 / 新建备忘录」，或在树空白处右键创建
-      </p>
+    <div className="flex h-full flex-col items-center justify-center gap-8 font-helvetica-now text-ui text-graphite">
+      <p>选择备忘录开始编辑</p>
       <button
         type="button"
         className="ds-tree-toolbar__btn"
@@ -50,7 +46,7 @@ function EmptyState({ onCreateFirst }: { onCreateFirst: () => void }) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 布局主体：文件树主侧栏 + 编辑区                                               */
+/* 布局主体：纯编辑区（文件树在 ContextPanel）                                   */
 /* -------------------------------------------------------------------------- */
 
 export function NotesLayout() {
@@ -63,12 +59,7 @@ export function NotesLayout() {
   const reset = useMemoTreeStore((s) => s.reset);
   const navigate = useNavigate();
 
-  /**
-   * 同一 user 只成功 bootstrap 一次。
-   * 成功后才写入 ref，避免 React Strict Mode 首轮 abort 后第二轮被跳过。
-   */
   const bootstrappedUserRef = useRef<string | null>(null);
-  /** 捕获首次挂载时的 noteId，避免 bootstrap 过程中路由变化干扰空树引导 */
   const initialNoteIdRef = useRef(noteId);
 
   const activeNode = useMemo(() => {
@@ -95,7 +86,6 @@ export function NotesLayout() {
         const tree = await fetchTree(controller.signal);
         if (cancelled) return;
 
-        // 已在具体 note 路由：只记 last-opened，不强制跳转
         if (entryNoteId) {
           const existing = findNode(tree, entryNoteId);
           if (existing?.node_type === "memo") {
@@ -105,7 +95,6 @@ export function NotesLayout() {
           return;
         }
 
-        // 进入 /app：按 last-opened / 空树策略引导
         const lastId = getLastOpenedMemo(user.id);
         if (lastId && findNode(tree, lastId)?.node_type === "memo") {
           navigate(`/app/notes/${lastId}`, { replace: true });
@@ -131,10 +120,9 @@ export function NotesLayout() {
           return;
         }
 
-        // 有节点但 last memo 不存在 → 停在 /app 空选择态
         bootstrappedUserRef.current = user.id;
       } catch {
-        // abort / 网络：允许下次再试（成功前未写入 ref）
+        /* abort / 网络：允许下次再试 */
       }
     })();
 
@@ -166,41 +154,20 @@ export function NotesLayout() {
     }
   }, [createMemo, navigate, user?.id]);
 
-  const handleMemoOpened = useCallback(
-    (nodeId: string) => {
-      if (user?.id) setLastOpenedMemo(user.id, nodeId);
-    },
-    [user?.id],
-  );
-
   const showEmpty = !noteId || !activeNode || activeNode.node_type !== "memo";
   const showLoading = loading && nodes.length === 0;
 
   return (
-    <div
-      className="grid h-full min-h-0"
-      style={{
-        gridTemplateColumns:
-          "minmax(var(--layout-tree-min), var(--layout-tree)) minmax(0, 1fr)",
-      }}
-    >
-      {/* 文件树 = 备忘录工作区主侧栏（文件夹 + 备忘录） */}
-      <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-vellum bg-chalk">
-        <MemoTree onMemoOpened={handleMemoOpened} />
-      </aside>
-
-      {/* 编辑区 */}
-      <div className="min-h-0 min-w-0 overflow-hidden">
-        {showLoading ? (
-          <div className="flex h-full items-center justify-center font-helvetica-now text-ui text-graphite">
-            加载中…
-          </div>
-        ) : activeNode && activeNode.node_type === "memo" ? (
-          <MemoEditorView node={activeNode} />
-        ) : showEmpty ? (
-          <EmptyState onCreateFirst={handleCreateFirst} />
-        ) : null}
-      </div>
+    <div className="ds-notes-content">
+      {showLoading ? (
+        <div className="flex h-full items-center justify-center font-helvetica-now text-ui text-graphite">
+          加载中…
+        </div>
+      ) : activeNode && activeNode.node_type === "memo" ? (
+        <MemoEditorView node={activeNode} />
+      ) : showEmpty ? (
+        <EmptyState onCreateFirst={handleCreateFirst} />
+      ) : null}
     </div>
   );
 }

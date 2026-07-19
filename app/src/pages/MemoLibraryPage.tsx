@@ -158,10 +158,7 @@ export function MemoLibraryPage() {
 
   return (
     <main
-      className="grid h-full min-h-0 min-w-0 bg-paper text-ink"
-      style={{
-        gridTemplateColumns: "minmax(var(--layout-tree-min), var(--layout-tree)) minmax(0, 1fr)",
-      }}
+      className="ds-notes-grid min-w-0 bg-paper text-ink"
     >
       <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-vellum bg-chalk">
         <div className="flex shrink-0 items-center justify-between gap-8 border-b border-vellum px-12 py-10">

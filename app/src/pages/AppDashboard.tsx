@@ -7,8 +7,10 @@
 import { lazy, Suspense, useState, type ComponentType } from "react";
 
 import { useAgentPanelStore } from "../shared/stores/agent-panel.store";
+import { type AppView } from "../shared/stores/sidebar.store";
 import { AgentPanel } from "../widgets/AgentPanel";
-import { AppSidebar, type AppView } from "../widgets/AppSidebar";
+import { AppSidebar } from "../widgets/AppSidebar";
+import { ContextPanel } from "../widgets/ContextPanel";
 import { MemoLibraryPage } from "./MemoLibraryPage";
 import { NewMemoPage } from "./NewMemoPage";
 import { ProfilePage } from "./ProfilePage";
@@ -29,14 +31,15 @@ export function AppDashboard() {
   return (
     <div className="h-dvh overflow-hidden bg-putty text-ink">
       <div
-        className="grid h-full min-h-0"
+        className="ds-app-grid"
         style={{
           gridTemplateColumns: agentOpen
-            ? "var(--layout-sidebar) minmax(0, 1fr) var(--layout-agent)"
-            : "var(--layout-sidebar) minmax(0, 1fr)",
+            ? "var(--layout-sidebar) 0px minmax(0, 1fr) var(--layout-agent)"
+            : "var(--layout-sidebar) 0px minmax(0, 1fr)",
         }}
       >
-        <AppSidebar activeView={activeView} onViewChange={setActiveView} />
+        <AppSidebar />
+        <ContextPanel />
         <div className="min-h-0 min-w-0 overflow-hidden">
           {activeView === "new" ? <NewMemoPage /> : null}
           {activeView === "memos" ? <MemoLibraryPage /> : null}

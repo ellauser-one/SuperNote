@@ -1,315 +1,87 @@
 /**
- * [INPUT]: 依赖 @ai-sdk/react useChat、ai DefaultChatTransport（via createChatTransport）、
- *         ai lastAssistantMessageIsCompleteWithToolCalls、shared/ui Button/Card/Input、
- *         agent-panel.store、chat-transport、services/chat/client-tools、
- *         features/agent-chat/tools/memo-write-tools（isWriteTool）、
- *         features/agent-chat/components/tools/ToolConfirmCard、
- *         app/providers/AuthProvider（useAuth）
- * [OUTPUT]: 对外提供 AgentPanel（右侧备忘录助手 SSE 对话面板）
+ * [INPUT]: 依赖 session.store（currentSessionId / initSessions）、
+ *         agent-panel.store（closePanel）、shared/ui Button、
+ *         SessionList（会话列表侧栏）、ChatPanelInner（对话内核 key-remount）
+ * [OUTPUT]: 对外提供 AgentPanel（右侧备忘录助手面板：会话列表 + 对话区）
  * [POS]: widgets 右侧 Agent 面板；AppShell 按 open 状态挂载
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  *
- * 工具回灌契约：
- * - onToolCall 命中镜像工具后必须显式 addToolResult（返回值会被 AI SDK 丢弃）
- * - 未知工具 / execute 抛错也要 addToolResult（output-error），否则 agent loop 卡死
- * - sendAutomaticallyWhen 收齐工具结果后自动发起下一轮
+ * 切换原理：
+ * - ChatPanelInner 以 key=currentSessionId 挂载
+ * - 换会话 → key 变 → remount → useChat 用新 initialMessages 干净重起
+ * - 不手动 setMessages 清旧消息，避免残留流状态
  *
- * 写权拦截（第二道）：
- * - create_/update_ 前缀工具在 onToolCall 检查 canWrite，无写权直接回灌只读错误
- * - chat/ 侧第一道已按前缀过滤 schema，此处为双重保险
+ * 刷新恢复：
+ * - currentSessionId 经 zustand persist 存 localStorage
+ * - 刷新后 initSessions 校验 id 是否仍在列表中，有效则恢复
  */
-import { useChat } from "@ai-sdk/react";
-import { lastAssistantMessageIsCompleteWithToolCalls } from "ai";
-import { Bot, PanelRightClose, SendHorizontal, Square } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Bot, PanelRightClose } from "lucide-react";
+import { useEffect } from "react";
 
 import { useAuth } from "../../app/providers/AuthProvider";
-import { ToolConfirmCard } from "../../features/agent-chat/components/tools/ToolConfirmCard";
-import { isWriteTool } from "../../features/agent-chat/tools/memo-write-tools";
-import {
-  ChatClientError,
-  createChatTransport,
-  isChatConfigured,
-} from "../../shared/services/chat/chat-transport";
-import { findClientTool } from "../../shared/services/chat/client-tools";
 import { useAgentPanelStore } from "../../shared/stores/agent-panel.store";
-import { Button, Card, Input } from "../../shared/ui";
-import { MarkdownMessage } from "./MarkdownMessage";
-import { getMessageText } from "./message-text";
-
-function friendlyError(error: Error | undefined): string | null {
-  if (!error) return null;
-  if (error instanceof ChatClientError) {
-    if (error.code === "UNAUTHORIZED" || error.code === "SESSION_ERROR") {
-      return error.message;
-    }
-    if (error.code === "CHAT_NOT_CONFIGURED") {
-      return error.message;
-    }
-    return `${error.message}${error.code ? `（${error.code}）` : ""}`;
-  }
-  // useChat / fetch 包装错误
-  const msg = error.message?.trim();
-  if (msg) return msg;
-  return "对话失败，请稍后重试。";
-}
+import { useSessionStore } from "../../shared/stores/session.store";
+import { Button } from "../../shared/ui";
+import { ChatPanelInner } from "./ChatPanelInner";
+import { SessionList } from "./SessionList";
 
 export function AgentPanel() {
   const closePanel = useAgentPanelStore((s) => s.closePanel);
+  const currentSessionId = useSessionStore((s) => s.currentSessionId);
+  const initSessions = useSessionStore((s) => s.initSessions);
   const { isAuthenticated } = useAuth();
-  const [draft, setDraft] = useState("");
-  const listRef = useRef<HTMLDivElement>(null);
 
-  // 写权跟人走：当前登录即有写权（未来可细化为角色检查）
-  const canWrite = isAuthenticated;
-
-  const transport = useMemo(() => createChatTransport(), []);
-
-  const {
-    messages,
-    sendMessage,
-    status,
-    stop,
-    error,
-    clearError,
-    addToolResult,
-  } = useChat({
-    transport,
-    // 工具结果齐了（全部 output-available / output-error）自动发起下一轮
-    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onToolCall: async ({ toolCall }) => {
-      const toolName = toolCall.toolName;
-      const tool = findClientTool(toolName);
-
-      // 未知工具也必须回灌结果，否则 agent loop 卡死
-      if (!tool) {
-        await addToolResult({
-          tool: toolName,
-          toolCallId: toolCall.toolCallId,
-          state: "output-error",
-          errorText: `未知工具: ${toolName}`,
-        });
-        return;
-      }
-
-      // 写权第二道拦截：create_/update_ 前缀无写权时直接回灌只读错误
-      if (isWriteTool(toolName) && !canWrite) {
-        await addToolResult({
-          tool: toolName,
-          toolCallId: toolCall.toolCallId,
-          output: { ok: false, error: "只读" },
-        });
-        return;
-      }
-
-      try {
-        const output = await tool.execute(toolCall.input);
-        // 必须显式 addToolResult：onToolCall 的返回值会被 AI SDK 丢弃
-        await addToolResult({
-          tool: toolName,
-          toolCallId: toolCall.toolCallId,
-          output,
-        });
-      } catch (err) {
-        await addToolResult({
-          tool: toolName,
-          toolCallId: toolCall.toolCallId,
-          state: "output-error",
-          errorText: err instanceof Error ? err.message : "工具执行失败",
-        });
-      }
-    },
-  });
-
-  const isStreaming = status === "streaming" || status === "submitted";
-  const errorText = friendlyError(error);
-  const configured = isChatConfigured();
-  const isEmpty = messages.length === 0;
-
-  /* 新消息 / 流式增长时滚到底 */
+  // 登录态变化时初始化会话列表
   useEffect(() => {
-    const el = listRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages, status]);
-
-  async function handleSend() {
-    const text = draft.trim();
-    if (!text || isStreaming) return;
-    if (error) clearError();
-    setDraft("");
-    try {
-      await sendMessage({ text });
-    } catch {
-      // useChat 会把错误写入 error；此处避免未捕获 Promise
+    if (isAuthenticated) {
+      void initSessions();
     }
-  }
+  }, [isAuthenticated, initSessions]);
 
   return (
-    <aside className="flex h-full min-h-0 w-full min-w-0 flex-col overflow-hidden border-l border-vellum bg-bone">
-      {/* Header */}
-      <div className="shrink-0 border-b border-vellum px-10 py-10">
-        <div className="flex items-start justify-between gap-6">
-          <div className="min-w-0">
-            <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-              Memo Agent
-            </p>
-            <h2 className="mt-2 flex items-center gap-6 truncate font-davinci text-title font-medium text-ink">
-              <Bot className="size-icon-sm shrink-0" aria-hidden="true" />
-              <span className="truncate">备忘录助手</span>
-            </h2>
+    <aside className="flex h-full min-h-0 w-full min-w-0 overflow-hidden border-l border-vellum bg-bone">
+      {/* 会话列表侧栏 */}
+      <div className="flex w-[220px] shrink-0 flex-col border-r border-vellum">
+        <div className="shrink-0 border-b border-vellum px-4 py-4">
+          <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
+            会话
+          </p>
+        </div>
+        <SessionList />
+      </div>
+
+      {/* 对话区 */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Header */}
+        <div className="shrink-0 border-b border-vellum px-6 py-6">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
+                Memo Agent
+              </p>
+              <h2 className="mt-2 flex items-center gap-4 truncate font-davinci text-title font-medium text-ink">
+                <Bot className="size-icon-sm shrink-0" aria-hidden="true" />
+                <span className="truncate">备忘录助手</span>
+              </h2>
+            </div>
+
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="关闭助手面板"
+              icon={<PanelRightClose aria-hidden="true" />}
+              onClick={closePanel}
+            >
+              关闭
+            </Button>
           </div>
-
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-label="关闭助手面板"
-            icon={<PanelRightClose aria-hidden="true" />}
-            onClick={closePanel}
-          >
-            关闭
-          </Button>
         </div>
-      </div>
 
-      {/* Messages */}
-      <div
-        ref={listRef}
-        className="flex min-h-0 flex-1 flex-col gap-8 overflow-y-auto px-10 py-10"
-        role="log"
-        aria-live="polite"
-        aria-relevant="additions"
-      >
-        {!configured ? (
-          <Card tone="chalk" className="rounded-md p-8">
-            <p className="font-helvetica-now text-ui text-graphite">
-              未配置助手服务。请在{" "}
-              <code className="font-helvetica-now text-meta">app/.env.local</code>{" "}
-              设置{" "}
-              <code className="font-helvetica-now text-meta">VITE_CHAT_BASE_URL</code>
-              （如 http://localhost:20002）。
-            </p>
-          </Card>
-        ) : null}
-
-        {configured && isEmpty && !errorText ? (
-          <Card tone="chalk" className="rounded-md p-8">
-            <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-              开始对话
-            </p>
-            <p className="mt-4 font-helvetica-now text-ui leading-relaxed text-ink">
-              我是备忘录助手。可以帮你提炼要点、改写草稿、规划文件夹命名。
-              输入一句话，我会流式回复。
-            </p>
-            <ul className="mt-8 list-disc space-y-4 pl-16 font-helvetica-now text-meta text-graphite">
-              <li>把这段灵感整理成可执行待办</li>
-              <li>给「产品定价」备忘录起个清晰标题</li>
-              <li>用三句话总结今天的会议记录</li>
-            </ul>
-          </Card>
-        ) : null}
-
-        {messages.map((message) => {
-          const text = getMessageText(message);
-          const isUser = message.role === "user";
-          return (
-            <div key={message.id}>
-              <Card
-                tone={isUser ? "ink" : "chalk"}
-                className={`rounded-md p-8 ${isUser ? "ml-6" : ""}`}
-              >
-                <p className="font-helvetica-now text-label font-medium uppercase opacity-70">
-                  {isUser ? "You" : "Assistant"}
-                </p>
-                <div className="mt-2">
-                  {isUser ? (
-                    <p className="whitespace-pre-wrap font-helvetica-now text-ui leading-relaxed">
-                      {text}
-                    </p>
-                  ) : text ? (
-                    <MarkdownMessage content={text} />
-                  ) : isStreaming ? (
-                    <p className="font-helvetica-now text-ui text-graphite">…</p>
-                  ) : null}
-                </div>
-              </Card>
-              {/* 助手消息后渲染确认卡（写工具 pending 时） */}
-              {!isUser && <ToolConfirmCard />}
-            </div>
-          );
-        })}
-
-        {isStreaming && messages[messages.length - 1]?.role === "user" ? (
-          <Card tone="chalk" className="rounded-md p-8">
-            <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-              Assistant
-            </p>
-            <p className="mt-2 font-helvetica-now text-ui text-graphite">正在思考…</p>
-          </Card>
-        ) : null}
-
-        {errorText ? (
-          <Card tone="paper" className="rounded-md border border-vellum p-8">
-            <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-              出错了
-            </p>
-            <p className="mt-2 font-helvetica-now text-ui leading-relaxed text-ink">
-              {errorText}
-            </p>
-            <div className="mt-8">
-              <Button variant="outline" size="sm" onClick={() => clearError()}>
-                知道了
-              </Button>
-            </div>
-          </Card>
-        ) : null}
-      </div>
-
-      {/* Composer */}
-      <div className="shrink-0 border-t border-vellum p-8">
-        <div className="flex gap-4">
-          <Input
-            aria-label="输入助手消息"
-            className="min-w-0 flex-1"
-            placeholder={
-              configured ? "问备忘录助手…" : "请先配置 VITE_CHAT_BASE_URL"
-            }
-            value={draft}
-            disabled={!configured || isStreaming}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void handleSend();
-              }
-            }}
-          />
-          {isStreaming ? (
-            <Button
-              variant="outline"
-              size="sm"
-              aria-label="停止生成"
-              icon={<Square aria-hidden="true" />}
-              onClick={() => {
-                void stop();
-              }}
-            >
-              停止
-            </Button>
-          ) : (
-            <Button
-              size="sm"
-              aria-label="发送消息"
-              icon={<SendHorizontal aria-hidden="true" />}
-              disabled={!configured || !draft.trim()}
-              onClick={() => {
-                void handleSend();
-              }}
-            >
-              发送
-            </Button>
-          )}
-        </div>
+        {/* Chat — key 驱动 remount */}
+        <ChatPanelInner
+          key={currentSessionId ?? "__empty__"}
+          sessionId={currentSessionId}
+        />
       </div>
     </aside>
   );

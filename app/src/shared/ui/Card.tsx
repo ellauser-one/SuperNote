@@ -8,7 +8,7 @@ import type { HTMLAttributes } from "react";
 
 import { cn } from "./cn";
 
-type CardTone = "bone" | "ink" | "chalk" | "paper";
+type CardTone = "bone" | "ink" | "chalk" | "paper" | "warning";
 
 export type CardProps = HTMLAttributes<HTMLDivElement> & {
   tone?: CardTone;
@@ -22,6 +22,7 @@ export function Card({ tone = "bone", className, ...props }: CardProps) {
         tone === "ink" && "ds-card--ink",
         tone === "chalk" && "ds-card--chalk",
         tone === "paper" && "ds-card--paper",
+        tone === "warning" && "ds-card--warning",
         className,
       )}
       {...props}

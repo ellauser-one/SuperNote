@@ -1,6 +1,6 @@
 /**
  * [INPUT]: 依赖 zustand store、lucide-react、react-router、
- *         memo-tree-helpers、MemoTreeContextMenu、CreateNodeDialog、useFlipAnimation
+ *         memo-tree-helpers、MemoTreeContextMenu、CreateNodeDialog、useMemoTreeDnd
  * [OUTPUT]: 对外提供 MemoTree 完整侧栏文件树（HTML5 DnD + 乐观 move + FLIP）
  * [POS]: widgets/MemoTree 主组件；folder/memo 同树；drop 后乐观 UI，成功不 refetch
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
@@ -14,42 +14,31 @@
  * - 禁止拖进自己 / 自己的后代
  * - move 乐观更新 + FLIP；失败 store 回滚 + toast
  */
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type DragEvent,
-} from "react";
+import { useCallback, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
-  ChevronRight,
   FilePlus,
-  FileText,
-  Folder,
-  FolderOpen,
   FolderPlus,
 } from "lucide-react";
 
 import {
   canDropTarget,
-  findNode,
-  resolveDropPlacement,
   sortNodes,
 } from "../../shared/lib/memo-tree-helpers";
 import { useMemoTreeStore } from "../../shared/stores/memo-tree.store";
 import type {
-  DropPosition,
   DropTarget,
   MemoTreeNode as NodeType,
 } from "../../shared/types/memo";
 import { cn } from "../../shared/ui/cn";
 import { CreateNodeDialog } from "./CreateNodeDialog";
+import { DropLine } from "./DropLine";
+import { MemoTreeNodeRow } from "./MemoTreeNodeRow";
 import {
   MemoTreeContextMenu,
-  type ContextMenuAction,
 } from "./MemoTreeContextMenu";
-import { useFlipAnimation } from "./useFlipAnimation";
+import { useMemoTreeActions } from "./useMemoTreeActions";
+import { useMemoTreeDnd } from "./useMemoTreeDnd";
 
 /** 树中是否存在任意 folder（含子树） */
 function hasAnyFolder(nodes: NodeType[]): boolean {
@@ -58,72 +47,6 @@ function hasAnyFolder(nodes: NodeType[]): boolean {
     if (n.children.length > 0 && hasAnyFolder(n.children)) return true;
   }
   return false;
-}
-
-/* -------------------------------------------------------------------------- */
-/* 常量                                                                         */
-/* -------------------------------------------------------------------------- */
-
-const DRAG_TYPE = "application/x-supernote-node-id";
-/** folder 标题行分区：上 before / 中 inside / 下 after（各约 24%） */
-const FOLDER_BEFORE = 0.24;
-const FOLDER_AFTER = 0.76;
-
-function sameDropTarget(a: DropTarget | null, b: DropTarget | null): boolean {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  return (
-    a.nodeId === b.nodeId &&
-    a.parentId === b.parentId &&
-    a.position === b.position
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-/* DropLine — 真实落点（层级边界 / 节点后）                                      */
-/* -------------------------------------------------------------------------- */
-
-type DropLineProps = {
-  depth: number;
-  active: boolean;
-  disabled?: boolean;
-  onHover: (e: DragEvent) => void;
-  onDropLine: (e: DragEvent) => void;
-};
-
-function DropLine({
-  depth,
-  active,
-  disabled,
-  onHover,
-  onDropLine,
-}: DropLineProps) {
-  return (
-    <div
-      className={cn(
-        "ds-tree-drop-line",
-        active && "ds-tree-drop-line--active",
-        disabled && "ds-tree-drop-line--disabled",
-      )}
-      style={{ marginLeft: `calc(${depth} * var(--spacing-12))` }}
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (disabled) {
-          e.dataTransfer.dropEffect = "none";
-          return;
-        }
-        e.dataTransfer.dropEffect = "move";
-        onHover(e);
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (disabled) return;
-        onDropLine(e);
-      }}
-    />
-  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -143,13 +66,9 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
   const nodes = useMemoTreeStore((s) => s.nodes);
   const loading = useMemoTreeStore((s) => s.loading);
   const lastError = useMemoTreeStore((s) => s.lastError);
-  const moveNode = useMemoTreeStore((s) => s.moveNode);
-  const renameNode = useMemoTreeStore((s) => s.renameNode);
-  const clearError = useMemoTreeStore((s) => s.clearError);
-  const navigate = useNavigate();
   const { noteId } = useParams<{ noteId: string }>();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const flip = useFlipAnimation();
+  const navigate = useNavigate();
+
 
   /* ── 展开 / 选中 ───────────────────────────────────────────── */
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -168,35 +87,21 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
     setExpanded((prev) => new Set(prev).add(id));
   }, []);
 
-  /* ── 拖拽态 ─────────────────────────────────────────────────── */
-  const [dragSourceId, setDragSourceId] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
-  const [draggingBusy, setDraggingBusy] = useState(false);
-
-  /* ── 重命名 / 菜单 / 创建 ──────────────────────────────────── */
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [renameValue, setRenameValue] = useState("");
-  const [contextMenu, setContextMenu] = useState<{
-    x: number;
-    y: number;
-    /** 新建节点的 parent（folder 上右键 = 该 folder；memo 上 = 其 parent） */
-    targetParentId: string | null;
-    /** 被右键的节点 id；有值时可重命名 */
-    targetNodeId: string | null;
-    /** 被右键节点的当前标题（进入重命名时用） */
-    targetTitle: string | null;
-  } | null>(null);
-  const [createDialog, setCreateDialog] = useState<{
-    type: "folder" | "memo";
-    parentId: string | null;
-  } | null>(null);
-
-  /* ── toast 自动消失 ────────────────────────────────────────── */
-  useEffect(() => {
-    if (!lastError) return;
-    const t = window.setTimeout(() => clearError(), 4000);
-    return () => window.clearTimeout(t);
-  }, [lastError, clearError]);
+  /* ── 拖拽（委托 useMemoTreeDnd hook） ─────────────────────── */
+  const {
+    dragSourceId,
+    dropTarget,
+    draggingBusy,
+    containerRef,
+    resetDrag,
+    proposeDropTarget,
+    handleDragStart,
+    handleDragEnd,
+    zoneFromFolderRow,
+    zoneFromMemoRow,
+    handleDropWithTarget,
+    rootEndTarget,
+  } = useMemoTreeDnd(expandFolder);
 
   /* ── 选择 ──────────────────────────────────────────────────── */
   const handleSelect = useCallback(
@@ -209,202 +114,25 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
     [navigate, onMemoOpened],
   );
 
-  /* ── 拖拽 helpers ──────────────────────────────────────────── */
-  const resetDrag = useCallback(() => {
-    setDragSourceId(null);
-    setDropTarget(null);
-  }, []);
 
-  const proposeDropTarget = useCallback(
-    (next: DropTarget) => {
-      if (!dragSourceId) {
-        setDropTarget(null);
-        return;
-      }
-      if (!canDropTarget(nodes, dragSourceId, next)) {
-        setDropTarget(null);
-        return;
-      }
-      setDropTarget((prev) => (sameDropTarget(prev, next) ? prev : next));
-    },
-    [dragSourceId, nodes],
-  );
 
-  const handleDragStart = useCallback((e: DragEvent, nodeId: string) => {
-    setDragSourceId(nodeId);
-    setDropTarget(null);
-    e.dataTransfer.setData(DRAG_TYPE, nodeId);
-    e.dataTransfer.effectAllowed = "move";
-  }, []);
-
-  const handleDragEnd = useCallback(() => {
-    resetDrag();
-  }, [resetDrag]);
-
-  /** folder 标题行三段分区 */
-  const zoneFromFolderRow = useCallback((e: DragEvent): DropPosition => {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const ratio = (e.clientY - rect.top) / Math.max(rect.height, 1);
-    if (ratio < FOLDER_BEFORE) return "before";
-    if (ratio > FOLDER_AFTER) return "after";
-    return "inside";
-  }, []);
-
-  /** memo 标题行：上 before / 下 after */
-  const zoneFromMemoRow = useCallback((e: DragEvent): DropPosition => {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const ratio = (e.clientY - rect.top) / Math.max(rect.height, 1);
-    return ratio < 0.5 ? "before" : "after";
-  }, []);
-
-  const commitDrop = useCallback(
-    async (sourceId: string, target: DropTarget) => {
-      if (!canDropTarget(nodes, sourceId, target)) {
-        resetDrag();
-        return;
-      }
-
-      const payload = resolveDropPlacement(nodes, sourceId, target);
-
-      // 无实际变化时跳过
-      const current = findNode(nodes, sourceId);
-      if (
-        current &&
-        current.parent_id === payload.parent_id &&
-        String(current.sort_order) === String(payload.sort_order)
-      ) {
-        resetDrag();
-        return;
-      }
-
-      setDraggingBusy(true);
-      flip.capture(containerRef.current);
-
-      // 乐观 move 同步改 store；双 rAF 等 React 提交 DOM 后再 FLIP
-      const movePromise = moveNode(sourceId, payload);
-
-      if (payload.parent_id) {
-        expandFolder(payload.parent_id);
-      }
-
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          flip.animate(containerRef.current);
-        });
-      });
-
-      try {
-        await movePromise;
-      } catch {
-        /* lastError 已由 store 写入；回滚后无需额外 FLIP */
-      } finally {
-        setDraggingBusy(false);
-        resetDrag();
-      }
-    },
-    [nodes, moveNode, expandFolder, flip, resetDrag],
-  );
-
-  const handleDropWithTarget = useCallback(
-    (e: DragEvent, target: DropTarget) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const sourceId =
-        e.dataTransfer.getData(DRAG_TYPE) || dragSourceId || "";
-      if (!sourceId || draggingBusy) {
-        resetDrag();
-        return;
-      }
-      void commitDrop(sourceId, target);
-    },
-    [dragSourceId, draggingBusy, commitDrop, resetDrag],
-  );
-
-  const rootEndTarget: DropTarget = {
-    nodeId: null,
-    parentId: null,
-    position: "after",
-  };
-
-  /* ── 重命名 ────────────────────────────────────────────────── */
-  const handleDoubleClick = useCallback((node: NodeType) => {
-    setRenamingId(node.id);
-    setRenameValue(node.title);
-  }, []);
-
-  const commitRename = useCallback(async () => {
-    if (!renamingId) return;
-    const trimmed = renameValue.trim();
-    if (trimmed) {
-      try {
-        await renameNode(renamingId, trimmed);
-      } catch {
-        /* store 回滚 + lastError */
-      }
-    }
-    setRenamingId(null);
-    setRenameValue("");
-  }, [renamingId, renameValue, renameNode]);
-
-  const cancelRename = useCallback(() => {
-    setRenamingId(null);
-    setRenameValue("");
-  }, []);
-
-  /* ── 右键 ──────────────────────────────────────────────────── */
-  const handleContextMenu = useCallback(
-    (
-      e: React.MouseEvent,
-      opts: {
-        parentId: string | null;
-        nodeId?: string | null;
-        title?: string | null;
-      },
-    ) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setContextMenu({
-        x: e.clientX,
-        y: e.clientY,
-        targetParentId: opts.parentId,
-        targetNodeId: opts.nodeId ?? null,
-        targetTitle: opts.title ?? null,
-      });
-    },
-    [],
-  );
-
-  const handleContextAction = useCallback(
-    (action: ContextMenuAction) => {
-      if (action === "rename") {
-        const id = contextMenu?.targetNodeId;
-        if (!id) return;
-        setRenamingId(id);
-        setRenameValue(contextMenu?.targetTitle ?? "");
-        return;
-      }
-      const parentId = contextMenu?.targetParentId ?? null;
-      setCreateDialog({
-        type: action === "create-folder" ? "folder" : "memo",
-        parentId,
-      });
-    },
-    [contextMenu],
-  );
-
-  const handleCreated = useCallback(
-    (nodeId: string) => {
-      const node = findNode(useMemoTreeStore.getState().nodes, nodeId);
-      if (node?.node_type === "memo") {
-        onMemoOpened?.(nodeId);
-        navigate(`/app/notes/${nodeId}`);
-      }
-      if (node?.parent_id) {
-        expandFolder(node.parent_id);
-      }
-    },
-    [navigate, expandFolder, onMemoOpened],
-  );
+  /* ── 重命名 / 菜单 / 创建（委托 useMemoTreeActions） ──────── */
+  const {
+    renamingId,
+    renameValue,
+    contextMenu,
+    createDialog,
+    setRenameValue,
+    setContextMenu,
+    setCreateDialog,
+    handleDoubleClick,
+    commitRename,
+    cancelRename,
+    handleContextMenu,
+    handleContextAction,
+    openCreate,
+    handleCreated,
+  } = useMemoTreeActions(expandFolder, onMemoOpened);
 
   /* ── 渲染一层列表 ──────────────────────────────────────────── */
   const renderLevel = useCallback(
@@ -476,145 +204,83 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
               dropTarget.position === "before";
 
             return (
-              <div key={node.id} className="ds-tree-subtree">
-                {/* 节点行 — 自身就是 before/inside/after 落点 */}
-                <div
-                  data-flip-id={node.id}
-                  className={cn(
-                    "ds-tree-node",
-                    isActive && "ds-tree-node--active",
-                    dropInside && "ds-tree-node--drop-inside",
-                    dropBefore && "ds-tree-node--drop-before",
-                    isDragging && "ds-tree-node--dragging",
-                  )}
-                  style={{
-                    paddingLeft: `calc(${depth} * var(--spacing-12) + var(--spacing-8))`,
-                  }}
-                  draggable={!isRenaming && !draggingBusy}
-                  onDragStart={(e) => handleDragStart(e, node.id)}
-                  onDragEnd={handleDragEnd}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!dragSourceId || dragSourceId === node.id) {
-                      e.dataTransfer.dropEffect = "none";
-                      return;
-                    }
-
-                    const position = isFolder
-                      ? zoneFromFolderRow(e)
-                      : zoneFromMemoRow(e);
-                    const next: DropTarget = {
-                      nodeId: node.id,
-                      parentId: node.parent_id,
-                      position,
-                    };
-
-                    if (!canDropTarget(nodes, dragSourceId, next)) {
-                      e.dataTransfer.dropEffect = "none";
-                      setDropTarget(null);
-                      return;
-                    }
-
-                    e.dataTransfer.dropEffect = "move";
-                    proposeDropTarget(next);
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    if (!dragSourceId) return;
-
-                    const position = isFolder
-                      ? zoneFromFolderRow(e)
-                      : zoneFromMemoRow(e);
-                    const next: DropTarget = {
-                      nodeId: node.id,
-                      parentId: node.parent_id,
-                      position,
-                    };
-                    handleDropWithTarget(e, next);
-                  }}
-                  onClick={() => {
-                    if (isFolder) toggleExpand(node.id);
-                    handleSelect(node);
-                  }}
-                  onDoubleClick={() => handleDoubleClick(node)}
-                  onContextMenu={(e) =>
-                    handleContextMenu(e, {
-                      parentId: isFolder ? node.id : node.parent_id,
-                      nodeId: node.id,
-                      title: node.title,
-                    })
+              <MemoTreeNodeRow
+                key={node.id}
+                node={node}
+                depth={depth}
+                isActive={isActive}
+                isExpanded={isExpanded}
+                isRenaming={isRenaming}
+                isDragging={isDragging}
+                renameValue={renameValue}
+                dropInside={dropInside}
+                dropBefore={dropBefore}
+                dragSourceId={dragSourceId}
+                draggingBusy={draggingBusy}
+                afterActive={Boolean(dragSourceId) && afterActive}
+                afterDisabled={afterDisabled}
+                childrenContent={
+                  isFolder && isExpanded
+                    ? renderLevel(node.children, node.id, depth + 1)
+                    : undefined
+                }
+                onDragStart={handleDragStart}
+                onDragEnd={handleDragEnd}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!dragSourceId || dragSourceId === node.id) {
+                    e.dataTransfer.dropEffect = "none";
+                    return;
                   }
-                >
-                  {isFolder ? (
-                    <span
-                      className={cn(
-                        "ds-tree-node__chevron",
-                        isExpanded && "ds-tree-node__chevron--open",
-                      )}
-                    >
-                      <ChevronRight />
-                    </span>
-                  ) : (
-                    <span
-                      className="ds-tree-node__chevron"
-                      style={{ visibility: "hidden" }}
-                    >
-                      <ChevronRight />
-                    </span>
-                  )}
-
-                  <span className="ds-tree-node__icon">
-                    {isFolder ? (
-                      isExpanded ? (
-                        <FolderOpen />
-                      ) : (
-                        <Folder />
-                      )
-                    ) : (
-                      <FileText />
-                    )}
-                  </span>
-
-                  {isRenaming ? (
-                    <input
-                      className="ds-tree-node__rename"
-                      value={renameValue}
-                      autoFocus
-                      onChange={(e) => setRenameValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void commitRename();
-                        if (e.key === "Escape") cancelRename();
-                      }}
-                      onBlur={() => void commitRename()}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  ) : (
-                    <span className="ds-tree-node__title">{node.title}</span>
-                  )}
-                </div>
-
-                {/* 展开的 children：独立一层列表（有自己的首尾落点） */}
-                {isFolder && isExpanded && (
-                  <div className="ds-tree-children">
-                    {renderLevel(node.children, node.id, depth + 1)}
-                  </div>
-                )}
-
-                {/*
-                  节点后落点：
-                  - 对 folder 表示「整个子树之后」的同级 after
-                  - 必须在 children 之后渲染，不能在 title 与 children 之间
-                */}
-                <DropLine
-                  depth={depth}
-                  active={Boolean(dragSourceId) && afterActive}
-                  disabled={afterDisabled}
-                  onHover={() => proposeDropTarget(afterTarget)}
-                  onDropLine={(e) => handleDropWithTarget(e, afterTarget)}
-                />
-              </div>
+                  const position = isFolder
+                    ? zoneFromFolderRow(e)
+                    : zoneFromMemoRow(e);
+                  const next: DropTarget = {
+                    nodeId: node.id,
+                    parentId: node.parent_id,
+                    position,
+                  };
+                  if (!canDropTarget(nodes, dragSourceId, next)) {
+                    e.dataTransfer.dropEffect = "none";
+                    resetDrag();
+                    return;
+                  }
+                  e.dataTransfer.dropEffect = "move";
+                  proposeDropTarget(next);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (!dragSourceId) return;
+                  const position = isFolder
+                    ? zoneFromFolderRow(e)
+                    : zoneFromMemoRow(e);
+                  const next: DropTarget = {
+                    nodeId: node.id,
+                    parentId: node.parent_id,
+                    position,
+                  };
+                  handleDropWithTarget(e, next);
+                }}
+                onClick={(n) => {
+                  if (n.node_type === "folder") toggleExpand(n.id);
+                  handleSelect(n);
+                }}
+                onDoubleClick={handleDoubleClick}
+                onContextMenu={(e, n) =>
+                  handleContextMenu(e, {
+                    parentId: n.node_type === "folder" ? n.id : n.parent_id,
+                    nodeId: n.id,
+                    title: n.title,
+                  })
+                }
+                onRenameChange={setRenameValue}
+                onRenameCommit={commitRename}
+                onRenameCancel={cancelRename}
+                onAfterHover={() => proposeDropTarget(afterTarget)}
+                onAfterDropLine={(e) => handleDropWithTarget(e, afterTarget)}
+              />
             );
           })}
 
@@ -651,13 +317,6 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
       commitRename,
       cancelRename,
     ],
-  );
-
-  const openCreate = useCallback(
-    (type: "folder" | "memo", parentId: string | null = null) => {
-      setCreateDialog({ type, parentId });
-    },
-    [],
   );
 
   const rootEndActive =
@@ -716,7 +375,7 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
             e.currentTarget === e.target ||
             !e.currentTarget.contains(e.relatedTarget as Node)
           ) {
-            setDropTarget(null);
+            resetDrag();
           }
         }}
       >
@@ -785,7 +444,7 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
                 }
                 if (!canDropTarget(nodes, dragSourceId, rootEndTarget)) {
                   e.dataTransfer.dropEffect = "none";
-                  setDropTarget(null);
+                  resetDrag();
                   return;
                 }
                 e.dataTransfer.dropEffect = "move";

@@ -52,6 +52,8 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
   const [titleError, setTitleError] = useState<string | null>(null);
   const [savingTitle, setSavingTitle] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  /** 保存状态指示器：编辑中 / 保存中 / 已保存 / 空闲 */
+  const [saveStatus, setSaveStatus] = useState<"idle" | "editing" | "saving" | "saved">("idle");
 
   /**
    * 切换瞬间：MDXEditor 会因 key=node.id remount，此时 value state 仍是旧 memo。
@@ -99,6 +101,7 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
       clearAutosaveTimers();
       savingContentRef.current = nextContent;
       setSaveError(null);
+      setSaveStatus("saving");
 
       try {
         await saveWithRetry(
@@ -110,6 +113,8 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
         if (latestValueRef.current === nextContent) {
           lastSavedValueRef.current = nextContent;
           charsSinceFlushRef.current = 0;
+          setSaveStatus("saved");
+          window.setTimeout(() => setSaveStatus((s) => (s === "saved" ? "idle" : s)), 2000);
         }
       } catch {
         if (latestValueRef.current === nextContent) {
@@ -166,6 +171,7 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
     charsSinceFlushRef.current = 0;
     clearAutosaveTimers();
     setSaveError(null);
+    setSaveStatus("idle");
 
     return () => {
       clearAutosaveTimers();
@@ -234,6 +240,7 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
       latestValueRef.current = nextValue;
       setValue(nextValue);
       updateLocal(node.id, nextValue);
+      setSaveStatus("editing");
       scheduleAutosave();
     },
     [boundNodeId, node.id, node.node_type, scheduleAutosave, updateLocal],
@@ -325,9 +332,12 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
           >
             {titleError}
           </p>
-        ) : (
-          <p className="font-helvetica-now text-meta text-graphite">
-            自动保存 · 点击标题可修改名称
+        ) : saveError ? null : (
+          <p className="font-helvetica-now text-meta text-graphite" aria-live="polite">
+            {saveStatus === "editing" && "编辑中…"}
+            {saveStatus === "saving" && "保存中…"}
+            {saveStatus === "saved" && "已保存"}
+            {saveStatus === "idle" && "已保存 · 点击标题可修改"}
           </p>
         )}
       </header>

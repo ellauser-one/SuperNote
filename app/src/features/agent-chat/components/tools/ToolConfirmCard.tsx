@@ -84,12 +84,12 @@ export function ToolConfirmCard() {
 
   return (
     <Card
-      tone="paper"
-      className="rounded-md border border-amber-200 p-8"
+      tone="warning"
+      className="rounded-md p-8"
     >
       <div className="flex items-center gap-4">
-        <Icon className="size-icon-sm shrink-0 text-amber-600" aria-hidden="true" />
-        <p className="font-helvetica-now text-label font-medium uppercase text-amber-700">
+        <Icon className="size-icon-sm shrink-0 text-warning" aria-hidden="true" />
+        <p className="font-helvetica-now text-label font-medium uppercase text-warning">
           {summary.label}
         </p>
       </div>

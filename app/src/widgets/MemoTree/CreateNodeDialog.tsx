@@ -72,11 +72,11 @@ export function CreateNodeDialog({
     <Dialog.Root open={open} onOpenChange={(v) => !v && onClose()}>
       <Dialog.Content>
         <Dialog.Title>{dialogTitle}</Dialog.Title>
-        <Dialog.Description>
+        <Dialog.Description className="font-helvetica-now text-ui text-graphite">
           {type === "folder" ? "给文件夹取个名字" : "给备忘录取个标题"}
         </Dialog.Description>
 
-        <div style={{ marginTop: "var(--spacing-12)" }}>
+        <div className="mt-12">
           <Input
             autoFocus
             value={title}
@@ -87,15 +87,8 @@ export function CreateNodeDialog({
           />
         </div>
 
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "flex-end",
-            gap: "var(--spacing-8)",
-            marginTop: "var(--spacing-16)",
-          }}
-        >
-          <Dialog.Close>取消</Dialog.Close>
+        <div className="mt-16 flex justify-end gap-8">
+          <Dialog.Close className="ds-button ds-button--ghost ds-button--sm">取消</Dialog.Close>
           <Button
             size="sm"
             loading={loading}
