@@ -32,3 +32,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Mastra build output (CLI 生成的构建产物，不进版本库)
+.mastra
