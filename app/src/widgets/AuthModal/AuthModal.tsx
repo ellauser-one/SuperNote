@@ -222,8 +222,8 @@ export function AuthModal({ open, onOpenChange }: AuthModalProps) {
           ) : null}
 
           <div className="mt-4 flex items-center justify-end gap-8">
-            <Dialog.Close className="ds-button ds-button--ghost ds-button--sm" disabled={submitting}>
-              取消
+            <Dialog.Close asChild>
+              <Button variant="ghost" size="sm" disabled={submitting}>取消</Button>
             </Dialog.Close>
             <Button type="submit" size="sm" loading={submitting}>
               {mode === "sign-in" ? "进入工作台" : "注册并继续"}

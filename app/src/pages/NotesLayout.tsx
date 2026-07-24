@@ -14,7 +14,8 @@
  *
  * 正文编辑与无感知自动保存委托 widgets/MemoEditorView。
  */
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { Loader2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { useAuth } from "../app/providers/AuthProvider";
@@ -24,6 +25,9 @@ import {
 } from "../shared/lib/last-opened-memo";
 import { findNode } from "../shared/lib/memo-tree-helpers";
 import { useMemoTreeStore } from "../shared/stores/memo-tree.store";
+import { ApiClientError } from "../shared/services/api/client";
+import { handleUnauthorized } from "../shared/services/unauthorized";
+import { Button } from "../shared/ui";
 import { MemoEditorView } from "../widgets/MemoEditorView";
 
 /* -------------------------------------------------------------------------- */
@@ -34,13 +38,24 @@ function EmptyState({ onCreateFirst }: { onCreateFirst: () => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center gap-8 font-helvetica-now text-ui text-graphite">
       <p>选择备忘录开始编辑</p>
-      <button
-        type="button"
-        className="ds-tree-toolbar__btn"
-        onClick={onCreateFirst}
-      >
+      <Button flat size="sm" onClick={onCreateFirst}>
         创建第一条备忘录
-      </button>
+      </Button>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* 加载失败态（401 走回登录，其它可重试）                                         */
+/* -------------------------------------------------------------------------- */
+
+function TreeErrorState({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div className="ds-error-state font-helvetica-now text-ui text-graphite">
+      <p>加载失败，请检查网络后重试。</p>
+      <Button flat size="sm" onClick={onRetry}>
+        重试
+      </Button>
     </div>
   );
 }
@@ -61,6 +76,9 @@ export function NotesLayout() {
 
   const bootstrappedUserRef = useRef<string | null>(null);
   const initialNoteIdRef = useRef(noteId);
+
+  const [treeError, setTreeError] = useState<string | null>(null);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   const activeNode = useMemo(() => {
     if (!noteId) return null;
@@ -121,8 +139,14 @@ export function NotesLayout() {
         }
 
         bootstrappedUserRef.current = user.id;
-      } catch {
-        /* abort / 网络：允许下次再试 */
+      } catch (err) {
+        if (cancelled) return;
+        // 401：会话失效，统一回登录（页面会跳转，无需本地错误态）
+        if (err instanceof ApiClientError && err.status === 401) {
+          handleUnauthorized();
+          return;
+        }
+        setTreeError(err instanceof Error ? err.message : "加载备忘录失败");
       }
     })();
 
@@ -130,7 +154,14 @@ export function NotesLayout() {
       cancelled = true;
       controller.abort();
     };
-  }, [user?.id, fetchTree, createMemo, reset, navigate]);
+  }, [user?.id, fetchTree, createMemo, reset, navigate, retryNonce]);
+
+  /* ── 重试拉树：清错误 + 重置引导标记，重新触发 bootstrap ──────── */
+  const handleRetryTree = useCallback(() => {
+    setTreeError(null);
+    bootstrappedUserRef.current = null;
+    setRetryNonce((n) => n + 1);
+  }, []);
 
   /* ── 打开 memo 时按 user 记录 last-opened ─────────────────── */
   useEffect(() => {
@@ -159,8 +190,11 @@ export function NotesLayout() {
 
   return (
     <div className="ds-notes-content">
-      {showLoading ? (
-        <div className="flex h-full items-center justify-center font-helvetica-now text-ui text-graphite">
+      {treeError && nodes.length === 0 ? (
+        <TreeErrorState onRetry={handleRetryTree} />
+      ) : showLoading ? (
+        <div className="flex h-full items-center justify-center gap-4 font-helvetica-now text-ui text-graphite">
+          <Loader2 className="size-icon-sm animate-spin" aria-hidden="true" />
           加载中…
         </div>
       ) : activeNode && activeNode.node_type === "memo" ? (

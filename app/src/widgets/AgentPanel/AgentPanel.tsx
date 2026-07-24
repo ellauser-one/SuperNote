@@ -41,7 +41,7 @@ export function AgentPanel() {
   return (
     <aside className="flex h-full min-h-0 w-full min-w-0 overflow-hidden border-l border-vellum bg-bone">
       {/* 会话列表侧栏 */}
-      <div className="flex w-[220px] shrink-0 flex-col border-r border-vellum">
+      <div className="flex shrink-0 flex-col border-r border-vellum" style={{ width: "var(--layout-session-list)" }}>
         <div className="shrink-0 border-b border-vellum px-4 py-4">
           <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
             会话
@@ -56,10 +56,7 @@ export function AgentPanel() {
         <div className="shrink-0 border-b border-vellum px-6 py-6">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-                Memo Agent
-              </p>
-              <h2 className="mt-2 flex items-center gap-4 truncate font-davinci text-title font-medium text-ink">
+              <h2 className="flex items-center gap-4 truncate font-davinci text-title font-medium text-ink">
                 <Bot className="size-icon-sm shrink-0" aria-hidden="true" />
                 <span className="truncate">备忘录助手</span>
               </h2>

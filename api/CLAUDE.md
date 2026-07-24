@@ -44,7 +44,7 @@
 <directory>
 src/index.ts - 进程入口（printBanner → printRuntimeInfo → Bun.serve → printReady）
 src/app.ts - Hono 组装（请求日志 + CORS + 错误处理 + router 聚合）
-src/router/ - 路由层，负责路径挂载、zod 校验、调 service、返回响应
+src/router/ - 路由层，负责路径挂载、zod 校验、调 service、返回响应（health/profile/memo/feedback/agent 子路由）
 src/dto/ - DTO 层，zod schema 与 infer 类型
 src/model/ - 模型层，响应信封类型与领域类型
 src/service/ - 服务层，业务编排与权限判断
@@ -55,5 +55,12 @@ src/config/ - 配置层，env.ts（zod 校验环境变量）
 src/lib/ - 集成库层，supabase-rest.ts + supabase-auth.ts + banner.ts + ansi.ts
 supabase/ - Schema SQL 留底（profiles.sql）
 </directory>
+
+## 发布冻结新增（round 02 · 最小反馈闭环 + AI 分类）
+- 路由 `POST /api/feedback`：仅 Supabase REST 写入 `public.feedback`，owner_id 来自 JWT，body 拒绝 `id/user_id/owner_id`。
+- 路由 `POST /agent/memos/classify`：读取 memo（owner 校验）→ 转发用户 JWT 给 `chat /v1/classify` → 落库 `memos.category`。
+- CORS 区分 dev/prod：非 `production` 用 `*` 通配；`production` 严格 `CORS_ORIGINS` 白名单。
+- 新增文件：`router/feedback.router.ts`、`router/agent.router.ts`、`service/feedback.service.ts`、`service/memo-classify.service.ts`、`repository/feedback.repository.ts`、`dto/feedback.dto.ts`、`dto/classify.dto.ts`。
+- 迁移：`scripts/sql/round02_feedback.sql`（经 Supabase MCP 执行）。
 
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md

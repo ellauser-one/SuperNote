@@ -8,10 +8,12 @@
  * - 只注入 Authorization: Bearer <access_token>
  * - 业务不直连 Supabase 数据；Supabase 仅用于登录态 token
  * - 非 2xx 解析 envelope，抛出带 code 的 ChatClientError
+ * - 401（无 token / token 失效）统一走 handleUnauthorized 回登录
  */
 import { DefaultChatTransport } from "ai";
 
 import { supabase } from "../supabase/client";
+import { handleUnauthorized } from "../unauthorized";
 
 const chatBase = (
   (import.meta.env.VITE_CHAT_BASE_URL as string | undefined) || ""
@@ -73,6 +75,8 @@ export async function chatFetch(
 
   const token = session?.access_token;
   if (!token) {
+    // 无会话即失效：直接回登录
+    handleUnauthorized();
     throw new ChatClientError(
       "未登录或登录已失效，请重新登录后再与助手对话。",
       "UNAUTHORIZED",
@@ -126,6 +130,10 @@ export function createChatTransport(sessionId?: string | null) {
 
 async function toChatClientError(response: Response): Promise<ChatClientError> {
   const status = response.status;
+  // chat 流 401：会话失效 → 回登录
+  if (status === 401) {
+    handleUnauthorized();
+  }
   let body: ErrorEnvelope | null = null;
 
   try {

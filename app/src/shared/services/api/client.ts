@@ -1,10 +1,14 @@
 /**
- * [INPUT]: 依赖 auth.getAccessToken 与 VITE_API_BASE_URL（兼容 VITE_API_URL）
+ * [INPUT]: 依赖 auth.getAccessToken、VITE_API_BASE_URL（兼容 VITE_API_URL）、
+ *         shared/services/unauthorized.handleUnauthorized
  * [OUTPUT]: 对外提供 apiFetch / apiJson（自动附带 Authorization Bearer）
  * [POS]: shared/services/api 浏览器 → api 客户端；禁止直连 chat
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ *
+ * 401 收敛：收到 HTTP 401 一律调用 handleUnauthorized（注销 + 回登录）
  */
 import { getAccessToken } from "../auth/auth.service";
+import { handleUnauthorized } from "../unauthorized";
 
 const apiBase = (
   (import.meta.env.VITE_API_BASE_URL as string | undefined) ||
@@ -68,10 +72,17 @@ export async function apiFetch(path: string, options: ApiFetchOptions = {}): Pro
 
   const url = path.startsWith("http") ? path : `${apiBase}${path.startsWith("/") ? path : `/${path}`}`;
 
-  return fetch(url, {
+  const res = await fetch(url, {
     ...options,
     headers,
   });
+
+  // 全局 401 收敛：会话失效 → 注销并回登录页
+  if (res.status === 401) {
+    handleUnauthorized();
+  }
+
+  return res;
 }
 
 export async function apiJson<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {

@@ -24,12 +24,15 @@ export const app = new Hono();
 app.use("*", requestLogger());
 
 // 2) CORS
+// 非 production 使用通配 *（dev 便利）；production 严格使用白名单。
+// 鉴权走 Bearer，不开启 credentials。
+const corsOrigin = env.nodeEnv === "production" ? env.corsOrigins : "*";
 app.use(
   "*",
   cors({
-    origin: env.corsOrigins,
+    origin: corsOrigin,
     allowHeaders: ["Authorization", "Content-Type"],
-    allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   }),
 );
 

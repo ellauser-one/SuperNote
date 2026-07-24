@@ -1,10 +1,12 @@
 /**
  * [INPUT]: 依赖 React context/state 与 createPortal；样式真相来自 index.css 的 .ds-dialog*
  * [OUTPUT]: 对外提供 Dialog 设计系统对话框（Root/Trigger/Content/Title/Description/Close）
- * [POS]: shared/ui 原子组件，替代第三方 Dialog；支持受控 open/onOpenChange
+ * [POS]: shared/ui 原子组件，替代第三方 Dialog；支持受控 open/onOpenChange；Close/Trigger 支持 asChild
  * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
  */
+import React from "react";
 import {
+  Children,
   createContext,
   useCallback,
   useContext,
@@ -79,19 +81,35 @@ function DialogRoot({
 
 type DialogTriggerProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
+  /** Render the child element directly instead of wrapping in a <button> */
+  asChild?: boolean;
 };
 
-function DialogTrigger({ children, className, onClick, type = "button", ...props }: DialogTriggerProps) {
+function DialogTrigger({ children, className, onClick, type = "button", asChild = false, ...props }: DialogTriggerProps) {
   const { setOpen } = useDialogContext("Dialog.Trigger");
+
+  const handleClick = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    onClick?.(event);
+    setOpen(true);
+  }, [onClick, setOpen]);
+
+  if (asChild && Children.count(children) === 1) {
+    const child = Children.only(children) as React.ReactElement<Record<string, unknown>>;
+    return React.cloneElement(child, {
+      onClick: (e: React.MouseEvent) => {
+        (child.props as Record<string, unknown>).onClick?.(e);
+        handleClick(e as React.MouseEvent<HTMLButtonElement>);
+      },
+      className: cn(child.props.className as string, className),
+      ...props,
+    });
+  }
 
   return (
     <button
       type={type}
       className={className}
-      onClick={(event) => {
-        onClick?.(event);
-        setOpen(true);
-      }}
+      onClick={handleClick}
       {...props}
     >
       {children}
@@ -168,19 +186,35 @@ function DialogDescription({ className, ...props }: HTMLAttributes<HTMLParagraph
 
 type DialogCloseProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
+  /** Render the child element directly instead of wrapping in a <button> */
+  asChild?: boolean;
 };
 
-function DialogClose({ children, className, onClick, type = "button", ...props }: DialogCloseProps) {
+function DialogClose({ children, className, onClick, type = "button", asChild = false, ...props }: DialogCloseProps) {
   const { setOpen } = useDialogContext("Dialog.Close");
+
+  const handleClick = useCallback((event: React.MouseEvent<HTMLButtonElement>) => {
+    onClick?.(event);
+    setOpen(false);
+  }, [onClick, setOpen]);
+
+  if (asChild && Children.count(children) === 1) {
+    const child = Children.only(children) as React.ReactElement<Record<string, unknown>>;
+    return React.cloneElement(child, {
+      onClick: (e: React.MouseEvent) => {
+        (child.props as Record<string, unknown>).onClick?.(e);
+        handleClick(e as React.MouseEvent<HTMLButtonElement>);
+      },
+      className: cn(child.props.className as string, className),
+      ...props,
+    });
+  }
 
   return (
     <button
       type={type}
       className={className}
-      onClick={(event) => {
-        onClick?.(event);
-        setOpen(false);
-      }}
+      onClick={handleClick}
       {...props}
     >
       {children}

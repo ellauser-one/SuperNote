@@ -197,6 +197,8 @@
   --min-app-width: 320px;
   --min-textarea: 160px;
   --min-preview-panel: 240px;
+  --max-preview-content: 120px;
+  --layout-session-list: 220px;
 
   --shadow-preview: 0 16px 48px color-mix(in srgb, var(--color-ink) 14%, transparent);
 
@@ -1184,23 +1186,6 @@
   box-shadow: var(--shadow-elevated, 0 4px 16px color-mix(in srgb, var(--color-ink) 12%, transparent));
 }
 
-.ds-memo-save-toast__retry {
-  flex-shrink: 0;
-  margin: 0;
-  padding: var(--spacing-4) var(--spacing-8);
-  border: 1px solid color-mix(in srgb, var(--color-ink) 18%, var(--color-vellum));
-  border-radius: var(--radius-sm);
-  background: var(--color-chalk);
-  color: var(--color-ink);
-  font-family: var(--font-helvetica-now);
-  font-size: var(--text-meta);
-  cursor: pointer;
-}
-
-.ds-memo-save-toast__retry:hover {
-  background: color-mix(in srgb, var(--color-ink) 6%, var(--color-chalk));
-}
-
 /* -------------------------------------------------------------------------- */
 /* Sidebar（左侧永久展开导航侧栏）                                             */
 /* -------------------------------------------------------------------------- */
@@ -1374,27 +1359,34 @@
   flex-shrink: 0;
 }
 
-.ds-tree-toolbar__btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--spacing-4);
-  height: var(--control-height-sm);
-  min-width: var(--control-height-sm);
-  padding-inline: var(--spacing-6);
+/* —— Flat：工具型扁平按钮，用于侧栏工具栏等紧凑场景 —— */
+.ds-button--flat {
   border: 1px solid color-mix(in srgb, var(--color-ink) 12%, var(--color-vellum));
   border-radius: var(--radius-sm);
   background: var(--color-paper);
   color: var(--color-ink);
-  font-family: var(--font-helvetica-now);
-  font-size: var(--text-meta);
-  line-height: var(--leading-compact);
-  cursor: pointer;
-  transition: background-color var(--duration-fast) var(--ease-standard);
+  box-shadow: none;
+  text-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
-.ds-tree-toolbar__btn:hover {
+.ds-button--flat:hover:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, var(--color-ink) 18%, var(--color-vellum));
   background: color-mix(in srgb, var(--color-ink) 6%, var(--color-paper));
+  box-shadow: none;
+  transform: none;
+}
+
+.ds-button--flat:active:not(:disabled):not(.ds-button--loading) {
+  background: color-mix(in srgb, var(--color-ink) 10%, var(--color-paper));
+  box-shadow: none;
+  transform: none;
+}
+
+/* Flat 按钮在只有图标时保证最小触控面 */
+.ds-button--flat.ds-button--sm:not(:has(.ds-button__label)) {
+  min-width: var(--control-height-sm);
 }
 
 .ds-tree-empty {
@@ -1637,6 +1629,76 @@
 
 .ds-tree-context-menu__item:hover {
   background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Toast viewport（轻量全局反馈层）                                            */
+/* -------------------------------------------------------------------------- */
+
+.ds-toast-viewport {
+  position: fixed;
+  left: 50%;
+  bottom: var(--spacing-20);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-8);
+  transform: translateX(-50%);
+  padding-inline: var(--spacing-12);
+  pointer-events: none;
+}
+
+.ds-toast {
+  pointer-events: auto;
+  max-width: min(100vw - var(--spacing-32), 32rem);
+  padding: var(--spacing-10) var(--spacing-14);
+  border: 1px solid color-mix(in srgb, var(--color-ink) 12%, var(--color-vellum));
+  border-radius: var(--radius-md);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  box-shadow: var(--shadow-preview);
+  font-family: var(--font-helvetica-now);
+  font-size: var(--text-ui);
+  line-height: var(--leading-compact);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.ds-toast--success {
+  border-color: color-mix(in srgb, var(--color-ink) 16%, var(--color-paper));
+}
+
+.ds-toast--error {
+  border-color: var(--color-warning-muted);
+  background: color-mix(in srgb, var(--color-warning-muted) 8%, var(--color-paper));
+}
+
+/* -------------------------------------------------------------------------- */
+/* 反馈浮动按钮（AppShell 右下角常驻入口）                                       */
+/* -------------------------------------------------------------------------- */
+
+.ds-feedback-fab {
+  position: fixed;
+  right: var(--spacing-20);
+  bottom: var(--spacing-20);
+  z-index: 40;
+}
+
+/* -------------------------------------------------------------------------- */
+/* 备忘录编辑区加载失败态                                                        */
+/* -------------------------------------------------------------------------- */
+
+.ds-error-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-12);
+  height: 100%;
+  padding: var(--spacing-20);
+  text-align: center;
 }
 
 /*

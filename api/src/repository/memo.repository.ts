@@ -233,6 +233,80 @@ export async function findMemoByNodeIdForUser(
   return normalizeMemo(rows[0]!);
 }
 
+/**
+ * 按 nodeId + user_id 取 memo 的标题与正文（双表 owner 校验）。
+ * 节点或正文缺失 → 404。
+ */
+export async function getMemoByIdForUser(
+  userId: string,
+  nodeId: string,
+): Promise<{ title: string; content: string }> {
+  const nodeQuery = createPostgrestQuery()
+    .select("id,title")
+    .eq("user_id", userId)
+    .eq("id", nodeId)
+    .limit(1)
+    .build();
+
+  const nodes = await supabaseRest<Record<string, unknown>[]>(NODES, {
+    method: "GET",
+    query: nodeQuery,
+  });
+
+  if (!nodes || nodes.length === 0) {
+    throw new HttpError(404, "NOT_FOUND", "备忘录不存在");
+  }
+  const title = String(nodes[0]!.title);
+
+  const memoQuery = createPostgrestQuery()
+    .select("content_mdx")
+    .eq("user_id", userId)
+    .eq("node_id", nodeId)
+    .limit(1)
+    .build();
+
+  const memos = await supabaseRest<Record<string, unknown>[]>(MEMOS, {
+    method: "GET",
+    query: memoQuery,
+  });
+
+  if (!memos || memos.length === 0) {
+    throw new HttpError(404, "NOT_FOUND", "备忘录正文不存在");
+  }
+  const contentMdx = memos[0]!.content_mdx;
+  const content = typeof contentMdx === "string" ? contentMdx : "";
+
+  return { title, content };
+}
+
+/** PATCH memos.category（owner 校验由 user_id 过滤保证） */
+export async function updateMemoCategory(
+  userId: string,
+  nodeId: string,
+  category: string,
+): Promise<{ node_id: string; category: string }> {
+  const query = createPostgrestQuery()
+    .eq("user_id", userId)
+    .eq("node_id", nodeId)
+    .build();
+
+  const updated = await supabaseRest<Record<string, unknown>[]>(MEMOS, {
+    method: "PATCH",
+    query: { ...query, select: "node_id,category" },
+    body: { category },
+    returnRepresentation: true,
+  });
+
+  const first = Array.isArray(updated) ? updated[0] : null;
+  if (!first) {
+    throw new HttpError(404, "NOT_FOUND", "备忘录正文不存在");
+  }
+  return {
+    node_id: String(first.node_id),
+    category: first.category == null ? "" : String(first.category),
+  };
+}
+
 export async function insertMemo(row: {
   node_id: string;
   user_id: string;

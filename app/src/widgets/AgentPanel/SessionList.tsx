@@ -12,11 +12,11 @@
  * - 当前会话高亮（bg-vellum）
  * - 空态引导新建
  */
-import { MessageSquarePlus, Trash2 } from "lucide-react";
+import { Loader2, MessageSquarePlus, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useSessionStore } from "../../shared/stores/session.store";
-import { Button, Dialog } from "../../shared/ui";
+import { Button, Dialog, Input } from "../../shared/ui";
 import type { ChatSession } from "../../shared/services/chat/session.api";
 
 /* -------------------------------------------------------------------------- */
@@ -106,9 +106,9 @@ function SessionItem({
     >
       <div className="min-w-0 flex-1">
         {editing ? (
-          <input
+          <Input
             ref={inputRef}
-            className="w-full rounded border border-vellum bg-bone px-4 py-2 font-helvetica-now text-ui text-ink outline-none focus:border-graphite"
+            className="w-full"
             value={editValue}
             aria-label="编辑会话标题"
             onChange={(e) => setEditValue(e.target.value)}
@@ -137,17 +137,18 @@ function SessionItem({
       </div>
 
       {/* 删除按钮（hover 显示） */}
-      <button
-        type="button"
-        className="shrink-0 rounded p-2 text-graphite/50 opacity-0 transition-opacity hover:text-ink group-hover:opacity-100"
+      <Button
+        variant="ghost"
+        flat
+        size="sm"
         aria-label={`删除会话：${session.title}`}
+        icon={<Trash2 className="size-icon-xs" aria-hidden="true" />}
+        className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
         onClick={(e) => {
           e.stopPropagation();
           onDelete();
         }}
-      >
-        <Trash2 className="size-4" aria-hidden="true" />
-      </button>
+      />
     </div>
   );
 }
@@ -177,7 +178,8 @@ export function SessionList() {
   /* ---- 加载态 ---- */
   if (sessionsLoading) {
     return (
-      <div className="flex flex-1 items-center justify-center p-8">
+      <div className="flex flex-1 items-center justify-center gap-4 p-8">
+        <Loader2 className="size-icon-sm animate-spin" aria-hidden="true" />
         <p className="font-helvetica-now text-meta text-graphite">加载中…</p>
       </div>
     );
@@ -235,10 +237,8 @@ export function SessionList() {
             删除后无法恢复，确定要删除「{deleteTarget?.title}」吗？
           </Dialog.Description>
           <div className="mt-8 flex justify-end gap-4">
-            <Dialog.Close
-              className="ds-button ds-button--outline ds-button--sm"
-            >
-              取消
+            <Dialog.Close asChild>
+              <Button variant="outline" size="sm">取消</Button>
             </Dialog.Close>
             <Button
               variant="primary"

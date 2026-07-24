@@ -128,7 +128,7 @@ export function ToolConfirmCard({ message }: { message: UIMessage }) {
           </>
         )}
         {"content" in summary && summary.content && (
-          <div className="mt-2 max-h-[120px] overflow-y-auto rounded bg-bone p-4">
+          <div className="mt-2 overflow-y-auto rounded bg-bone p-4" style={{ maxHeight: "var(--max-preview-content)" }}>
             <pre className="whitespace-pre-wrap font-helvetica-now text-meta text-graphite">
               {summary.content.length > 300
                 ? `${summary.content.slice(0, 300)}…`

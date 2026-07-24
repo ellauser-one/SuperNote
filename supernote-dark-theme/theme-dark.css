@@ -1,0 +1,221 @@
+/**
+ * SuperNote — Dark Theme Override（暗色高级感覆盖层 · 可选启用）
+ * ===========================================================================
+ * [INPUT]   依赖 app/src/index.css 的 token 体系；必须在 index.css / token-lock.css
+ *           之后 import（本文件只"重映射"与"定向覆盖"，不新增组件逻辑）。
+ *
+ * [激活方式] 二选一，加在 <html> 上：
+ *   - 属性： document.documentElement.setAttribute('data-theme', 'dark')
+ *   - 类：   document.documentElement.classList.add('dark')
+ *   推荐在 index.css 的 import 之后引入本文件：
+ *     import './shared/ui/token-lock.css';
+ *     import '../supernote-dark-theme/theme-dark.css';  // 或放你的静态目录
+ *
+ * [原则]    不改任何组件、不改任何功能、不改 index.css：
+ *   1) 颜色全部走 token，这里只重映射 --color-* / --surface-*。
+ *   2) 阴影是"以 ink 为深色漆"的，暗态下重写所有 --shadow-* 变量为暗态深度。
+ *   3) 少量"把 --color-ink 当深色漆用"的类（primary 按钮 / ink 卡 / 弹窗遮罩 /
+ *      激活树节点）做定向覆盖——仍是纯 CSS 覆盖，不碰 TSX。
+ *   4) 作用域用 :root[data-theme="dark"]（特异性高于 :root），import 顺序无关。
+ *
+ * [风格]    暖调石墨（warm-charcoal）：咖啡近黑 + 暖白文字，承接浅色纸感的品牌，
+ *           在暗态下更显"高级 / 编辑感"。如需更冷的中性灰，改 --color-putty/bone 即可。
+ */
+
+:root[data-theme="dark"],
+:root.dark {
+  /* ------------------------------------------------------------------ */
+  /* 1. 颜色 — 暖调石墨                                                   */
+  /* ------------------------------------------------------------------ */
+  --color-putty: #161513;   /* canvas 画布：暖近黑 */
+  --color-bone:  #1d1b17;   /* panel 面板 */
+  --color-chalk: #26231d;   /* raised 抬升面 */
+  --color-vellum:#3d382f;   /* 边框 / 分隔浅漆 */
+  --color-graphite:#a8a194; /* 次级文字 */
+  --color-ash:   #6e695e;   /* 三级文字 */
+  --color-ink:   #ECE8E0;   /* 前景文字（暖白） */
+  --color-paper: #0F0E0B;   /* 深色基底 / room / 编辑器底 */
+  --color-warning: #f5b942;
+  --color-warning-muted: #fbbf24;
+
+  --surface-canvas: var(--color-putty);
+  --surface-card:   var(--color-bone);
+  --surface-muted:  var(--color-chalk);
+  --surface-room:   var(--color-paper);
+  --surface-paper:  var(--color-paper);
+
+  /* ------------------------------------------------------------------ */
+  /* 2. 阴影 — 暗态深度（外暗投影 + 内顶高光）                            */
+  /*    原浅色阴影"外暗 + 内白高光"在暗底上要反过来才成立，这里整组重写。   */
+  /* ------------------------------------------------------------------ */
+  --shadow-preview: 0 16px 48px color-mix(in srgb, #000 55%, transparent);
+
+  --shadow-button-primary:
+    0 1px 2px color-mix(in srgb, #000 55%, transparent),
+    0 6px 16px color-mix(in srgb, #000 45%, transparent),
+    0 12px 26px color-mix(in srgb, #000 35%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 12%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, #000 50%, transparent);
+
+  --shadow-button-primary-hover:
+    0 2px 3px color-mix(in srgb, #000 50%, transparent),
+    0 8px 20px color-mix(in srgb, #000 50%, transparent),
+    0 16px 32px color-mix(in srgb, #000 40%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 16%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, #000 50%, transparent);
+
+  --shadow-button-primary-active:
+    0 1px 2px color-mix(in srgb, #000 40%, transparent),
+    inset 0 2px 5px color-mix(in srgb, #000 60%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #000 35%, transparent);
+
+  --shadow-button-surface:
+    0 1px 1px color-mix(in srgb, #000 40%, transparent),
+    0 3px 10px color-mix(in srgb, #000 35%, transparent),
+    0 8px 18px color-mix(in srgb, #000 25%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 8%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, #000 40%, transparent);
+
+  --shadow-button-surface-hover:
+    0 2px 2px color-mix(in srgb, #000 42%, transparent),
+    0 5px 14px color-mix(in srgb, #000 38%, transparent),
+    0 12px 24px color-mix(in srgb, #000 30%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 12%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, #000 36%, transparent);
+
+  --shadow-button-surface-active:
+    0 1px 2px color-mix(in srgb, #000 40%, transparent),
+    inset 0 2px 5px color-mix(in srgb, #000 50%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #000 30%, transparent);
+
+  --shadow-field:
+    0 1px 1px color-mix(in srgb, #000 35%, transparent),
+    inset 0 1px 2px color-mix(in srgb, #000 45%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, #ffffff 6%, transparent);
+
+  --shadow-field-focus:
+    0 0 0 1px color-mix(in srgb, var(--color-ink) 30%, transparent),
+    0 1px 2px color-mix(in srgb, #000 40%, transparent),
+    inset 0 1px 2px color-mix(in srgb, #000 40%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, #ffffff 8%, transparent);
+
+  --shadow-card:
+    0 1px 1px color-mix(in srgb, #000 40%, transparent),
+    0 4px 14px color-mix(in srgb, #000 45%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 7%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, #000 40%, transparent);
+
+  --shadow-button-ghost:
+    0 1px 1px color-mix(in srgb, #000 30%, transparent),
+    0 2px 8px color-mix(in srgb, #000 30%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 6%, transparent),
+    inset 0 -1px 0 color-mix(in srgb, #000 30%, transparent);
+
+  --shadow-button-ghost-hover:
+    0 2px 2px color-mix(in srgb, #000 32%, transparent),
+    0 4px 12px color-mix(in srgb, #000 34%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 10%, transparent),
+    inset 0 -1px 1px color-mix(in srgb, #000 34%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, #ffffff 6%, transparent);
+
+  --shadow-button-ghost-active:
+    inset 0 2px 4px color-mix(in srgb, #000 45%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #000 30%, transparent);
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. 定向覆盖 — 解决"--color-ink 被当深色漆"的语义冲突                  */
+/* ------------------------------------------------------------------ */
+
+/* Primary 按钮：浅色态里 ink=白，会变成"白按钮"。在暗态改回优雅的深炭按钮 */
+:root[data-theme="dark"] .ds-button--primary,
+:root.dark .ds-button--primary {
+  color: var(--color-ink);
+  border-color: color-mix(in srgb, #000 70%, var(--color-vellum));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-chalk) 70%, #000) 0%,
+      #000 50%,
+      color-mix(in srgb, #000 80%, var(--color-graphite)) 100%
+    );
+  box-shadow: var(--shadow-button-primary);
+  text-shadow: 0 1px 0 color-mix(in srgb, #000 60%, transparent);
+}
+
+:root[data-theme="dark"] .ds-button--primary:hover:not(:disabled):not(.ds-button--loading),
+:root.dark .ds-button--primary:hover:not(:disabled):not(.ds-button--loading) {
+  border-color: color-mix(in srgb, #000 60%, var(--color-vellum));
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--color-chalk) 85%, #000) 0%,
+      color-mix(in srgb, #000 92%, var(--color-graphite)) 52%,
+      color-mix(in srgb, #000 78%, var(--color-graphite)) 100%
+    );
+  box-shadow: var(--shadow-button-primary-hover);
+  transform: translateY(-1px);
+}
+
+:root[data-theme="dark"] .ds-button--primary:active:not(:disabled):not(.ds-button--loading),
+:root.dark .ds-button--primary:active:not(:disabled):not(.ds-button--loading) {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, #000 96%, var(--color-graphite)) 0%,
+      #000 55%,
+      color-mix(in srgb, #000 82%, var(--color-vellum)) 100%
+    );
+  box-shadow: var(--shadow-button-primary-active);
+  transform: translateY(1px);
+  text-shadow: none;
+}
+
+/* ink 卡：浅色态里 ink=黑，暗态会变成"白卡"。改回深邃近黑卡 */
+:root[data-theme="dark"] .ds-card--ink,
+:root.dark .ds-card--ink {
+  border-color: color-mix(in srgb, #000 70%, var(--color-vellum));
+  background:
+    linear-gradient(
+      180deg,
+      #15140f 0%,
+      #0c0b08 100%
+    );
+  color: var(--color-ink);
+  box-shadow: var(--shadow-button-primary);
+}
+
+/* 弹窗遮罩：原用 ink 40% 透明，暗态下 ink=白会变成"白雾"。改回深色遮罩 */
+:root[data-theme="dark"] .ds-dialog-backdrop,
+:root.dark .ds-dialog-backdrop {
+  background: color-mix(in srgb, #000 60%, transparent);
+}
+
+/* 激活树节点：浅色态是"黑底白字"。暗态改为优雅的磨砂选中态（不刺眼） */
+:root[data-theme="dark"] .ds-tree-node--active,
+:root.dark .ds-tree-node--active {
+  background: color-mix(in srgb, var(--color-ink) 14%, transparent);
+  color: var(--color-ink);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-ink) 18%, transparent);
+}
+
+:root[data-theme="dark"] .ds-tree-node--active:hover,
+:root.dark .ds-tree-node--active:hover {
+  background: color-mix(in srgb, var(--color-ink) 18%, transparent);
+}
+
+/* 拖拽落点线 / 右键菜单等纯 ink 漆标记，暗态下保持可读 */
+:root[data-theme="dark"] .ds-tree-drop-line--active::after,
+:root.dark .ds-tree-drop-line--active::after,
+:root[data-theme="dark"] .ds-tree-drop-line--active::before,
+:root.dark .ds-tree-drop-line--active::before,
+:root[data-theme="dark"] .ds-tree-root-drop--active,
+:root.dark .ds-tree-root-drop--active {
+  background: var(--color-ink);
+}
+
+:root[data-theme="dark"] .ds-tree-root-drop--active,
+:root.dark .ds-tree-root-drop--active {
+  box-shadow: inset 0 2px 0 0 var(--color-ink);
+  background: color-mix(in srgb, var(--color-ink) 5%, transparent);
+}

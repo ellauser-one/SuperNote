@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SuperNote · 暗色高级感预览（当前浅色 ↔ 新暗色 可切换）</title>
+<style>
+  /* ========================================================================
+     本预览页内联了 SuperNote 现有浅色 token 与"新暗色"token，用于对照。
+     生产环境请用 supernote-dark-theme/theme-dark.css（仅暗色覆盖，不重复浅色）。
+     ======================================================================== */
+
+  /* ---------- 浅色（当前 / before） ---------- */
+  :root {
+    --color-putty: #c4c3b6; --color-ink: #000000; --color-bone: #e7e5e4;
+    --color-chalk: #ebebeb; --color-vellum: #dfdcd5; --color-graphite: #595855;
+    --color-ash: #808080; --color-paper: #ffffff;
+    --color-warning: #b45309; --color-warning-muted: #fbbf24;
+
+    --surface-canvas: var(--color-putty); --surface-card: var(--color-bone);
+    --surface-muted: var(--color-chalk); --surface-room: var(--color-ink);
+    --surface-paper: var(--color-paper);
+
+    --font-sans: "Helvetica Now", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-serif: "Davinci", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+
+    --text-caption: 9px; --text-label: 10px; --text-meta: 11px; --text-ui: 12px;
+    --text-ui-md: 13px; --text-body: 14px; --text-title: 16px; --text-title-lg: 20px;
+    --text-subheading: 22px; --leading-compact: 1.25; --leading-body: 1.5; --leading-prose: 1.65; --leading-tight: 1.15;
+
+    --spacing-4: 4px; --spacing-6: 6px; --spacing-8: 8px; --spacing-10: 10px;
+    --spacing-12: 12px; --spacing-14: 14px; --spacing-16: 16px; --spacing-20: 20px;
+    --spacing-24: 24px; --spacing-32: 32px;
+
+    --control-height-sm: 26px; --control-height-md: 32px; --control-height-lg: 36px;
+    --icon-sm: 14px; --icon-md: 16px; --avatar-sm: 28px; --avatar-md: 40px;
+
+    --radius-sm: 4px; --radius-md: 8px; --radius-lg: 12px; --radius-xl: 14px; --radius-2xl: 16px; --radius-full: 9999px;
+    --radius-buttons: 14px; --radius-cards: 12px; --radius-control: 8px;
+
+    --shadow-button-primary:
+      0 1px 1px rgba(0,0,0,.12), 0 4px 8px rgba(0,0,0,.18), 0 10px 22px rgba(0,0,0,.12),
+      inset 0 1px 0 rgba(255,255,255,.28), inset 0 -1px 1px rgba(0,0,0,.55);
+    --shadow-button-surface:
+      0 1px 1px rgba(0,0,0,.06), 0 3px 8px rgba(0,0,0,.10), 0 8px 16px rgba(0,0,0,.06),
+      inset 0 1px 0 #fff, inset 0 -1px 1px rgba(0,0,0,.10);
+    --shadow-button-ghost:
+      0 1px 1px rgba(0,0,0,.04), 0 2px 6px rgba(0,0,0,.06),
+      inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 0 rgba(0,0,0,.06);
+    --shadow-field:
+      0 1px 1px rgba(0,0,0,.04), inset 0 1px 2px rgba(0,0,0,.10);
+    --shadow-field-focus:
+      0 0 0 1px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.08), inset 0 1px 2px rgba(0,0,0,.08);
+    --shadow-card:
+      0 1px 1px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.08),
+      inset 0 1px 0 rgba(255,255,255,.75), inset 0 -1px 0 rgba(0,0,0,.06);
+    --shadow-preview: 0 16px 48px rgba(0,0,0,.14);
+  }
+
+  /* ---------- 暗色（新 / after） ---------- */
+  :root.dark {
+    --color-putty: #161513; --color-bone: #1d1b17; --color-chalk: #26231d;
+    --color-vellum:#3d382f; --color-graphite:#a8a194; --color-ash: #6e695e;
+    --color-ink: #ECE8E0; --color-paper: #0F0E0B;
+    --color-warning: #f5b942; --color-warning-muted: #fbbf24;
+
+    --surface-canvas: var(--color-putty); --surface-card: var(--color-bone);
+    --surface-muted: var(--color-chalk); --surface-room: var(--color-paper);
+    --surface-paper: var(--color-paper);
+
+    --shadow-preview: 0 16px 48px rgba(0,0,0,.55);
+    --shadow-button-primary:
+      0 1px 2px rgba(0,0,0,.55), 0 6px 16px rgba(0,0,0,.45), 0 12px 26px rgba(0,0,0,.35),
+      inset 0 1px 0 rgba(255,255,255,.12), inset 0 -1px 1px rgba(0,0,0,.5);
+    --shadow-button-surface:
+      0 1px 1px rgba(0,0,0,.4), 0 3px 10px rgba(0,0,0,.35), 0 8px 18px rgba(0,0,0,.25),
+      inset 0 1px 0 rgba(255,255,255,.08), inset 0 -1px 1px rgba(0,0,0,.4);
+    --shadow-button-ghost:
+      0 1px 1px rgba(0,0,0,.3), 0 2px 8px rgba(0,0,0,.3),
+      inset 0 1px 0 rgba(255,255,255,.06), inset 0 -1px 0 rgba(0,0,0,.3);
+    --shadow-field:
+      0 1px 1px rgba(0,0,0,.35), inset 0 1px 2px rgba(0,0,0,.45);
+    --shadow-field-focus:
+      0 0 0 1px rgba(236,232,224,.30), 0 1px 2px rgba(0,0,0,.4), inset 0 1px 2px rgba(0,0,0,.4);
+    --shadow-card:
+      0 1px 1px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.45),
+      inset 0 1px 0 rgba(255,255,255,.07), inset 0 -1px 0 rgba(0,0,0,.4);
+  }
+
+  /* ---------- base ---------- */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  html { background: var(--surface-canvas); color: var(--color-ink);
+         font-family: var(--font-sans); font-size: var(--text-body); line-height: var(--leading-body); }
+
+  /* ---------- shell ---------- */
+  .ds-app-grid { display: grid; grid-template-columns: 220px 1fr 320px;
+                 height: 100vh; min-height: 0; }
+  .ds-sidebar { border-right: 1px solid color-mix(in srgb, var(--color-vellum) 60%, transparent);
+                padding: var(--spacing-12); display: flex; flex-direction: column; gap: var(--spacing-12); min-width: 0; overflow: hidden; }
+  .ds-notes-content { min-width: 0; overflow: hidden; display: flex; flex-direction: column; padding: var(--spacing-16) var(--spacing-20); gap: var(--spacing-16); }
+  .agent-panel { border-left: 1px solid color-mix(in srgb, var(--color-vellum) 60%, transparent);
+                 padding: var(--spacing-12); display: flex; flex-direction: column; gap: var(--spacing-12); min-width: 0; overflow: hidden; }
+
+  /* ---------- brand ---------- */
+  .brand { display: flex; align-items: center; gap: var(--spacing-8); }
+  .brand__mark { width: 24px; height: 24px; border-radius: var(--radius-md);
+                 background: linear-gradient(180deg, var(--color-bone), var(--color-chalk));
+                 border: 1px solid var(--color-vellum); display: grid; place-items: center;
+                 font-family: var(--font-serif); font-weight: 500; }
+  :root.dark .brand__mark { background: linear-gradient(180deg, #15140f, #000); }
+  .brand__name { font-family: var(--font-serif); font-size: var(--text-title); font-weight: 500; }
+
+  /* ---------- buttons ---------- */
+  .ds-button { display: inline-flex; align-items: center; justify-content: center; gap: var(--spacing-6);
+               border-style: solid; border-width: 1px; border-radius: var(--radius-buttons);
+               font-family: var(--font-sans); font-weight: 500; letter-spacing: .01em; line-height: var(--leading-compact);
+               white-space: nowrap; cursor: pointer; -webkit-tap-highlight-color: transparent; transition: .14s; }
+  .ds-button--primary { color: var(--color-paper); border-color: #000;
+    background: linear-gradient(180deg, color-mix(in srgb, var(--color-ink) 78%, #fff) 0%, var(--color-ink) 46%, color-mix(in srgb, var(--color-ink) 88%, var(--color-graphite)) 100%);
+    box-shadow: var(--shadow-button-primary); }
+  :root.dark .ds-button--primary { color: var(--color-ink); border-color: color-mix(in srgb, #000 70%, var(--color-vellum));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--color-chalk) 70%, #000) 0%, #000 50%, color-mix(in srgb, #000 80%, var(--color-graphite)) 100%); }
+  .ds-button--outline { color: var(--color-ink); border-color: color-mix(in srgb, var(--color-vellum) 55%, var(--color-ink));
+    background: linear-gradient(180deg, #fff 0%, color-mix(in srgb, var(--color-bone) 70%, #fff) 55%, var(--color-bone) 100%);
+    box-shadow: var(--shadow-button-surface); }
+  .ds-button--ghost { color: var(--color-ink); border-color: color-mix(in srgb, var(--color-ink) 14%, transparent);
+    background: linear-gradient(180deg, color-mix(in srgb, #fff 52%, transparent) 0%, color-mix(in srgb, var(--color-bone) 28%, transparent) 100%);
+    box-shadow: var(--shadow-button-ghost); backdrop-filter: blur(6px); }
+  .ds-button--sm { height: var(--control-height-sm); padding-inline: var(--spacing-10); font-size: var(--text-meta); }
+  .ds-button--md { height: var(--control-height-md); padding-inline: var(--spacing-14); font-size: var(--text-ui); }
+  .ds-button__icon { width: var(--icon-sm); height: var(--icon-sm); display: inline-flex; opacity: .92; }
+  .ds-button__icon > svg { width: 100%; height: 100%; }
+
+  /* ---------- input ---------- */
+  .ds-input { width: 100%; height: var(--control-height-md); padding-inline: var(--spacing-10);
+              border: 1px solid color-mix(in srgb, var(--color-vellum) 70%, var(--color-ink)); border-radius: var(--radius-control);
+              background: linear-gradient(180deg, color-mix(in srgb, var(--color-chalk) 35%, #fff) 0%, #fff 40%, #fff 100%);
+              color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-ui); outline: none; box-shadow: var(--shadow-field); transition: .14s; }
+  .ds-input::placeholder { color: var(--color-graphite); }
+  .ds-input:focus { border-color: color-mix(in srgb, var(--color-ink) 45%, var(--color-vellum)); box-shadow: var(--shadow-field-focus); }
+  :root.dark .ds-input { background: linear-gradient(180deg, color-mix(in srgb, var(--color-chalk) 35%, #000) 0%, #0b0a08 40%, #0b0a08 100%); }
+
+  /* ---------- card ---------- */
+  .ds-card { border: 1px solid color-mix(in srgb, var(--color-vellum) 80%, var(--color-ink)); border-radius: var(--radius-cards);
+             background: linear-gradient(180deg, color-mix(in srgb, #fff 55%, var(--color-bone)) 0%, var(--color-bone) 100%);
+             color: var(--color-ink); box-shadow: var(--shadow-card); }
+  .ds-card--paper { background: var(--color-paper); }
+  :root.dark .ds-card { background: linear-gradient(180deg, color-mix(in srgb, var(--color-paper) 55%, var(--color-bone)) 0%, var(--color-bone) 100%); }
+  .ds-card--ink { border-color: color-mix(in srgb, var(--color-ink) 88%, #fff);
+    background: linear-gradient(180deg, color-mix(in srgb, var(--color-ink) 82%, #fff) 0%, var(--color-ink) 100%); color: var(--color-paper); box-shadow: var(--shadow-button-primary); }
+  :root.dark .ds-card--ink { border-color: color-mix(in srgb, #000 70%, var(--color-vellum));
+    background: linear-gradient(180deg, #15140f 0%, #0c0b08 100%); color: var(--color-ink); }
+
+  /* ---------- tree ---------- */
+  .ds-tree-node { display: flex; align-items: center; gap: var(--spacing-4); width: 100%; height: var(--control-height-md);
+                  padding-inline: var(--spacing-8); border: 0; border-radius: var(--radius-sm); background: transparent;
+                  color: var(--color-ink); font-family: var(--font-sans); font-size: var(--text-ui); line-height: var(--leading-compact);
+                  cursor: pointer; user-select: none; transition: background-color .14s; text-align: left; }
+  .ds-tree-node:hover { background: color-mix(in srgb, var(--color-ink) 6%, transparent); }
+  .ds-tree-node--active { background: var(--color-ink); color: var(--color-paper); }
+  :root.dark .ds-tree-node--active { background: color-mix(in srgb, var(--color-ink) 14%, transparent); color: var(--color-ink);
+                  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--color-ink) 18%, transparent); }
+  .ds-tree-node__icon { width: var(--icon-sm); height: var(--icon-sm); display: inline-flex; color: var(--color-graphite); flex-shrink: 0; }
+  .ds-tree-node--active .ds-tree-node__icon { color: color-mix(in srgb, var(--color-paper) 75%, transparent); }
+  :root.dark .ds-tree-node--active .ds-tree-node__icon { color: color-mix(in srgb, var(--color-ink) 75%, transparent); }
+  .ds-tree-node__title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---------- avatar ---------- */
+  .ds-avatar { display: inline-flex; align-items: center; justify-content: center; width: var(--avatar-md); height: var(--avatar-md);
+               border-radius: var(--radius-full); border: 1px solid color-mix(in srgb, var(--color-ink) 12%, transparent); overflow: hidden;
+               background: linear-gradient(180deg, color-mix(in srgb, #fff 70%, var(--color-bone)) 0%, var(--color-bone) 100%);
+               color: var(--color-graphite); font-weight: 500; }
+  :root.dark .ds-avatar { background: linear-gradient(180deg, color-mix(in srgb, var(--color-ink) 18%, transparent) 0%, color-mix(in srgb, var(--color-ink) 8%, transparent) 100%); color: var(--color-ink); }
+
+  /* ---------- editor / md ---------- */
+  .ds-memo-title-input { width: 100%; margin: 0; padding: var(--spacing-4) 0; border: 0; border-radius: var(--radius-sm);
+                         background: transparent; color: var(--color-ink); font-family: var(--font-serif); font-size: var(--text-title-lg);
+                         font-weight: 500; line-height: var(--leading-tight); outline: none; }
+  .ds-memo-title-input::placeholder { color: var(--color-ash); }
+  .ds-memo-title-input:focus { background: color-mix(in srgb, var(--color-ink) 4%, transparent); box-shadow: inset 0 -1.5px 0 0 color-mix(in srgb, var(--color-ink) 35%, transparent); }
+  .ds-md { color: var(--color-ink); }
+  .ds-md h1, .ds-md h2, .ds-md h3 { font-family: var(--font-serif); font-weight: 500; margin: 0 0 var(--spacing-8); }
+  .ds-md h2 { font-size: var(--text-subheading); }
+  .ds-md p { margin: 0 0 var(--spacing-8); line-height: var(--leading-prose); }
+  .ds-md ul { margin: 0 0 var(--spacing-8); padding-left: var(--spacing-16); }
+  .ds-md li { margin: var(--spacing-4) 0; }
+  .ds-md code { padding: 0 var(--spacing-4); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--color-ink) 10%, transparent);
+                font-family: ui-monospace, Menlo, monospace; font-size: var(--text-meta); }
+  .ds-md pre { margin: 0 0 var(--spacing-8); padding: var(--spacing-8); border-radius: var(--radius-sm);
+               background: color-mix(in srgb, var(--color-ink) 8%, transparent); overflow-x: auto; }
+  .ds-md pre code { background: none; padding: 0; }
+  .ds-md blockquote { margin: 0 0 var(--spacing-8); padding-left: var(--spacing-12); border-left: 2px solid color-mix(in srgb, var(--color-ink) 25%, transparent); opacity: .9; }
+
+  /* ---------- dialog ---------- */
+  .ds-dialog-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+                        background: color-mix(in srgb, var(--color-ink) 40%, transparent); padding: var(--spacing-16); }
+  :root.dark .ds-dialog-backdrop { background: rgba(0,0,0,.6); }
+  .ds-dialog-panel { width: min(100%, 420px); border: 1px solid var(--color-vellum); border-radius: var(--radius-lg);
+                     background: var(--color-bone); color: var(--color-ink); padding: var(--spacing-16); box-shadow: var(--shadow-preview); }
+  .ds-dialog-title { margin: 0; font-family: var(--font-serif); font-size: var(--text-title); font-weight: 500; }
+  .ds-dialog-description { margin: var(--spacing-10) 0 0; font-size: var(--text-ui); line-height: var(--leading-body); color: var(--color-graphite); }
+
+  /* ---------- misc ---------- */
+  .row { display: flex; align-items: center; gap: var(--spacing-8); }
+  .spread { justify-content: space-between; }
+  .stack { display: flex; flex-direction: column; gap: var(--spacing-6); }
+  .grow { flex: 1; min-width: 0; }
+  .topbar { display: flex; align-items: center; gap: var(--spacing-12); }
+  .editor-card { padding: var(--spacing-16) var(--spacing-20); overflow: auto; flex: 1; min-height: 0; }
+  .muted { color: var(--color-graphite); font-size: var(--text-ui); }
+  .toast { position: absolute; bottom: var(--spacing-16); left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: var(--spacing-12);
+           padding: var(--spacing-10) var(--spacing-14); border: 1px solid color-mix(in srgb, var(--color-ink) 12%, var(--color-vellum)); border-radius: var(--radius-sm);
+           background: var(--color-paper); color: var(--color-ink); box-shadow: var(--shadow-preview); font-size: var(--text-ui); }
+  .notes-wrap { position: relative; flex: 1; min-height: 0; display: flex; }
+  .agent-msg { font-size: var(--text-ui); line-height: var(--leading-body); color: var(--color-ink); }
+  .agent-msg.bot { color: var(--color-graphite); }
+
+  /* ---------- floating switcher ---------- */
+  .switcher { position: fixed; top: 14px; right: 14px; z-index: 100; display: flex; gap: 6px;
+              padding: 6px; border: 1px solid color-mix(in srgb, var(--color-vellum) 70%, var(--color-ink)); border-radius: 9999px;
+              background: var(--color-paper); box-shadow: var(--shadow-card); }
+  .switcher button { border: 0; background: transparent; color: var(--color-graphite); font-family: var(--font-sans);
+                     font-size: 11px; padding: 6px 12px; border-radius: 9999px; cursor: pointer; }
+  .switcher button.on { background: var(--color-ink); color: var(--color-paper); }
+</style>
+</head>
+<body>
+  <div class="switcher">
+    <button id="btn-dark" class="on">新 · 暗色</button>
+    <button id="btn-light">当前 · 浅色</button>
+  </div>
+
+  <div class="ds-app-grid">
+    <!-- 左：文件树 -->
+    <aside class="ds-sidebar">
+      <div class="brand">
+        <div class="brand__mark">S</div>
+        <div class="brand__name">SuperNote</div>
+      </div>
+      <div class="row">
+        <button class="ds-button ds-button--primary ds-button--sm">
+          <span class="ds-button__icon">{＋}</span> 新建
+        </button>
+        <button class="ds-button ds-button--ghost ds-button--sm">
+          <span class="ds-button__icon">{⚙}</span>
+        </button>
+      </div>
+      <div class="stack" style="overflow:auto;">
+        <button class="ds-tree-node ds-tree-node--active">
+          <span class="ds-tree-node__icon">{▸}</span><span class="ds-tree-node__title">产品会议纪要</span>
+        </button>
+        <button class="ds-tree-node">
+          <span class="ds-tree-node__icon">{▸}</span><span class="ds-tree-node__title">周报 · 第 29 周</span>
+        </button>
+        <button class="ds-tree-node">
+          <span class="ds-tree-node__icon">{▸}</span><span class="ds-tree-node__title">读书笔记 · 设计心理学</span>
+        </button>
+        <button class="ds-tree-node">
+          <span class="ds-tree-node__icon">{▸}</span><span class="ds-tree-node__title">旅行清单</span>
+        </button>
+        <button class="ds-tree-node">
+          <span class="ds-tree-node__icon">{▸}</span><span class="ds-tree-node__title">灵感碎片</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- 中：编辑区 -->
+    <main class="ds-notes-content">
+      <div class="topbar">
+        <input class="ds-input grow" style="max-width:280px" placeholder="搜索笔记…" />
+        <div class="grow"></div>
+        <button class="ds-button ds-button--ghost ds-button--sm">分享</button>
+        <button class="ds-button ds-button--outline ds-button--sm">导出</button>
+        <div class="ds-avatar">YL</div>
+      </div>
+
+      <div class="notes-wrap">
+        <div class="ds-card ds-card--paper editor-card grow">
+          <input class="ds-memo-title-input" value="产品会议纪要 · 2026-07-21" />
+          <div class="ds-md">
+            <h2>今日要点</h2>
+            <p>评审了暗色主题草案，结论：<strong>只换 token、不动组件</strong>，风险最低且可逆。</p>
+            <ul>
+              <li>颜色全部走 <code>--color-*</code>，重映射即可整体换皮</li>
+              <li>阴影在暗态需重写（外暗投影 + 内顶高光）</li>
+              <li>primary 按钮定向覆盖为深炭按钮</li>
+            </ul>
+            <blockquote>优雅不是装饰多，而是克制——灰阶打底，颜色只表状态。</blockquote>
+            <h3>下一步</h3>
+            <p>在 <code>index.css</code> 之后引入 <code>theme-dark.css</code>，给 <code>&lt;html&gt;</code> 加 <code>data-theme="dark"</code>。</p>
+            <pre><code>document.documentElement.setAttribute('data-theme','dark')</code></pre>
+          </div>
+        </div>
+
+        <div class="toast">
+          <span>已自动保存</span>
+          <button class="ds-button ds-button--ghost ds-button--sm" style="height:22px;">撤销</button>
+        </div>
+      </div>
+    </main>
+
+    <!-- 右：Agent 面板 -->
+    <aside class="agent-panel">
+      <div class="row spread">
+        <strong style="font-family:var(--font-serif);font-weight:500;">AI 助手</strong>
+        <button class="ds-button ds-button--ghost ds-button--sm">清空</button>
+      </div>
+      <div class="stack grow" style="overflow:auto;">
+        <div class="agent-msg bot">需要我把这段会议纪要整理成三日待办吗？</div>
+        <div class="agent-msg">好，按优先级列出前三项。</div>
+        <div class="agent-msg bot">1) 提交 theme-dark.css 评审 · 2) 灰度 10% 用户 · 3) 收集对比反馈。</div>
+      </div>
+      <input class="ds-input" placeholder="问问 SuperNote…" />
+    </aside>
+  </div>
+
+  <!-- 弹窗示例 -->
+  <div class="ds-dialog-backdrop">
+    <div class="ds-dialog-panel">
+      <h2 class="ds-dialog-title">切换到暗色主题？</h2>
+      <p class="ds-dialog-description">这将启用新的暖调石墨暗色皮肤，仅改变外观，不影响任何功能与数据。</p>
+      <div class="row" style="margin-top:16px; justify-content:flex-end;">
+        <button class="ds-button ds-button--ghost ds-button--sm">稍后</button>
+        <button class="ds-button ds-button--primary ds-button--sm">启用</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const root = document.documentElement;
+  const bD = document.getElementById('btn-dark');
+  const bL = document.getElementById('btn-light');
+  function set(on){ root.classList.toggle('dark', on); bD.classList.toggle('on', on); bL.classList.toggle('on', !on); }
+  bD.onclick = () => set(true);
+  bL.onclick = () => set(false);
+</script>
+</body>
+</html>

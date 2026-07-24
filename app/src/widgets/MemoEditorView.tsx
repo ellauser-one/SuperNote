@@ -11,6 +11,8 @@
  * - blur / 切 memo / visibility hidden / pagehide 时 flush
  * - 慢响应不得覆盖更新的本地内容（store 侧竞态保护）
  * - 失败 toast；成功静默
+ * - 「AI 自动分类」按钮：POST /agent/memos/classify，带 Bearer token，
+ *   成功后 toast 分类结果并刷新树；401 走回登录
  */
 import {
   lazy,
@@ -20,10 +22,30 @@ import {
   useRef,
   useState,
 } from "react";
+import { Loader2, Sparkles } from "lucide-react";
 
 import { saveWithRetry } from "../shared/lib/save-with-retry";
 import { useMemoTreeStore } from "../shared/stores/memo-tree.store";
+import { ApiClientError, apiJson } from "../shared/services/api/client";
+import { handleUnauthorized } from "../shared/services/unauthorized";
+import { Button, showToast } from "../shared/ui";
 import type { MemoTreeNode } from "../shared/types/memo";
+
+/** /agent/memos/classify 的返回（后端信封 data 字段） */
+type ClassifyResult = {
+  category?: string;
+  suggestion?: string;
+  message?: string;
+};
+
+function classifySummary(data: ClassifyResult): string {
+  if (data.category) {
+    return `已分类：${data.category}${data.suggestion ? `（${data.suggestion}）` : ""}`;
+  }
+  if (data.message) return data.message;
+  if (data.suggestion) return `建议分类：${data.suggestion}`;
+  return "自动分类完成";
+}
 
 const MdxMemoEditor = lazy(() =>
   import("./MdxMemoEditor").then((m) => ({ default: m.MdxMemoEditor })),
@@ -42,6 +64,7 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
   const updateLocal = useMemoTreeStore((s) => s.updateMemoContentLocal);
   const saveContent = useMemoTreeStore((s) => s.saveMemoContent);
   const renameNode = useMemoTreeStore((s) => s.renameNode);
+  const fetchTree = useMemoTreeStore((s) => s.fetchTree);
 
   const storeContent = node.memo?.content_mdx ?? "";
 
@@ -288,42 +311,84 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
     }
   }, [titleDraft, node.id, node.title, renameNode, savingTitle]);
 
+  /* ── AI 自动分类 ──────────────────────────────────────────── */
+  const [classifying, setClassifying] = useState(false);
+
+  const handleClassify = useCallback(async () => {
+    if (classifying) return;
+    setClassifying(true);
+    try {
+      const data = await apiJson<ClassifyResult>("/agent/memos/classify", {
+        method: "POST",
+        body: JSON.stringify({ memoId: node.id }),
+      });
+      showToast(classifySummary(data), "success");
+      // 分类可能改了树节点（如标签），刷新树
+      await fetchTree();
+    } catch (err) {
+      // 401 已由 apiFetch 触发回登录（页面跳转），这里仅兜底
+      if (err instanceof ApiClientError && err.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      showToast(
+        err instanceof Error ? err.message : "自动分类失败，请稍后重试。",
+        "error",
+      );
+    } finally {
+      setClassifying(false);
+    }
+  }, [classifying, node.id, fetchTree]);
+
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-paper">
       <header className="flex shrink-0 flex-col gap-6 border-b border-vellum px-20 py-12">
-        <label className="sr-only" htmlFor={`memo-title-${node.id}`}>
-          备忘录标题
-        </label>
-        <input
-          id={`memo-title-${node.id}`}
-          className="ds-memo-title-input"
-          value={titleDraft}
-          disabled={savingTitle}
-          onChange={(e) => {
-            setTitleDraft(e.target.value);
-            if (titleError) setTitleError(null);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              (e.currentTarget as HTMLInputElement).blur();
+        <div className="flex items-center gap-10">
+          <label className="sr-only" htmlFor={`memo-title-${node.id}`}>
+            备忘录标题
+          </label>
+          <input
+            id={`memo-title-${node.id}`}
+            className="ds-memo-title-input min-w-0 flex-1"
+            value={titleDraft}
+            disabled={savingTitle}
+            onChange={(e) => {
+              setTitleDraft(e.target.value);
+              if (titleError) setTitleError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                (e.currentTarget as HTMLInputElement).blur();
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setTitleDraft(node.title);
+                setTitleError(null);
+                (e.currentTarget as HTMLInputElement).blur();
+              }
+            }}
+            onBlur={() => {
+              void commitTitle();
+            }}
+            placeholder="备忘录标题"
+            aria-invalid={Boolean(titleError) || undefined}
+            aria-describedby={
+              titleError ? `memo-title-error-${node.id}` : undefined
             }
-            if (e.key === "Escape") {
-              e.preventDefault();
-              setTitleDraft(node.title);
-              setTitleError(null);
-              (e.currentTarget as HTMLInputElement).blur();
-            }
-          }}
-          onBlur={() => {
-            void commitTitle();
-          }}
-          placeholder="备忘录标题"
-          aria-invalid={Boolean(titleError) || undefined}
-          aria-describedby={
-            titleError ? `memo-title-error-${node.id}` : undefined
-          }
-        />
+          />
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={<Sparkles aria-hidden="true" />}
+            loading={classifying}
+            onClick={() => {
+              void handleClassify();
+            }}
+          >
+            AI 自动分类
+          </Button>
+        </div>
         {titleError ? (
           <p
             id={`memo-title-error-${node.id}`}
@@ -345,7 +410,8 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <Suspense
           fallback={
-            <div className="flex h-full items-center justify-center font-helvetica-now text-ui text-graphite">
+            <div className="flex h-full items-center justify-center gap-4 font-helvetica-now text-ui text-graphite">
+              <Loader2 className="size-icon-sm animate-spin" aria-hidden="true" />
               加载编辑器…
             </div>
           }
@@ -364,16 +430,16 @@ export function MemoEditorView({ node }: MemoEditorViewProps) {
       {saveError ? (
         <div className="ds-memo-save-toast" role="alert">
           <p className="font-helvetica-now text-meta">{saveError}</p>
-          <button
-            type="button"
-            className="ds-memo-save-toast__retry"
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => {
               setSaveError(null);
               void flushAutosave();
             }}
           >
             重试
-          </button>
+          </Button>
         </div>
       ) : null}
     </div>

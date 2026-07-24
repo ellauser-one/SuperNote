@@ -8,7 +8,8 @@
  * - PORT          HTTP 端口（默认 20001）
  * - NODE_ENV      运行环境（默认 development）
  * - SYSTEM_NAME   系统展示名（默认 SuperNote）
- * - CORS_ORIGINS  逗号分隔的 CORS 来源
+ * - CORS_ORIGINS  逗号分隔的 CORS 来源（production 严格白名单）
+ * - CHAT_BASE_URL AI 分类 chat 服务基址（默认 http://localhost:20002）
  * - SUPABASE_URL  Supabase 项目 URL（必填）
  * - SUPABASE_SERVICE_ROLE_KEY  service_role 密钥（必填，仅服务端）
  */
@@ -21,6 +22,7 @@ const envSchema = z.object({
   CORS_ORIGINS: z
     .string()
     .default("http://localhost:20000,http://127.0.0.1:20000"),
+  CHAT_BASE_URL: z.string().url().default("http://localhost:20002"),
   SUPABASE_URL: z.string().url(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
 });
@@ -32,6 +34,7 @@ export type Env = {
   nodeEnv: string;
   systemName: string;
   corsOrigins: string[];
+  chatBaseUrl: string;
   supabaseUrl: string;
   supabaseServiceRoleKey: string;
 };
@@ -43,6 +46,7 @@ export const env: Env = {
   corsOrigins: parsed.CORS_ORIGINS.split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  chatBaseUrl: parsed.CHAT_BASE_URL,
   supabaseUrl: parsed.SUPABASE_URL,
   supabaseServiceRoleKey: parsed.SUPABASE_SERVICE_ROLE_KEY,
 };

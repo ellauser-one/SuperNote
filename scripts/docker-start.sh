@@ -22,8 +22,8 @@ else
   cp .env.example .env.local
 
 并填写至少：
-  SUPABASE_URL=https://your-project.supabase.co
-  SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+  SUPABASE_URL=https://fvvegntuhvletxbhkxqa
+  SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ2dmVnbnR1aHZsZXR4YmhreHFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MzE0MDk2OSwiZXhwIjoyMDk4NzE2OTY5fQ.mOJK9c1FikYQSB07ScKLk4qDLfYeAGicjWUKrnUY0tU
 
 然后重新执行：
   ./scripts/docker-start.sh

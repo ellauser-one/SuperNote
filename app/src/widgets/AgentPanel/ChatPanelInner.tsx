@@ -297,7 +297,8 @@ export function ChatPanelInner({ sessionId }: ChatPanelInnerProps) {
 
   if (historyLoading) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center">
+      <div className="flex min-h-0 flex-1 items-center justify-center gap-4">
+        <Loader2 className="size-icon-sm animate-spin" aria-hidden="true" />
         <p className="font-helvetica-now text-ui text-graphite">加载对话历史…</p>
       </div>
     );

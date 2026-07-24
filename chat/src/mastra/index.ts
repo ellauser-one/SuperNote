@@ -10,6 +10,8 @@ import { env } from "@/config/env";
 import { chatRoute } from "@/routes/chat";
 import { sessionRoutes } from "@/routes/session";
 import { sessionMessagesRoute } from "@/routes/session-messages";
+import { healthRoute } from "@/routes/health";
+import { classifyRoute } from "@/routes/classify";
 
 import { memoAgent } from "./agents/memo-agent";
 
@@ -25,6 +27,12 @@ export const mastra = new Mastra({
       allowHeaders: ["Content-Type", "Authorization"],
       allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     },
-    apiRoutes: [chatRoute, ...sessionRoutes, sessionMessagesRoute],
+    apiRoutes: [
+      healthRoute,
+      chatRoute,
+      ...sessionRoutes,
+      sessionMessagesRoute,
+      classifyRoute,
+    ],
   },
 });

@@ -13,12 +13,14 @@
  * - 根空白区域 = parent_id null 末尾
  * - 禁止拖进自己 / 自己的后代
  * - move 乐观更新 + FLIP；失败 store 回滚 + toast
+ * - 搜索：对「已加载」树节点按标题/正文做客户端过滤（不新增后端接口）
  */
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   FilePlus,
   FolderPlus,
+  Loader2,
 } from "lucide-react";
 
 import {
@@ -30,7 +32,7 @@ import type {
   DropTarget,
   MemoTreeNode as NodeType,
 } from "../../shared/types/memo";
-import { cn } from "../../shared/ui/cn";
+import { Button, cn } from "../../shared/ui";
 import { CreateNodeDialog } from "./CreateNodeDialog";
 import { DropLine } from "./DropLine";
 import { MemoTreeNodeRow } from "./MemoTreeNodeRow";
@@ -47,6 +49,25 @@ function hasAnyFolder(nodes: NodeType[]): boolean {
     if (n.children.length > 0 && hasAnyFolder(n.children)) return true;
   }
   return false;
+}
+
+/**
+ * 客户端过滤：对「已加载」树按标题/正文做匹配。
+ * 命中自身、或任一后代命中 → 保留该节点（与子树一起）。
+ * 只读内存数据，不触发任何后端请求。
+ */
+function filterTree(nodes: NodeType[], query: string): NodeType[] {
+  const out: NodeType[] = [];
+  for (const node of nodes) {
+    const children = filterTree(node.children, query);
+    const selfHit =
+      node.title.toLowerCase().includes(query) ||
+      Boolean(node.memo?.content_mdx?.toLowerCase().includes(query));
+    if (selfHit || children.length > 0) {
+      out.push({ ...node, children });
+    }
+  }
+  return out;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -68,6 +89,14 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
   const lastError = useMemoTreeStore((s) => s.lastError);
   const { noteId } = useParams<{ noteId: string }>();
   const navigate = useNavigate();
+
+  /* ── 搜索：客户端过滤已加载树 ─────────────────────────────── */
+  const [search, setSearch] = useState("");
+  const displayNodes = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return nodes;
+    return filterTree(nodes, q);
+  }, [nodes, search]);
 
 
   /* ── 展开 / 选中 ───────────────────────────────────────────── */
@@ -325,43 +354,55 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
     dropTarget.parentId === null &&
     dropTarget.position === "after";
 
-  const showFolderHint = !loading && nodes.length > 0 && !hasAnyFolder(nodes);
-  const showEmptyHint = !loading && nodes.length === 0;
+  const showFolderHint = !loading && displayNodes.length > 0 && !hasAnyFolder(displayNodes);
+  const showEmptyHint = !loading && displayNodes.length === 0 && !search.trim();
+  const showNoMatch = !loading && displayNodes.length === 0 && Boolean(search.trim());
 
   return (
     <div className="relative flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      {/* 侧栏头：标题 + 可见新建入口（不只靠右键） */}
+      {/* 侧栏头：标题 + 可见新建入口 */}
       <div className="flex shrink-0 items-center justify-between gap-8 border-b border-vellum px-12 py-10">
         <div className="min-w-0">
           <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-            Memo Tree
+            备忘录
           </p>
           <h1 className="truncate font-davinci text-title font-medium">
             备忘录
           </h1>
         </div>
         <div className="ds-tree-toolbar">
-          <button
-            type="button"
-            className="ds-tree-toolbar__btn"
-            title="新建文件夹"
+          <Button
+            flat
+            size="sm"
             aria-label="新建文件夹"
+            icon={<FolderPlus className="size-icon-xs" aria-hidden="true" />}
             onClick={() => openCreate("folder", null)}
           >
-            <FolderPlus className="size-icon-xs" aria-hidden="true" />
             <span className="hidden sm:inline">文件夹</span>
-          </button>
-          <button
-            type="button"
-            className="ds-tree-toolbar__btn"
-            title="新建备忘录"
+          </Button>
+          <Button
+            flat
+            size="sm"
             aria-label="新建备忘录"
+            icon={<FilePlus className="size-icon-xs" aria-hidden="true" />}
             onClick={() => openCreate("memo", null)}
           >
-            <FilePlus className="size-icon-xs" aria-hidden="true" />
             <span className="hidden sm:inline">备忘录</span>
-          </button>
+          </Button>
         </div>
+      </div>
+
+      <div
+        className="shrink-0 px-12 py-6"
+      >
+        <input
+          type="search"
+          aria-label="搜索备忘录"
+          className="ds-input"
+          placeholder="搜索备忘录…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
       </div>
 
       <div
@@ -380,54 +421,61 @@ export function MemoTree({ onMemoOpened }: MemoTreeProps = {}) {
         }}
       >
         {loading && nodes.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center font-helvetica-now text-ui text-graphite">
+          <div className="flex flex-1 items-center justify-center gap-4 font-helvetica-now text-ui text-graphite">
+            <Loader2 className="size-icon-sm animate-spin" aria-hidden="true" />
             加载中…
           </div>
         ) : (
           <>
             {showEmptyHint && (
               <div className="ds-tree-empty">
-                <p>还没有内容。先建一个文件夹，或直接写备忘录。</p>
+                <p>还没有内容，先建文件夹或直接写备忘录。</p>
                 <div className="ds-tree-empty__actions">
-                  <button
-                    type="button"
-                    className="ds-tree-toolbar__btn"
+                  <Button
+                    flat
+                    size="sm"
+                    icon={<FolderPlus className="size-icon-xs" aria-hidden="true" />}
                     onClick={() => openCreate("folder", null)}
                   >
-                    <FolderPlus className="size-icon-xs" aria-hidden="true" />
                     新建文件夹
-                  </button>
-                  <button
-                    type="button"
-                    className="ds-tree-toolbar__btn"
+                  </Button>
+                  <Button
+                    flat
+                    size="sm"
+                    icon={<FilePlus className="size-icon-xs" aria-hidden="true" />}
                     onClick={() => openCreate("memo", null)}
                   >
-                    <FilePlus className="size-icon-xs" aria-hidden="true" />
                     新建备忘录
-                  </button>
+                  </Button>
                 </div>
+              </div>
+            )}
+
+            {showNoMatch && (
+              <div className="ds-tree-empty">
+                <p>没有匹配的备忘录或文件夹。</p>
               </div>
             )}
 
             {showFolderHint && (
               <div className="ds-tree-empty">
                 <p>
-                  当前只有备忘录，还没有文件夹。点右上角「文件夹」创建后，可把备忘录拖进去。
+                  没有文件夹。点右上角「文件夹」创建后，可把备忘录拖进去。
                 </p>
                 <div className="ds-tree-empty__actions">
-                  <button
-                    type="button"
-                    className="ds-tree-toolbar__btn"
+                  <Button
+                    flat
+                    size="sm"
+                    icon={<FolderPlus className="size-icon-xs" aria-hidden="true" />}
                     onClick={() => openCreate("folder", null)}
                   >
-                    <FolderPlus className="size-icon-xs" aria-hidden="true" />
                     新建文件夹
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
 
-            {renderLevel(nodes, null, 0)}
+            {renderLevel(displayNodes, null, 0)}
 
             {/* 根空白区域：拖到此处 = 根目录末尾 */}
             <div

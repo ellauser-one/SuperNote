@@ -6,6 +6,8 @@
  */
 import { Hono } from "hono";
 
+import { agentRouter } from "./agent.router";
+import { feedbackRouter } from "./feedback.router";
 import { healthRouter } from "./health.router";
 import { memoRouter } from "./memo.router";
 import { profileRouter } from "./profile.router";
@@ -15,3 +17,5 @@ export const router = new Hono();
 router.route("/", healthRouter);
 router.route("/", profileRouter);
 router.route("/", memoRouter);
+router.route("/api", feedbackRouter);
+router.route("/agent", agentRouter);

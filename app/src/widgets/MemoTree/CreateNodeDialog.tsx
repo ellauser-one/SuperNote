@@ -88,7 +88,9 @@ export function CreateNodeDialog({
         </div>
 
         <div className="mt-16 flex justify-end gap-8">
-          <Dialog.Close className="ds-button ds-button--ghost ds-button--sm">取消</Dialog.Close>
+          <Dialog.Close asChild>
+            <Button variant="ghost" size="sm">取消</Button>
+          </Dialog.Close>
           <Button
             size="sm"
             loading={loading}

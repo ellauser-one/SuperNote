@@ -164,7 +164,7 @@ export function MemoLibraryPage() {
         <div className="flex shrink-0 items-center justify-between gap-8 border-b border-vellum px-12 py-10">
           <div className="min-w-0">
             <p className="font-helvetica-now text-label font-medium uppercase text-graphite">
-              Memo Tree
+              备忘录
             </p>
             <h1 className="truncate font-davinci text-title font-medium">备忘录</h1>
           </div>
